@@ -4,21 +4,13 @@
 # Usage: ./import_global.sh [options]
 #
 # Options:
-#   --download    Download PBFs even if they exist
-#   --wikidata    Also fetch Wikidata labels
-#   --fresh       Delete and recreate the index before import
-#   --no-filter   Skip osmium pre-filtering
+#   --download        Download PBFs even if they exist
+#   --wikidata        Also fetch Wikidata labels
+#   --fresh           Delete and recreate the index before import
+#   --no-filter       Skip osmium pre-filtering
+#   --url <url>       Custom Elasticsearch URL (default: http://localhost:9200)
 #
-# This script downloads, filters, and imports data for:
-# - Europe
-# - China
-# - Malaysia/Singapore/Brunei
-# - South Korea
-# - Japan
-# - Thailand
-# - North America
-# - South America
-# - Australia/Oceania
+# This script downloads, filters, and imports data for multiple global regions.
 
 set -e
 
@@ -46,13 +38,44 @@ WIKIDATA=""
 FRESH_FLAG=""
 NO_FILTER=false
 IS_FIRST_IMPORT=true
+ES_URL="http://localhost:9200"
 
-for arg in "$@"; do
-    case $arg in
-        --download) DOWNLOAD=true ;;
-        --wikidata) WIKIDATA="--wikidata" ;;
-        --fresh)    FRESH_FLAG="true" ;; # we handle this manually for the first item
-        --no-filter) NO_FILTER=true ;;
+# Use ELASTICSEARCH_URL env var if set
+if [ -n "$ELASTICSEARCH_URL" ]; then
+    ES_URL="$ELASTICSEARCH_URL"
+fi
+
+while [[ $# -gt 0 ]]; do
+    key="$1"
+    case $key in
+        --download)
+            DOWNLOAD=true
+            shift
+            ;;
+        --wikidata)
+            WIKIDATA="--wikidata"
+            shift
+            ;;
+        --fresh)
+            FRESH_FLAG="true"
+            shift
+            ;;
+        --no-filter)
+            NO_FILTER=true
+            shift
+            ;;
+        --url)
+            ES_URL="$2"
+            shift 2
+            ;;
+        *)
+            # Ignore unknown args or warn? 
+            # Previous script just ignored known flags if loop was simple `for arg in "$@"` but `case` matches.
+            # If we see unknown, we should probably warn or ignore. 
+            # But the original script had a simple loop that just matched known flags.
+            echo "Unknown option: $1"
+            shift # Just skip it
+            ;;
     esac
 done
 
@@ -61,6 +84,7 @@ mkdir -p "$DATA_DIR"
 
 echo "=== Cypress Global Import ==="
 echo "Regions: ${#REGIONS[@]}"
+echo "Elasticsearch URL: $ES_URL"
 if [ -n "$FRESH_FLAG" ]; then
     echo "Mode: FRESH IMPORT (Index will be recreated)"
 else
@@ -117,12 +141,9 @@ for region in "${REGIONS[@]}"; do
     echo "Importing $NAME into Elasticsearch..."
     cd "$PROJECT_DIR"
     
-    # We assume 'ingest' binary is already built or 'cargo run' will build it.
-    # To save time, we build once before the loop? 
-    # Actually cargo run checks quickly.
-    
     cargo run --release --bin ingest -- \
         --file "$PBF_TO_IMPORT" \
+        --es-url "$ES_URL" \
         --refresh \
         $WIKIDATA \
         $CURRENT_FRESH_ARG
