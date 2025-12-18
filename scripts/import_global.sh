@@ -9,6 +9,7 @@
 #   --fresh           Delete and recreate the index before import
 #   --no-filter       Skip osmium pre-filtering
 #   --url <url>       Custom Elasticsearch URL (default: http://localhost:9200)
+#   --tmp-dir <dir>   Directory for temporary data files (PBFs) (default: ./data)
 #
 # This script downloads, filters, and imports data for multiple global regions.
 
@@ -68,6 +69,10 @@ while [[ $# -gt 0 ]]; do
             ES_URL="$2"
             shift 2
             ;;
+        --tmp-dir)
+            DATA_DIR="$2"
+            shift 2
+            ;;
         *)
             # Ignore unknown args or warn? 
             # Previous script just ignored known flags if loop was simple `for arg in "$@"` but `case` matches.
@@ -85,6 +90,7 @@ mkdir -p "$DATA_DIR"
 echo "=== Cypress Global Import ==="
 echo "Regions: ${#REGIONS[@]}"
 echo "Elasticsearch URL: $ES_URL"
+echo "Data Directory: $DATA_DIR"
 if [ -n "$FRESH_FLAG" ]; then
     echo "Mode: FRESH IMPORT (Index will be recreated)"
 else
