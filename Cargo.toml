@@ -1,0 +1,64 @@
+[package]
+name = "cypress"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "query"
+path = "src/query/main.rs"
+
+[[bin]]
+name = "ingest"
+path = "src/ingest/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+
+# OSM parsing
+osmpbfreader = "0.16"
+
+# Elasticsearch
+elasticsearch = "8.5.0-alpha.1"
+
+# HTTP client (for Wikidata)
+reqwest = { version = "0.11", features = ["json", "gzip"] }
+
+# Web framework
+axum = { version = "0.7", features = ["macros"] }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Geometry
+geo = "0.27"
+geo-types = "0.7"
+rstar = "0.11"  # R-tree for spatial indexing
+
+# CLI
+clap = { version = "4.4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Utilities
+hashbrown = "0.14"
+rayon = "1.8"
+chrono = { version = "0.4", features = ["serde"] }
+url = "2.5"
+futures = "0.3"
+indicatif = "0.17"  # Progress bars
+
+[profile.release]
+lto = true
+codegen-units = 1

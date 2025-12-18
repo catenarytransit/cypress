@@ -1,0 +1,90 @@
+# Cypress OSM Filter Expressions
+# Used with: osmium tags-filter input.osm.pbf -e filter_expressions.txt -o filtered.osm.pbf
+#
+# This filters OSM data to only include items the Cypress importer needs.
+
+# ============================================
+# ADMIN BOUNDARIES (relations with boundary=administrative)
+# ============================================
+r/boundary=administrative
+
+# ============================================
+# PLACES (nodes/ways with place tag)
+# ============================================
+nw/place
+
+# ============================================
+# NAMED FEATURES (anything with a name is potentially searchable)
+# We filter by various POI categories that typically have names
+# ============================================
+
+# Amenities (restaurants, cafes, banks, hospitals, etc.)
+nw/amenity
+
+# Shops
+nw/shop
+
+# Tourism (hotels, attractions, museums, etc.)  
+nw/tourism
+
+# Leisure (parks, sports, etc.)
+nw/leisure
+
+# Office buildings
+nw/office
+
+# Named buildings
+nw/building=yes
+nw/building=public
+nw/building=commercial
+nw/building=retail
+nw/building=industrial
+nw/building=residential
+
+# Public transport
+nw/public_transport
+nw/railway=station
+nw/railway=halt
+nw/aeroway=aerodrome
+nw/aeroway=terminal
+
+# Natural features with names
+nw/natural=peak
+nw/natural=volcano
+nw/natural=bay
+nw/natural=beach
+nw/natural=cave_entrance
+nw/natural=glacier
+nw/natural=hot_spring
+nw/natural=spring
+nw/natural=valley
+nw/natural=water
+
+# Waterways
+nw/waterway=river
+nw/waterway=stream
+nw/waterway=canal
+
+# Historic sites
+nw/historic
+
+# Man-made landmarks
+nw/man_made=tower
+nw/man_made=lighthouse
+nw/man_made=windmill
+nw/man_made=bridge
+
+# Highways with names (major roads, streets)
+w/highway=motorway
+w/highway=trunk
+w/highway=primary
+w/highway=secondary
+w/highway=tertiary
+w/highway=residential
+w/highway=living_street
+w/highway=pedestrian
+
+# ============================================
+# ADDRESSES (nodes/ways with addr:housenumber)
+# ============================================
+nw/addr:housenumber

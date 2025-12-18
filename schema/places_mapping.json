@@ -1,0 +1,255 @@
+{
+  "settings": {
+    "number_of_shards": 1,
+    "number_of_replicas": 0,
+    "index": {
+      "refresh_interval": "10s"
+    },
+    "analysis": {
+      "tokenizer": {
+        "peliasNameTokenizer": {
+          "type": "pattern",
+          "pattern": "[\\s,/\\\\-]+"
+        }
+      },
+      "filter": {
+        "peliasASCIIFolding": {
+          "type": "asciifolding",
+          "preserve_original": true
+        },
+        "peliasSynonymFilter": {
+          "type": "synonym",
+          "synonyms": [
+            "street,st,str",
+            "avenue,ave,av",
+            "road,rd",
+            "boulevard,blvd,bd",
+            "place,pl",
+            "square,sq",
+            "drive,dr",
+            "lane,ln",
+            "court,ct"
+          ]
+        },
+        "peliasEdgeNGram": {
+          "type": "edge_ngram",
+          "min_gram": 1,
+          "max_gram": 24
+        }
+      },
+      "analyzer": {
+        "peliasQuery": {
+          "type": "custom",
+          "tokenizer": "peliasNameTokenizer",
+          "filter": [
+            "lowercase",
+            "peliasASCIIFolding",
+            "peliasSynonymFilter"
+          ]
+        },
+        "peliasIndex": {
+          "type": "custom",
+          "tokenizer": "peliasNameTokenizer",
+          "filter": [
+            "lowercase",
+            "peliasASCIIFolding"
+          ]
+        },
+        "peliasAutocomplete": {
+          "type": "custom",
+          "tokenizer": "peliasNameTokenizer",
+          "filter": [
+            "lowercase",
+            "peliasASCIIFolding",
+            "peliasEdgeNGram"
+          ]
+        }
+      }
+    }
+  },
+  "mappings": {
+    "dynamic": "true",
+    "dynamic_templates": [
+      {
+        "name_fields": {
+          "path_match": "name.*",
+          "mapping": {
+            "type": "text",
+            "analyzer": "peliasIndex",
+            "search_analyzer": "peliasQuery",
+            "fields": {
+              "autocomplete": {
+                "type": "text",
+                "analyzer": "peliasAutocomplete",
+                "search_analyzer": "peliasQuery"
+              }
+            }
+          }
+        }
+      },
+      {
+        "parent_name_fields": {
+          "path_match": "parent.*.name_*",
+          "mapping": {
+            "type": "text",
+            "analyzer": "peliasIndex",
+            "search_analyzer": "peliasQuery"
+          }
+        }
+      }
+    ],
+    "properties": {
+      "source_id": {
+        "type": "keyword"
+      },
+      "source_file": {
+        "type": "keyword"
+      },
+      "import_timestamp": {
+        "type": "date"
+      },
+      "osm_type": {
+        "type": "keyword"
+      },
+      "osm_id": {
+        "type": "long"
+      },
+      "wikidata_id": {
+        "type": "keyword"
+      },
+      "layer": {
+        "type": "keyword"
+      },
+      "categories": {
+        "type": "keyword"
+      },
+      "name": {
+        "type": "object",
+        "dynamic": true,
+        "properties": {
+          "default": {
+            "type": "text",
+            "analyzer": "peliasIndex",
+            "search_analyzer": "peliasQuery",
+            "fields": {
+              "autocomplete": {
+                "type": "text",
+                "analyzer": "peliasAutocomplete",
+                "search_analyzer": "peliasQuery"
+              }
+            }
+          }
+        }
+      },
+      "phrase": {
+        "type": "text",
+        "analyzer": "peliasIndex",
+        "search_analyzer": "peliasQuery"
+      },
+      "address": {
+        "type": "object",
+        "properties": {
+          "housenumber": {
+            "type": "keyword"
+          },
+          "street": {
+            "type": "text",
+            "analyzer": "peliasIndex",
+            "search_analyzer": "peliasQuery"
+          },
+          "postcode": {
+            "type": "keyword"
+          },
+          "city": {
+            "type": "text",
+            "analyzer": "peliasIndex",
+            "search_analyzer": "peliasQuery"
+          }
+        }
+      },
+      "center_point": {
+        "type": "geo_point"
+      },
+      "bbox": {
+        "type": "geo_shape"
+      },
+      "parent": {
+        "type": "object",
+        "properties": {
+          "country": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "text", "analyzer": "peliasIndex" },
+              "abbr": { "type": "keyword" },
+              "id": { "type": "long" }
+            }
+          },
+          "macro_region": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "text", "analyzer": "peliasIndex" },
+              "abbr": { "type": "keyword" },
+              "id": { "type": "long" }
+            }
+          },
+          "region": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "text", "analyzer": "peliasIndex" },
+              "abbr": { "type": "keyword" },
+              "id": { "type": "long" }
+            }
+          },
+          "macro_county": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "text", "analyzer": "peliasIndex" },
+              "abbr": { "type": "keyword" },
+              "id": { "type": "long" }
+            }
+          },
+          "county": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "text", "analyzer": "peliasIndex" },
+              "abbr": { "type": "keyword" },
+              "id": { "type": "long" }
+            }
+          },
+          "local_admin": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "text", "analyzer": "peliasIndex" },
+              "abbr": { "type": "keyword" },
+              "id": { "type": "long" }
+            }
+          },
+          "locality": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "text", "analyzer": "peliasIndex" },
+              "abbr": { "type": "keyword" },
+              "id": { "type": "long" }
+            }
+          },
+          "borough": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "text", "analyzer": "peliasIndex" },
+              "abbr": { "type": "keyword" },
+              "id": { "type": "long" }
+            }
+          },
+          "neighbourhood": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "text", "analyzer": "peliasIndex" },
+              "abbr": { "type": "keyword" },
+              "id": { "type": "long" }
+            }
+          }
+        }
+      }
+    }
+  }
+}
