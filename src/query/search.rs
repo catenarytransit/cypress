@@ -15,6 +15,7 @@ pub struct SearchParams {
     pub bbox: Option<[f64; 4]>,
     pub focus_lat: Option<f64>,
     pub focus_lon: Option<f64>,
+    pub focus_weight: Option<f64>,
     pub layers: Option<Vec<String>>,
     pub size: usize,
 }
@@ -165,7 +166,7 @@ pub async fn execute_search(
                                 "decay": 0.5
                             }
                         },
-                        "weight": 3
+                        "weight": params.focus_weight.unwrap_or(3.0)
                     }
                 ],
                 "score_mode": "multiply",

@@ -122,6 +122,7 @@ async fn search_handler(
         bbox: parse_bbox(&params.bbox),
         focus_lat: params.focus_point_lat,
         focus_lon: params.focus_point_lon,
+        focus_weight: params.focus_point_weight,
         layers: params
             .layers
             .as_ref()
@@ -147,6 +148,7 @@ async fn autocomplete_handler(
         bbox: parse_bbox(&params.bbox),
         focus_lat: params.focus_point_lat,
         focus_lon: params.focus_point_lon,
+        focus_weight: params.focus_point_weight,
         layers: params
             .layers
             .as_ref()
@@ -196,6 +198,9 @@ struct SearchQueryParams {
     /// Focus point longitude
     #[serde(rename = "focus.point.lon")]
     focus_point_lon: Option<f64>,
+    /// Focus point weight (defaults to 3.0)
+    #[serde(rename = "focus.point.weight")]
+    focus_point_weight: Option<f64>,
     /// Filter by layers (comma-separated)
     layers: Option<String>,
     /// Number of results
