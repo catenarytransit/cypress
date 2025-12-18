@@ -5,6 +5,7 @@ use osmpbfreader::{NodeId, OsmObj, OsmPbfReader, RelationId, WayId};
 use std::collections::HashMap;
 use std::io::{Read, Seek};
 use tracing::{debug, info};
+use tempfile::Builder;
 
 use crate::models::{AdminArea, AdminLevel};
 
@@ -40,6 +41,11 @@ pub fn extract_admin_boundaries<R: Read + Seek>(
     let mut way_refs: HashMap<WayId, Vec<NodeId>> = HashMap::new();
     let mut needed_ways: hashbrown::HashSet<WayId> = hashbrown::HashSet::new();
     let mut needed_nodes: hashbrown::HashSet<NodeId> = hashbrown::HashSet::new();
+
+    // Create temporary database for node coordinates to save RAM
+    let temp_dir = Builder::new().prefix("cypress-import-").tempdir()?;
+    let db = sled::open(temp_dir.path())?;
+    info!("Created temporary database at {:?}", temp_dir.path());
 
     info!("Pass 1: Collecting admin relations...");
     reader.rewind()?;
@@ -145,18 +151,26 @@ pub fn extract_admin_boundaries<R: Read + Seek>(
     info!("Pass 3: Collecting node coordinates...");
     reader.rewind()?;
 
-    let mut node_coords: HashMap<NodeId, (f64, f64)> = HashMap::new();
+    let mut node_count = 0;
 
     for obj in reader.iter() {
         let obj = obj?;
         if let OsmObj::Node(node) = obj {
             if needed_nodes.contains(&node.id) {
-                node_coords.insert(node.id, (node.lon(), node.lat()));
+                let key = node.id.0.to_be_bytes();
+                let mut value = [0u8; 16];
+                value[0..8].copy_from_slice(&node.lon().to_be_bytes());
+                value[8..16].copy_from_slice(&node.lat().to_be_bytes());
+                db.insert(key, &value)?;
+                node_count += 1;
             }
         }
     }
 
-    info!("Collected {} node coordinates", node_coords.len());
+    // Flush to disk
+    db.flush()?;
+
+    info!("Collected {} node coordinates in temporary DB", node_count);
 
     // Build geometries
     info!("Building boundary geometries...");
@@ -170,8 +184,22 @@ pub fn extract_admin_boundaries<R: Read + Seek>(
             if let Some(node_ids) = way_refs.get(way_id) {
                 let coords: Vec<Coord<f64>> = node_ids
                     .iter()
-                    .filter_map(|nid| node_coords.get(nid))
-                    .map(|(lon, lat)| Coord { x: *lon, y: *lat })
+                    .filter_map(|nid| {
+                        let key = nid.0.to_be_bytes();
+                        match db.get(key) {
+                            Ok(Some(bytes)) => {
+                                if bytes.len() == 16 {
+                                    let lon = f64::from_be_bytes(bytes[0..8].try_into().unwrap());
+                                    let lat = f64::from_be_bytes(bytes[8..16].try_into().unwrap());
+                                    Some((lon, lat))
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        }
+                    })
+                    .map(|(lon, lat)| Coord { x: lon, y: lat })
                     .collect();
 
                 if coords.len() >= 3 {
