@@ -3,7 +3,12 @@
     "number_of_shards": 1,
     "number_of_replicas": 0,
     "index": {
-      "refresh_interval": "10s"
+      "refresh_interval": "10s",
+      "mapping": {
+        "total_fields": {
+          "limit": 10000
+        }
+      }
     },
     "analysis": {
       "tokenizer": {
@@ -182,73 +187,136 @@
           "country": {
             "type": "object",
             "properties": {
-              "name": { "type": "text", "analyzer": "peliasIndex" },
-              "abbr": { "type": "keyword" },
-              "id": { "type": "long" }
+              "name": {
+                "type": "text",
+                "analyzer": "peliasIndex"
+              },
+              "abbr": {
+                "type": "keyword"
+              },
+              "id": {
+                "type": "long"
+              }
             }
           },
           "macro_region": {
             "type": "object",
             "properties": {
-              "name": { "type": "text", "analyzer": "peliasIndex" },
-              "abbr": { "type": "keyword" },
-              "id": { "type": "long" }
+              "name": {
+                "type": "text",
+                "analyzer": "peliasIndex"
+              },
+              "abbr": {
+                "type": "keyword"
+              },
+              "id": {
+                "type": "long"
+              }
             }
           },
           "region": {
             "type": "object",
             "properties": {
-              "name": { "type": "text", "analyzer": "peliasIndex" },
-              "abbr": { "type": "keyword" },
-              "id": { "type": "long" }
+              "name": {
+                "type": "text",
+                "analyzer": "peliasIndex"
+              },
+              "abbr": {
+                "type": "keyword"
+              },
+              "id": {
+                "type": "long"
+              }
             }
           },
           "macro_county": {
             "type": "object",
             "properties": {
-              "name": { "type": "text", "analyzer": "peliasIndex" },
-              "abbr": { "type": "keyword" },
-              "id": { "type": "long" }
+              "name": {
+                "type": "text",
+                "analyzer": "peliasIndex"
+              },
+              "abbr": {
+                "type": "keyword"
+              },
+              "id": {
+                "type": "long"
+              }
             }
           },
           "county": {
             "type": "object",
             "properties": {
-              "name": { "type": "text", "analyzer": "peliasIndex" },
-              "abbr": { "type": "keyword" },
-              "id": { "type": "long" }
+              "name": {
+                "type": "text",
+                "analyzer": "peliasIndex"
+              },
+              "abbr": {
+                "type": "keyword"
+              },
+              "id": {
+                "type": "long"
+              }
             }
           },
           "local_admin": {
             "type": "object",
             "properties": {
-              "name": { "type": "text", "analyzer": "peliasIndex" },
-              "abbr": { "type": "keyword" },
-              "id": { "type": "long" }
+              "name": {
+                "type": "text",
+                "analyzer": "peliasIndex"
+              },
+              "abbr": {
+                "type": "keyword"
+              },
+              "id": {
+                "type": "long"
+              }
             }
           },
           "locality": {
             "type": "object",
             "properties": {
-              "name": { "type": "text", "analyzer": "peliasIndex" },
-              "abbr": { "type": "keyword" },
-              "id": { "type": "long" }
+              "name": {
+                "type": "text",
+                "analyzer": "peliasIndex"
+              },
+              "abbr": {
+                "type": "keyword"
+              },
+              "id": {
+                "type": "long"
+              }
             }
           },
           "borough": {
             "type": "object",
             "properties": {
-              "name": { "type": "text", "analyzer": "peliasIndex" },
-              "abbr": { "type": "keyword" },
-              "id": { "type": "long" }
+              "name": {
+                "type": "text",
+                "analyzer": "peliasIndex"
+              },
+              "abbr": {
+                "type": "keyword"
+              },
+              "id": {
+                "type": "long"
+              }
             }
           },
           "neighbourhood": {
             "type": "object",
             "properties": {
-              "name": { "type": "text", "analyzer": "peliasIndex" },
-              "abbr": { "type": "keyword" },
-              "id": { "type": "long" }
+              "name": {
+                "type": "text",
+                "analyzer": "peliasIndex"
+              },
+              "abbr": {
+                "type": "keyword"
+              },
+              "id": {
+                "type": "long"
+              }
             }
           }
         }

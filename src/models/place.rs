@@ -181,4 +181,45 @@ impl Place {
     pub fn add_category(&mut self, key: &str, value: &str) {
         self.categories.push(format!("{}:{}", key, value));
     }
+
+    /// Sanitize the place to check for invalid values before indexing
+    pub fn sanitize(&mut self) {
+        // Clamp center point
+        self.center_point.lat = self.center_point.lat.clamp(-90.0, 90.0);
+        self.center_point.lon = self.center_point.lon.clamp(-180.0, 180.0);
+
+        // Clamp bbox if present
+        if let Some(ref mut bbox) = self.bbox {
+            // Check for invalid bbox where min > max
+            // We can't easily fix inverted bbox without knowing which is which,
+            // but we can at least clamp the values.
+            // If min > max, we swap them.
+
+            let mut min_lon = bbox.coordinates[0][0].clamp(-180.0, 180.0);
+            let mut max_lat = bbox.coordinates[0][1].clamp(-90.0, 90.0);
+            let mut max_lon = bbox.coordinates[1][0].clamp(-180.0, 180.0);
+            let mut min_lat = bbox.coordinates[1][1].clamp(-90.0, 90.0);
+
+            if min_lon > max_lon {
+                std::mem::swap(&mut min_lon, &mut max_lon);
+            }
+            if min_lat > max_lat {
+                std::mem::swap(&mut min_lat, &mut max_lat);
+            }
+
+            bbox.coordinates[0][0] = min_lon;
+            bbox.coordinates[0][1] = max_lat;
+            bbox.coordinates[1][0] = max_lon;
+            bbox.coordinates[1][1] = min_lat;
+        }
+
+        // Sanitize importance
+        if let Some(imp) = self.importance {
+            if !imp.is_finite() {
+                self.importance = Some(0.0);
+            } else {
+                self.importance = Some(imp.clamp(0.0, 1.0));
+            }
+        }
+    }
 }

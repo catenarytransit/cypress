@@ -211,6 +211,7 @@ async fn main() -> Result<()> {
             // Usually admins form a hierarchy.
             // Ideally we index them appropriately.
 
+            place.sanitize();
             indexer.add(place).await?;
         }
     }
@@ -247,6 +248,7 @@ async fn main() -> Result<()> {
                 }
             }
 
+            place.sanitize();
             places_buffer.push(place);
 
             // Batch Wikidata fetch every 1000 places
@@ -442,7 +444,16 @@ fn extract_tags(place: &mut Place, tags: &osmpbfreader::Tags) {
         if key_str == "name" {
             place.add_name("default", value.to_string());
         } else if let Some(lang) = key_str.strip_prefix("name:") {
-            place.add_name(lang, value.to_string());
+            // Validate language code to prevent field explosion (ES limit 1000)
+            // Allow 2-10 chars, alphanumeric + -_
+            if lang.len() >= 2
+                && lang.len() <= 10
+                && lang
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+            {
+                place.add_name(lang, value.to_string());
+            }
         }
         // Wikidata
         else if key_str == "wikidata" || key_str == "brand:wikidata" {

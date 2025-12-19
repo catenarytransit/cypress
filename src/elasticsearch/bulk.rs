@@ -84,15 +84,29 @@ impl BulkIndexer {
         if response_body["errors"].as_bool().unwrap_or(false) {
             let items = response_body["items"].as_array();
             if let Some(items) = items {
-                let error_count = items
+                let errors: Vec<_> = items
                     .iter()
                     .filter(|item| item["index"]["error"].is_object())
-                    .count();
+                    .collect();
+
+                let error_count = errors.len();
                 self.total_errors += error_count;
                 warn!(
                     "Bulk request had {} errors out of {} documents",
                     error_count, count
                 );
+
+                // Log the first 5 errors to help debugging
+                for (i, error_item) in errors.iter().take(5).enumerate() {
+                    let error = &error_item["index"]["error"];
+                    let doc_id = &error_item["index"]["_id"];
+                    warn!(
+                        "Error #{}: Doc ID: {:?}, Reason: {:?}",
+                        i + 1,
+                        doc_id,
+                        error
+                    );
+                }
             }
         }
 
