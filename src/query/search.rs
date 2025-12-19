@@ -128,6 +128,24 @@ pub async fn execute_search(
                 "boost": 2.0
             }
         }),
+        // Name + Admin hybrid search (e.g. "Los Angeles California")
+        json!({
+            "multi_match": {
+                "query": &params.text,
+                "type": "cross_fields",
+                "fields": [
+                    "name.default",
+                    "parent.country.name",
+                    "parent.region.name",
+                    "parent.county.name",
+                    "parent.locality.name",
+                    "parent.neighbourhood.name"
+                ],
+                "analyzer": "peliasQuery",
+                "operator": "and",
+                "boost": 8.0
+            }
+        }),
     ];
 
     // Build query with optional filters
@@ -143,37 +161,49 @@ pub async fn execute_search(
         }]);
     }
 
-    // Build function score for location bias
-    let mut query = json!({
-        "bool": bool_query
-    });
+    // Build function score for location bias + importance
+    let mut functions = vec![
+        // Importance boosting
+        json!({
+            "field_value_factor": {
+                "field": "importance",
+                "missing": 0.0, // Default importance if missing
+                "factor": 1.0,  // Tuning parameter
+                "modifier": "log1p", // log(1 + importance) - smooth curve
+                // Importance is 0..1 usually. log1p(1) = 0.69.
+                // If we want importance to significantly affect ranking, we might want a different modifier or factor.
+                // But log1p is a safe start to avoid huge multipliers.
+                // Actually, often we want linear boost + 1.
+                // Let's stick to log1p for now as it's standard.
+            },
+             "weight": 2.0 // Boost importance influence
+        }),
+    ];
 
-    // Wrap with function score for geo bias
     if params.focus_lat.is_some() && params.focus_lon.is_some() {
         let focus_lat = params.focus_lat.unwrap();
         let focus_lon = params.focus_lon.unwrap();
-
-        query = json!({
-            "function_score": {
-                "query": query,
-                "functions": [
-                    {
-                        "gauss": {
-                            "center_point": {
-                                "origin": { "lat": focus_lat, "lon": focus_lon },
-                                "scale": "50km",
-                                "offset": "10km",
-                                "decay": 0.5
-                            }
-                        },
-                        "weight": params.focus_weight.unwrap_or(3.0)
-                    }
-                ],
-                "score_mode": "multiply",
-                "boost_mode": "multiply"
-            }
-        });
+        functions.push(json!({
+            "gauss": {
+                "center_point": {
+                    "origin": { "lat": focus_lat, "lon": focus_lon },
+                    "scale": "50km",
+                    "offset": "10km",
+                    "decay": 0.5
+                }
+            },
+            "weight": params.focus_weight.unwrap_or(3.0)
+        }));
     }
+
+    let query = json!({
+        "function_score": {
+            "query": { "bool": bool_query },
+            "functions": functions,
+            "score_mode": "sum",    // Sum the scores from functions (importance + geo)
+            "boost_mode": "multiply" // Multiply original text score by function score
+        }
+    });
 
     // Build full request body
     let mut body = json!({

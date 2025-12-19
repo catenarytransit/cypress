@@ -117,6 +117,9 @@
       "wikidata_id": {
         "type": "keyword"
       },
+      "importance": {
+        "type": "double"
+      },
       "layer": {
         "type": "keyword"
       },

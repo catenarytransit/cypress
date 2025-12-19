@@ -3,23 +3,30 @@
 //! Parses OSM data, extracts places, performs PIP lookups,
 //! and indexes into Elasticsearch.
 
+mod geometry;
+mod importance;
+
 use std::fs::File;
 use std::io::BufReader;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::Parser;
+use geo::{BoundingRect, Centroid};
 use indicatif::{ProgressBar, ProgressStyle};
 use osmpbfreader::OsmPbfReader;
 use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use cypress::elasticsearch::{create_index, BulkIndexer, EsClient};
-use cypress::models::{Address, GeoPoint, Layer, OsmType, Place};
+use cypress::models::{Address, GeoBbox, GeoPoint, Layer, OsmType, Place};
 use cypress::pip::{extract_admin_boundaries, AdminSpatialIndex, PipService};
 use cypress::wikidata::WikidataFetcher;
+
+use crate::geometry::GeometryResolver;
+use crate::importance::{calculate_default_importance, load_importance};
 
 #[derive(Parser, Debug)]
 #[command(name = "ingest")]
@@ -52,6 +59,10 @@ struct Args {
     /// Batch size for bulk indexing
     #[arg(long, default_value = "5000")]
     batch_size: usize,
+
+    /// Path to wikimedia-importance.csv (optional)
+    #[arg(long)]
+    importance_file: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -92,6 +103,16 @@ async fn main() -> Result<()> {
 
     let import_start = Utc::now();
 
+    // Load importance data
+    let importance_map = if let Some(path) = &args.importance_file {
+        Some(load_importance(path)?)
+    } else if Path::new("wikimedia-importance.csv").exists() {
+        Some(load_importance(Path::new("wikimedia-importance.csv"))?)
+    } else {
+        warn!("No importance file found. Skipping importance ranking.");
+        None
+    };
+
     // Open PBF file
     let file = File::open(&args.file).context("Failed to open PBF file")?;
     let mut reader = OsmPbfReader::new(BufReader::new(file));
@@ -99,13 +120,19 @@ async fn main() -> Result<()> {
     // Extract admin boundaries and build PIP service
     info!("Building admin boundary index...");
     let boundaries = extract_admin_boundaries(&mut reader)?;
-    let spatial_index = AdminSpatialIndex::build(boundaries);
+    let spatial_index = AdminSpatialIndex::build(boundaries.clone());
     let pip_service = Arc::new(PipService::new(spatial_index));
 
     info!(
         "PIP service ready with {} boundaries",
         pip_service.index().len()
     );
+
+    // Build GeometryResolver for Ways
+    let file = File::open(&args.file)?;
+    let mut reader = OsmPbfReader::new(BufReader::new(file));
+    let geometry_resolver =
+        GeometryResolver::build(&mut reader, |tags| determine_layer(tags).is_some())?;
 
     // Initialize Wikidata fetcher if enabled
     let mut wikidata = if args.wikidata {
@@ -114,11 +141,12 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Re-open file for place extraction
+    // Re-open file for place extraction (count first)
+    // Note: Counting is expensive on large files, maybe skip?
+    // User code had it, we'll keep it but it adds a pass.
     let file = File::open(&args.file)?;
     let mut reader = OsmPbfReader::new(BufReader::new(file));
 
-    // First pass: count objects for progress
     info!("Counting objects...");
     let mut total_count = 0u64;
     for obj in reader.iter() {
@@ -149,6 +177,44 @@ async fn main() -> Result<()> {
     let mut wikidata_ids: Vec<String> = Vec::new();
     let mut places_buffer: Vec<Place> = Vec::new();
 
+    // Index Admin Boundaries first
+    info!("Indexing {} administrative boundaries...", boundaries.len());
+    for boundary in boundaries {
+        let center = boundary.geometry.centroid().map(|p| GeoPoint {
+            lat: p.y(),
+            lon: p.x(),
+        });
+        let bbox = boundary
+            .bbox()
+            .map(|(min_x, min_y, max_x, max_y)| GeoBbox::new(min_x, min_y, max_x, max_y));
+
+        if let Some(center) = center {
+            let mut place = Place::new(
+                OsmType::Relation,
+                boundary.area.osm_id,
+                Layer::Admin, // Use Admin layer
+                center,
+                &source_file,
+            );
+            place.name = boundary.area.name;
+            place.wikidata_id = boundary.area.wikidata_id;
+            place.bbox = bbox;
+
+            // Assign importance if available
+            if let Some(ref map) = importance_map {
+                if let Some(ref qid) = place.wikidata_id {
+                    place.importance = map.get(qid).copied();
+                }
+            }
+
+            // We could also do PIP lookup for parent, but admin boundaries ARE the parents.
+            // Usually admins form a hierarchy.
+            // Ideally we index them appropriately.
+
+            indexer.add(place).await?;
+        }
+    }
+
     info!("Processing OSM objects...");
 
     // Process each OSM object
@@ -164,7 +230,7 @@ async fn main() -> Result<()> {
         };
 
         // Try to extract a place from this object
-        if let Some(mut place) = extract_place(&obj, &source_file)? {
+        if let Some(mut place) = extract_place(&obj, &source_file, &geometry_resolver)? {
             // PIP lookup for admin hierarchy
             let hierarchy = pip_service.lookup(place.center_point.lon, place.center_point.lat);
             place.parent = hierarchy;
@@ -172,6 +238,13 @@ async fn main() -> Result<()> {
             // Collect Wikidata ID if present
             if let Some(ref qid) = place.wikidata_id {
                 wikidata_ids.push(qid.clone());
+
+                // Assign importance
+                if let Some(ref map) = importance_map {
+                    if let Some(score) = map.get(qid) {
+                        place.importance = Some(*score);
+                    }
+                }
             }
 
             places_buffer.push(place);
@@ -238,53 +311,76 @@ async fn main() -> Result<()> {
 }
 
 /// Extract a Place from an OSM object if it's relevant
-fn extract_place(obj: &osmpbfreader::OsmObj, source_file: &str) -> Result<Option<Place>> {
+fn extract_place(
+    obj: &osmpbfreader::OsmObj,
+    source_file: &str,
+    resolver: &GeometryResolver,
+) -> Result<Option<Place>> {
     use osmpbfreader::OsmObj;
 
     match obj {
         OsmObj::Node(node) => {
-            // Check if this node is interesting (has relevant tags)
-            let tags = &node.tags;
-
-            // Must have a name to be searchable
-            if !tags.contains_key("name") {
+            if !has_relevant_tags(&node.tags) {
                 return Ok(None);
             }
-
-            // Determine layer from tags
-            let layer = determine_layer(tags);
-            if layer.is_none() {
-                return Ok(None);
+            if let Some(layer) = determine_layer(&node.tags) {
+                let center = GeoPoint {
+                    lat: node.lat(),
+                    lon: node.lon(),
+                };
+                let mut place = Place::new(OsmType::Node, node.id.0, layer, center, source_file);
+                place.importance = Some(calculate_default_importance(&node.tags));
+                extract_tags(&mut place, &node.tags);
+                Ok(Some(place))
+            } else {
+                Ok(None)
             }
-
-            let center = GeoPoint {
-                lat: node.lat(),
-                lon: node.lon(),
-            };
-
-            let mut place = Place::new(
-                OsmType::Node,
-                node.id.0,
-                layer.unwrap(),
-                center,
-                source_file,
-            );
-
-            // Extract names and other tags
-            extract_tags(&mut place, tags);
-
-            Ok(Some(place))
         }
-        OsmObj::Way(_way) => {
-            // Ways need coordinate lookup - skip for now, handle in full pipeline
-            // For now, we focus on nodes
-            Ok(None)
+        OsmObj::Way(way) => {
+            if !has_relevant_tags(&way.tags) {
+                return Ok(None);
+            }
+            if let Some(layer) = determine_layer(&way.tags) {
+                // Resolve geometry
+                if let Some((lon, lat)) = resolver.resolve_centroid(way.id) {
+                    let center = GeoPoint { lat, lon };
+                    let mut place = Place::new(OsmType::Way, way.id.0, layer, center, source_file);
+                    place.importance = Some(calculate_default_importance(&way.tags));
+                    extract_tags(&mut place, &way.tags);
+
+                    // Optional: Add Bbox
+                    if let Some(poly) = resolver.resolve_way(way.id) {
+                        if let Some(rect) = poly.bounding_rect() {
+                            place.bbox = Some(GeoBbox::new(
+                                rect.min().x,
+                                rect.min().y,
+                                rect.max().x,
+                                rect.max().y,
+                            ));
+                        }
+                    }
+
+                    Ok(Some(place))
+                } else {
+                    // warn!("Could not resolve geometry for way {}", way.id.0);
+                    Ok(None)
+                }
+            } else {
+                Ok(None)
+            }
         }
         OsmObj::Relation(_rel) => {
-            // Relations are complex - mainly admin boundaries handled separately
+            // Relation handling is complex (multipolygon).
+            // We handled Admin boundaries separately.
+            // Generic multipolygons (POIs) can be handled if we extend GeometryResolver.
+            // For now, we skip non-admin relations.
             Ok(None)
         }
     }
+}
+
+fn has_relevant_tags(tags: &osmpbfreader::Tags) -> bool {
+    tags.contains_key("name")
 }
 
 /// Determine the layer/type from OSM tags
@@ -300,14 +396,24 @@ fn determine_layer(tags: &osmpbfreader::Tags) -> Option<Layer> {
         };
     }
 
+    // Check for boundary=administrative
+    if tags
+        .get("boundary")
+        .map(|v| v == "administrative")
+        .unwrap_or(false)
+    {
+        return Some(Layer::Admin);
+    }
+
     // Check for address
     if tags.contains_key("addr:housenumber") && tags.contains_key("addr:street") {
         return Some(Layer::Address);
     }
 
     // Check for various POI types
+    // Expanded list
     let poi_keys = [
-        "amenity", "shop", "tourism", "leisure", "office", "building",
+        "amenity", "shop", "tourism", "leisure", "office", "building", "historic", "craft",
     ];
     for key in &poi_keys {
         if tags.contains_key(*key) {
@@ -318,7 +424,7 @@ fn determine_layer(tags: &osmpbfreader::Tags) -> Option<Layer> {
     // Check for highway (streets)
     if tags
         .get("highway")
-        .map(|v| v == "residential" || v == "primary" || v == "secondary")
+        .map(|v| v == "residential" || v == "primary" || v == "secondary" || v == "tertiary")
         .unwrap_or(false)
     {
         return Some(Layer::Street);
@@ -339,7 +445,7 @@ fn extract_tags(place: &mut Place, tags: &osmpbfreader::Tags) {
             place.add_name(lang, value.to_string());
         }
         // Wikidata
-        else if key_str == "wikidata" {
+        else if key_str == "wikidata" || key_str == "brand:wikidata" {
             place.wikidata_id = Some(value.to_string());
         }
         // Address components
@@ -357,7 +463,7 @@ fn extract_tags(place: &mut Place, tags: &osmpbfreader::Tags) {
         }
         // Categories (POI types)
         else if [
-            "amenity", "shop", "tourism", "leisure", "cuisine", "building",
+            "amenity", "shop", "tourism", "leisure", "cuisine", "building", "historic", "office",
         ]
         .contains(&key_str)
         {

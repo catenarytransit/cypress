@@ -98,6 +98,24 @@ else
 fi
 echo
 
+# Download and extract Importance Data if needed
+IMPORTANCE_URL="https://nominatim.org/data/wikimedia-importance.csv.gz"
+IMPORTANCE_FILE="${DATA_DIR}/wikimedia-importance.csv.gz"
+IMPORTANCE_CSV="${DATA_DIR}/wikimedia-importance.csv"
+
+echo "Checking Importance Data..."
+if [ ! -f "$IMPORTANCE_CSV" ]; then
+    if [ ! -f "$IMPORTANCE_FILE" ]; then
+        echo "Downloading Importance Data..."
+        curl -A "Mozilla/5.0 (CypressImport/1.0)" -L -o "$IMPORTANCE_FILE" "$IMPORTANCE_URL"
+    fi
+    echo "Extracting Importance Data..."
+    gunzip -k "$IMPORTANCE_FILE"
+else
+    echo "Importance Data exists."
+fi
+echo
+
 # Iterate over regions
 for region in "${REGIONS[@]}"; do
     IFS="|" read -r NAME URL <<< "$region"
@@ -113,7 +131,7 @@ for region in "${REGIONS[@]}"; do
     # 1. Download
     if [ ! -f "$RAW_PBF" ] || [ "$DOWNLOAD" = true ]; then
         echo "Downloading $NAME..."
-        curl -L -o "$RAW_PBF" "$URL"
+        curl -A "Mozilla/5.0 (CypressImport/1.0)" -L -o "$RAW_PBF" "$URL"
         # Force re-filter if new download
         rm -f "$FILTERED_PBF"
     else
@@ -152,6 +170,7 @@ for region in "${REGIONS[@]}"; do
         --es-url "$ES_URL" \
         --refresh \
         $WIKIDATA \
+        --importance-file "$IMPORTANCE_CSV" \
         $CURRENT_FRESH_ARG
         
     echo "Finished $NAME"

@@ -108,6 +108,10 @@ pub struct Place {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wikidata_id: Option<String>,
 
+    /// Importance ranking (0.0 to 1.0)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub importance: Option<f64>,
+
     /// Layer/type classification
     pub layer: Layer,
 
@@ -153,6 +157,7 @@ impl Place {
             osm_type,
             osm_id,
             wikidata_id: None,
+            importance: None,
             layer,
             categories: Vec::new(),
             name: HashMap::new(),
