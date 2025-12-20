@@ -3,7 +3,6 @@
 //! Parses OSM data, extracts places, performs PIP lookups,
 //! and indexes into Elasticsearch.
 
-mod geometry;
 mod importance;
 
 use std::fs::File;
@@ -22,10 +21,9 @@ use tracing_subscriber::FmtSubscriber;
 
 use cypress::elasticsearch::{create_index, BulkIndexer, EsClient};
 use cypress::models::{Address, GeoBbox, GeoPoint, Layer, OsmType, Place};
-use cypress::pip::{extract_admin_boundaries, AdminSpatialIndex, PipService};
+use cypress::pip::{extract_admin_boundaries, AdminSpatialIndex, GeometryResolver, PipService};
 use cypress::wikidata::WikidataFetcher;
 
-use crate::geometry::GeometryResolver;
 use crate::importance::{calculate_default_importance, load_importance};
 
 #[derive(Parser, Debug)]
@@ -35,6 +33,10 @@ struct Args {
     /// OSM PBF file to import
     #[arg(short, long)]
     file: PathBuf,
+
+    /// Optional pre-filtered admin boundary file
+    #[arg(long)]
+    admin_file: Option<PathBuf>,
 
     /// Elasticsearch URL
     #[arg(long, default_value = "http://localhost:9200")]
@@ -114,12 +116,40 @@ async fn main() -> Result<()> {
     };
 
     // Open PBF file
-    let file = File::open(&args.file).context("Failed to open PBF file")?;
-    let mut reader = OsmPbfReader::new(BufReader::new(file));
+    // Build GeometryResolver(s)
+    let (admin_resolver, _place_resolver_source) = if let Some(admin_path) = &args.admin_file {
+        info!(
+            "Building admin geometry index from: {}",
+            admin_path.display()
+        );
+        let file = File::open(admin_path).context("Failed to open admin PBF file")?;
+        let mut reader = OsmPbfReader::new(BufReader::new(file));
+        // No filter needed for pre-filtered file, or ensure we get relations/ways
+        let resolver = GeometryResolver::build(&mut reader, |_| true)?;
+        (resolver, None)
+    } else {
+        // Use main file for both
+        info!("Building geometry index from main file...");
+        let file = File::open(&args.file).context("Failed to open PBF file")?;
+        let mut reader = OsmPbfReader::new(BufReader::new(file));
+        let resolver =
+            GeometryResolver::build(&mut reader, |tags| determine_layer(tags).is_some())?;
+        // Clone/re-use strategy: GeometryResolver is read-only mostly, but expensive to clone if it owns DB?
+        // Actually GeometryResolver uses sled::Db which is cloneable (handles).
+        // BUT we need a separate one for places if we didn't build the admin one from the main file.
+        // If we build admin from SMALL file, we can't use it for places (missing nodes).
+        // So we need a second build for places later.
+        (resolver, Some(&args.file))
+    };
 
-    // Extract admin boundaries and build PIP service
-    info!("Building admin boundary index...");
-    let boundaries = extract_admin_boundaries(&mut reader)?;
+    // Extract admin boundaries using admin_resolver
+    let boundaries = {
+        let path = args.admin_file.as_ref().unwrap_or(&args.file);
+        info!("Extracting admin boundaries from: {}", path.display());
+        let file = File::open(path)?;
+        let mut reader = OsmPbfReader::new(BufReader::new(file));
+        extract_admin_boundaries(&mut reader, &admin_resolver)?
+    };
     let spatial_index = AdminSpatialIndex::build(boundaries.clone());
     let pip_service = Arc::new(PipService::new(spatial_index));
 
@@ -128,17 +158,39 @@ async fn main() -> Result<()> {
         pip_service.index().len()
     );
 
-    // Build GeometryResolver for Ways
-    let file = File::open(&args.file)?;
-    let mut reader = OsmPbfReader::new(BufReader::new(file));
-    let geometry_resolver =
-        GeometryResolver::build(&mut reader, |tags| determine_layer(tags).is_some())?;
-
     // Initialize Wikidata fetcher if enabled
     let mut wikidata = if args.wikidata {
         Some(WikidataFetcher::new())
     } else {
         None
+    };
+
+    // Prepare resolver for places
+    // If we have an admin file, admin_resolver is ONLY for admins. We need a new one for places from MAIN file.
+    // If we don't, admin_resolver IS the place resolver (built from main file).
+    let place_resolver = if args.admin_file.is_some() {
+        info!("Building place geometry index from main file...");
+        let file = File::open(&args.file)?;
+        let mut reader = OsmPbfReader::new(BufReader::new(file));
+        GeometryResolver::build(&mut reader, |tags| determine_layer(tags).is_some())?
+    } else {
+        // We can reuse the admin_resolver since it WAS built from main file
+        // But wait, in the `else` block above we returned `(resolver, Some(&args.file))`
+        // actually `admin_resolver` ignores the second tuple item in this scope?
+        // Let's refine the logic.
+        // GeometryResolver contains a sled::Db. We can clone it?
+        // Struct definition: struct GeometryResolver { node_db: Db, ... }
+        // Db is thread-safe and cloneable.
+        // But we shouldn't re-build it if we don't have to.
+        // The simplistic approach above works: `admin_resolver` is used, we just need to alias it or clone it.
+        // However, Rust ownership.
+        // Let's make `place_resolver` a reference or move it?
+        // We need `admin_resolver` for the PIP service? No, `admin_resolver` was used to Extract Boundaries.
+        // The PIP service uses `boundaries` (Vec<AdminBoundary>).
+        // So `admin_resolver` is DONE after extraction.
+        // So we can move it or drop it.
+        // If we didn't have admin file, `admin_resolver` should be reused as `place_resolver`.
+        admin_resolver
     };
 
     // Re-open file for place extraction (count first)
@@ -231,7 +283,7 @@ async fn main() -> Result<()> {
         };
 
         // Try to extract a place from this object
-        if let Some(mut place) = extract_place(&obj, &source_file, &geometry_resolver)? {
+        if let Some(mut place) = extract_place(&obj, &source_file, &place_resolver)? {
             // PIP lookup for admin hierarchy
             let hierarchy = pip_service.lookup(place.center_point.lon, place.center_point.lat);
             place.parent = hierarchy;

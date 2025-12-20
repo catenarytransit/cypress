@@ -69,22 +69,35 @@ fi
 echo "Raw PBF: $RAW_PBF ($(du -h "$RAW_PBF" | cut -f1))"
 
 # Filter the PBF to reduce memory usage
-if [ "$NO_FILTER" = false ] && command -v osmium &> /dev/null; then
-    # Re-filter if filtered file doesn't exist or is older than raw file
-    if [ ! -f "$FILTERED_PBF" ] || [ "$RAW_PBF" -nt "$FILTERED_PBF" ]; then
-        echo
-        echo "Pre-filtering OSM data (reduces memory usage)..."
-        "$SCRIPT_DIR/filter_osm.sh" "$RAW_PBF" "$FILTERED_PBF"
+if [ "$NO_FILTER" = false ]; then
+    if command -v osmium &> /dev/null; then
+        # General filter
+        if [ ! -f "$FILTERED_PBF" ] || [ "$RAW_PBF" -nt "$FILTERED_PBF" ]; then
+            echo
+            echo "Pre-filtering OSM data (reduces memory usage)..."
+            "$SCRIPT_DIR/filter_osm.sh" "$RAW_PBF" "$FILTERED_PBF"
+        else
+            echo "Using cached filtered file: $FILTERED_PBF ($(du -h "$FILTERED_PBF" | cut -f1))"
+        fi
+        PBF_FILE="$FILTERED_PBF"
+
+        # Admin filter
+        ADMIN_PBF="${DATA_DIR}/switzerland-admins.osm.pbf"
+        if [ ! -f "$ADMIN_PBF" ] || [ "$RAW_PBF" -nt "$ADMIN_PBF" ]; then
+            echo "Filtering admin boundaries..."
+            "$SCRIPT_DIR/filter_admins.sh" "$RAW_PBF" "$ADMIN_PBF"
+        else
+            echo "Using cached admin file: $ADMIN_PBF"
+        fi
     else
-        echo "Using cached filtered file: $FILTERED_PBF ($(du -h "$FILTERED_PBF" | cut -f1))"
-    fi
-    PBF_FILE="$FILTERED_PBF"
-else
-    if [ "$NO_FILTER" = false ]; then
         echo "Warning: osmium-tool not found, skipping pre-filter step"
         echo "  Install with: apt install osmium-tool"
+        PBF_FILE="$RAW_PBF"
+        ADMIN_PBF=""
     fi
+else
     PBF_FILE="$RAW_PBF"
+    ADMIN_PBF=""
 fi
 
 echo
@@ -116,6 +129,7 @@ echo
 echo "Starting import..."
 cargo run --release --bin ingest -- \
     --file "$PBF_FILE" \
+    --admin-file "$ADMIN_PBF" \
     --refresh \
     $WIKIDATA \
     $FRESH

@@ -140,15 +140,27 @@ for region in "${REGIONS[@]}"; do
     
     # 2. Filter
     PBF_TO_IMPORT="$RAW_PBF"
+    ADMIN_PBF=""
+    
     if [ "$NO_FILTER" = false ]; then
         if command -v osmium &> /dev/null; then
+            # General filter (places)
             if [ ! -f "$FILTERED_PBF" ] || [ "$RAW_PBF" -nt "$FILTERED_PBF" ]; then
-                echo "Filtering $NAME..."
+                echo "Filtering places in $NAME..."
                 "$SCRIPT_DIR/filter_osm.sh" "$RAW_PBF" "$FILTERED_PBF"
             else
                 echo "Using cached filtered file: $FILTERED_PBF"
             fi
             PBF_TO_IMPORT="$FILTERED_PBF"
+            
+            # Admin filter
+            ADMIN_PBF="${DATA_DIR}/${FILENAME%.osm.pbf}-admins.osm.pbf"
+            if [ ! -f "$ADMIN_PBF" ] || [ "$RAW_PBF" -nt "$ADMIN_PBF" ]; then
+                echo "Filtering admin boundaries in $NAME..."
+                "$SCRIPT_DIR/filter_admins.sh" "$RAW_PBF" "$ADMIN_PBF"
+            else
+                echo "Using cached admin file: $ADMIN_PBF"
+            fi
         else
              echo "Warning: osmium-tool not found, skipping filter."
         fi
@@ -165,13 +177,24 @@ for region in "${REGIONS[@]}"; do
     echo "Importing $NAME into Elasticsearch..."
     cd "$PROJECT_DIR"
     
-    cargo run --release --bin ingest -- \
-        --file "$PBF_TO_IMPORT" \
-        --es-url "$ES_URL" \
-        --refresh \
-        $WIKIDATA \
-        --importance-file "$IMPORTANCE_CSV" \
-        $CURRENT_FRESH_ARG
+    if [ -n "$ADMIN_PBF" ]; then
+        cargo run --release --bin ingest -- \
+            --file "$PBF_TO_IMPORT" \
+            --admin-file "$ADMIN_PBF" \
+            --es-url "$ES_URL" \
+            --refresh \
+            $WIKIDATA \
+            --importance-file "$IMPORTANCE_CSV" \
+            $CURRENT_FRESH_ARG
+    else
+        cargo run --release --bin ingest -- \
+            --file "$PBF_TO_IMPORT" \
+            --es-url "$ES_URL" \
+            --refresh \
+            $WIKIDATA \
+            --importance-file "$IMPORTANCE_CSV" \
+            $CURRENT_FRESH_ARG
+    fi
         
     echo "Finished $NAME"
     echo
