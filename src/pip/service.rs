@@ -18,14 +18,19 @@ impl PipService {
     }
 
     /// Build the admin hierarchy for a point
-    pub fn lookup(&self, lon: f64, lat: f64) -> AdminHierarchy {
+    pub fn lookup(&self, lon: f64, lat: f64, limit_level: Option<AdminLevel>) -> AdminHierarchy {
         let mut hierarchy = AdminHierarchy::default();
 
         // Find all containing boundaries
-        let boundaries = self.index.lookup(lon, lat);
+        let mut boundaries = self.index.lookup(lon, lat);
+
+        // Filter out boundaries that are at or below the limit level (if provided)
+        if let Some(limit) = limit_level {
+            boundaries.retain(|b| b.area.level < limit);
+        }
 
         debug!(
-            "PIP lookup at ({}, {}): found {} boundaries",
+            "PIP lookup at ({}, {}): found {} boundaries after filtering",
             lon,
             lat,
             boundaries.len()
@@ -62,7 +67,7 @@ mod tests {
     fn test_empty_hierarchy() {
         let index = AdminSpatialIndex::build(vec![]);
         let service = PipService::new(index);
-        let hierarchy = service.lookup(8.5, 47.4);
+        let hierarchy = service.lookup(8.5, 47.4, None);
         assert!(hierarchy.country.is_none());
     }
 }

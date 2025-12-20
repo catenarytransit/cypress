@@ -102,6 +102,15 @@ pub fn extract_admin_boundaries<R: std::io::Read + std::io::Seek>(
 
         // Resolve geometry
         if let Some(geometry) = resolver.resolve_boundary(&obj) {
+            use geo::BoundingRect;
+            if let Some(rect) = geometry.bounding_rect() {
+                area.bbox = Some(crate::models::place::GeoBbox::new(
+                    rect.min().x,
+                    rect.min().y,
+                    rect.max().x,
+                    rect.max().y,
+                ));
+            }
             boundaries.push(AdminBoundary { area, geometry });
         } else {
             debug!("Could not resolve geometry for admin boundary {}", id);

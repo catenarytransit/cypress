@@ -252,6 +252,14 @@ async fn main() -> Result<()> {
             place.wikidata_id = boundary.area.wikidata_id;
             place.bbox = bbox;
 
+            // PIP lookup for admin hierarchy (limit to higher levels)
+            let hierarchy = pip_service.lookup(
+                place.center_point.lon,
+                place.center_point.lat,
+                Some(boundary.area.level),
+            );
+            place.parent = hierarchy;
+
             // Assign importance if available
             if let Some(ref map) = importance_map {
                 if let Some(ref qid) = place.wikidata_id {
@@ -285,7 +293,8 @@ async fn main() -> Result<()> {
         // Try to extract a place from this object
         if let Some(mut place) = extract_place(&obj, &source_file, &place_resolver)? {
             // PIP lookup for admin hierarchy
-            let hierarchy = pip_service.lookup(place.center_point.lon, place.center_point.lat);
+            let hierarchy =
+                pip_service.lookup(place.center_point.lon, place.center_point.lat, None);
             place.parent = hierarchy;
 
             // Collect Wikidata ID if present

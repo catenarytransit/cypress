@@ -107,6 +107,10 @@ pub struct AdminArea {
     /// Multilingual names: {"default": "...", "de": "...", "fr": "..."}
     pub name: HashMap<String, String>,
 
+    /// Bounding box
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bbox: Option<super::place::GeoBbox>,
+
     /// Abbreviation (e.g., "CH" for Switzerland)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub abbr: Option<String>,
@@ -119,6 +123,7 @@ impl AdminArea {
             level,
             wikidata_id: None,
             name: HashMap::new(),
+            bbox: None,
             abbr: None,
         }
     }
@@ -144,6 +149,10 @@ pub struct AdminEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<i64>,
 
+    /// Bounding box
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bbox: Option<super::place::GeoBbox>,
+
     /// Multilingual names: {"de": "...", "fr": "..."}
     #[serde(flatten, skip_serializing_if = "HashMap::is_empty")]
     pub names: HashMap<String, String>,
@@ -155,6 +164,7 @@ impl AdminEntry {
             name: area.name.get("default").cloned(),
             abbr: area.abbr.clone(),
             id: Some(area.osm_id),
+            bbox: area.bbox.clone(),
             names: area
                 .name
                 .iter()
