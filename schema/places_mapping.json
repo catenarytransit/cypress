@@ -204,7 +204,8 @@
             "properties": {
               "name": {
                 "type": "text",
-                "analyzer": "peliasIndex"
+                "analyzer": "peliasIndex",
+                "search_analyzer": "peliasQuery"
               },
               "abbr": {
                 "type": "keyword"
@@ -219,7 +220,8 @@
             "properties": {
               "name": {
                 "type": "text",
-                "analyzer": "peliasIndex"
+                "analyzer": "peliasIndex",
+                "search_analyzer": "peliasQuery"
               },
               "abbr": {
                 "type": "keyword"
@@ -234,7 +236,8 @@
             "properties": {
               "name": {
                 "type": "text",
-                "analyzer": "peliasIndex"
+                "analyzer": "peliasIndex",
+                "search_analyzer": "peliasQuery"
               },
               "abbr": {
                 "type": "keyword"
@@ -249,7 +252,8 @@
             "properties": {
               "name": {
                 "type": "text",
-                "analyzer": "peliasIndex"
+                "analyzer": "peliasIndex",
+                "search_analyzer": "peliasQuery"
               },
               "abbr": {
                 "type": "keyword"
@@ -264,7 +268,8 @@
             "properties": {
               "name": {
                 "type": "text",
-                "analyzer": "peliasIndex"
+                "analyzer": "peliasIndex",
+                "search_analyzer": "peliasQuery"
               },
               "abbr": {
                 "type": "keyword"
@@ -279,7 +284,8 @@
             "properties": {
               "name": {
                 "type": "text",
-                "analyzer": "peliasIndex"
+                "analyzer": "peliasIndex",
+                "search_analyzer": "peliasQuery"
               },
               "abbr": {
                 "type": "keyword"
@@ -294,7 +300,8 @@
             "properties": {
               "name": {
                 "type": "text",
-                "analyzer": "peliasIndex"
+                "analyzer": "peliasIndex",
+                "search_analyzer": "peliasQuery"
               },
               "abbr": {
                 "type": "keyword"
@@ -309,7 +316,8 @@
             "properties": {
               "name": {
                 "type": "text",
-                "analyzer": "peliasIndex"
+                "analyzer": "peliasIndex",
+                "search_analyzer": "peliasQuery"
               },
               "abbr": {
                 "type": "keyword"

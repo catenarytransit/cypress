@@ -136,9 +136,13 @@ pub async fn execute_search(
                 "fields": [
                     "name.default",
                     "parent.country.name",
+                    "parent.macro_region.name",
                     "parent.region.name",
+                    "parent.macro_county.name",
                     "parent.county.name",
+                    "parent.local_admin.name",
                     "parent.locality.name",
+                    "parent.borough.name",
                     "parent.neighbourhood.name"
                 ],
                 "analyzer": "peliasQuery",
