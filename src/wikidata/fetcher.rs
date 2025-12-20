@@ -1,6 +1,6 @@
 //! Wikidata label fetcher using SPARQL queries.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -97,48 +97,83 @@ impl WikidataFetcher {
             values
         );
 
-        let response = self
-            .client
-            .get(WIKIDATA_SPARQL_ENDPOINT)
-            .query(&[("query", &query), ("format", &"json".to_string())])
-            .send()
-            .await
-            .context("Wikidata SPARQL request failed")?;
+        let mut attempts = 0;
+        let max_attempts = 2;
 
-        if !response.status().is_success() {
-            warn!("Wikidata query failed: {}", response.status());
+        while attempts < max_attempts {
+            attempts += 1;
+
+            let response = match self
+                .client
+                .get(WIKIDATA_SPARQL_ENDPOINT)
+                .query(&[("query", &query), ("format", &"json".to_string())])
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(
+                        "Wikidata SPARQL request failed (attempt {}/{}): {}",
+                        attempts, max_attempts, e
+                    );
+                    if attempts < max_attempts {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        continue;
+                    }
+                    return Ok(());
+                }
+            };
+
+            if !response.status().is_success() {
+                warn!(
+                    "Wikidata query failed with status {} (attempt {}/{}): {:?}",
+                    response.status(),
+                    attempts,
+                    max_attempts,
+                    response.text().await.ok()
+                );
+                if attempts < max_attempts {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+                return Ok(());
+            }
+
+            let data: SparqlResponse = match response.json().await {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!("Failed to parse Wikidata response: {}", e);
+                    return Ok(());
+                }
+            };
+
+            // Process results
+            for binding in data.results.bindings {
+                // Extract Q-ID from URI
+                let qid = binding
+                    .item
+                    .value
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+
+                if qid.is_empty() {
+                    continue;
+                }
+
+                let lang = binding.label.lang.unwrap_or_else(|| "default".to_string());
+
+                self.cache
+                    .entry(qid)
+                    .or_insert_with(HashMap::new)
+                    .insert(lang, binding.label.value);
+            }
+
+            debug!("Fetched labels for {} items", qids.len());
             return Ok(());
         }
 
-        let data: SparqlResponse = response
-            .json()
-            .await
-            .context("Failed to parse Wikidata response")?;
-
-        // Process results
-        for binding in data.results.bindings {
-            // Extract Q-ID from URI
-            let qid = binding
-                .item
-                .value
-                .rsplit('/')
-                .next()
-                .unwrap_or("")
-                .to_string();
-
-            if qid.is_empty() {
-                continue;
-            }
-
-            let lang = binding.label.lang.unwrap_or_else(|| "default".to_string());
-
-            self.cache
-                .entry(qid)
-                .or_insert_with(HashMap::new)
-                .insert(lang, binding.label.value);
-        }
-
-        debug!("Fetched labels for {} items", qids.len());
         Ok(())
     }
 
