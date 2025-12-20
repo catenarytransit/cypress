@@ -1,6 +1,9 @@
 # Cypress
 
-A Rust-based geocoding system with Elasticsearch, inspired by [Pelias](https://pelias.io/).
+A Rust-based geocoding system with Elasticsearch, inspired by [Pelias](https://pelias.io/) and [Nominatim](https://nominatim.org/).
+
+![1200x680](https://github.com/user-attachments/assets/496f0dba-7e6d-4b50-90cc-744f21909ece)
+
 
 ## Features
 
