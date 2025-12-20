@@ -54,6 +54,22 @@ cargo run --release --bin ingest -- \
 cargo run --release --bin query -- --listen 0.0.0.0:3000
 ```
 
+## Data Management
+
+### Wiping a Region
+
+If you need to remove data for a specific region (e.g., to re-import it or free up space), you can use the `wipe_region.sh` script:
+
+```bash
+# Wipe data for Albania
+./scripts/wipe_region.sh Albania
+
+# Wipe data using a custom Elasticsearch URL
+./scripts/wipe_region.sh Germany --url http://10.0.0.5:9200
+```
+
+The script identifies the correct records using the `source_file` field based on the regions defined in `scripts/import_global.sh`.
+
 ## API Endpoints
 
 ### Forward Geocoding
