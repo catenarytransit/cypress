@@ -10,6 +10,7 @@
 #   --no-filter       Skip osmium pre-filtering
 #   --url <url>       Custom Elasticsearch URL (default: http://localhost:9200)
 #   --tmp-dir <dir>   Directory for temporary data files (PBFs) (default: ./data)
+#   --discord-webhook <url> Discord webhook URL for notifications
 #
 # This script downloads, filters, and imports data for multiple global regions.
 
@@ -99,6 +100,7 @@ FRESH_FLAG=""
 NO_FILTER=false
 IS_FIRST_IMPORT=true
 ES_URL="http://localhost:9200"
+DISCORD_WEBHOOK=""
 
 # Use ELASTICSEARCH_URL env var if set
 if [ -n "$ELASTICSEARCH_URL" ]; then
@@ -130,6 +132,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --tmp-dir)
             DATA_DIR="$2"
+            shift 2
+            ;;
+        --discord-webhook)
+            DISCORD_WEBHOOK="--discord-webhook $2"
             shift 2
             ;;
         *)
@@ -244,7 +250,8 @@ for region in "${REGIONS[@]}"; do
             --refresh \
             $WIKIDATA \
             --importance-file "$IMPORTANCE_CSV" \
-            $CURRENT_FRESH_ARG
+            $CURRENT_FRESH_ARG \
+            $DISCORD_WEBHOOK
     else
         cargo run --release --bin ingest -- \
             --file "$PBF_TO_IMPORT" \
@@ -252,7 +259,8 @@ for region in "${REGIONS[@]}"; do
             --refresh \
             $WIKIDATA \
             --importance-file "$IMPORTANCE_CSV" \
-            $CURRENT_FRESH_ARG
+            $CURRENT_FRESH_ARG \
+            $DISCORD_WEBHOOK
     fi
         
     echo "Finished $NAME"

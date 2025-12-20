@@ -19,6 +19,7 @@ use osmpbfreader::OsmPbfReader;
 use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
+use cypress::discord::DiscordWebhook;
 use cypress::elasticsearch::{create_index, BulkIndexer, EsClient};
 use cypress::models::{Address, GeoBbox, GeoPoint, Layer, OsmType, Place};
 use cypress::pip::{extract_admin_boundaries, AdminSpatialIndex, GeometryResolver, PipService};
@@ -65,6 +66,10 @@ struct Args {
     /// Path to wikimedia-importance.csv (optional)
     #[arg(long)]
     importance_file: Option<PathBuf>,
+
+    /// Discord webhook URL for notifications (optional)
+    #[arg(long)]
+    discord_webhook: Option<String>,
 }
 
 #[tokio::main]
@@ -90,10 +95,11 @@ async fn main() -> Result<()> {
     }
     info!("Connected to Elasticsearch");
 
-    // Create index if requested
-    if args.create_index {
-        create_index(&es_client, true).await?;
-    }
+    // Initialize Discord webhook
+    let discord = args
+        .discord_webhook
+        .as_ref()
+        .map(|url| DiscordWebhook::new(url.clone()));
 
     // Get source file name for tracking
     let source_file = args
@@ -102,6 +108,21 @@ async fn main() -> Result<()> {
         .and_then(|n| n.to_str())
         .unwrap_or("unknown.osm.pbf")
         .to_string();
+
+    if let Some(ref dw) = discord {
+        let _ = dw
+            .send_notification(
+                "Ingestion Started",
+                &format!("Starting ingestion for: **{}**", source_file),
+                true,
+            )
+            .await;
+    }
+
+    // Create index if requested
+    if args.create_index {
+        create_index(&es_client, true).await?;
+    }
 
     let import_start = Utc::now();
 
@@ -142,6 +163,16 @@ async fn main() -> Result<()> {
         (resolver, Some(&args.file))
     };
 
+    if let Some(ref dw) = discord {
+        let _ = dw
+            .send_notification(
+                "Geometry Index Built",
+                &format!("Geometry index building complete for: **{}**", source_file),
+                true,
+            )
+            .await;
+    }
+
     // Extract admin boundaries using admin_resolver
     let boundaries = {
         let path = args.admin_file.as_ref().unwrap_or(&args.file);
@@ -152,6 +183,20 @@ async fn main() -> Result<()> {
     };
     let spatial_index = AdminSpatialIndex::build(boundaries.clone());
     let pip_service = Arc::new(PipService::new(spatial_index));
+
+    if let Some(ref dw) = discord {
+        let _ = dw
+            .send_notification(
+                "Admin Boundaries Extracted",
+                &format!(
+                    "Extracted **{}** admin boundaries for: **{}**",
+                    boundaries.len(),
+                    source_file
+                ),
+                true,
+            )
+            .await;
+    }
 
     info!(
         "PIP service ready with {} boundaries",
@@ -369,6 +414,14 @@ async fn main() -> Result<()> {
     // Final stats
     let doc_count = es_client.doc_count().await?;
     info!("Total documents in index: {}", doc_count);
+
+    if let Some(ref dw) = discord {
+        let _ = dw.send_notification(
+            "Ingestion Complete",
+            &format!("Successfully indexed **{}** documents (with **{}** errors) for **{}**.\nTotal documents in index: **{}**", indexed, errors, source_file, doc_count),
+            true
+        ).await;
+    }
 
     Ok(())
 }

@@ -8,6 +8,7 @@
 #   --wikidata    Also fetch Wikidata labels for multilingual enrichment
 #   --fresh       Delete and recreate the index before importing
 #   --no-filter   Skip the osmium pre-filter step
+#   --discord-webhook <url> Discord webhook URL for notifications
 #
 # Prerequisites:
 #   - Elasticsearch running on localhost:9200
@@ -33,6 +34,7 @@ DOWNLOAD=false
 WIKIDATA=""
 FRESH=""
 NO_FILTER=false
+DISCORD_WEBHOOK=""
 
 for arg in "$@"; do
     case $arg in
@@ -47,6 +49,10 @@ for arg in "$@"; do
             ;;
         --no-filter)
             NO_FILTER=true
+            ;;
+        --discord-webhook)
+            shift
+            DISCORD_WEBHOOK="--discord-webhook $1"
             ;;
     esac
 done
@@ -132,7 +138,8 @@ cargo run --release --bin ingest -- \
     --admin-file "$ADMIN_PBF" \
     --refresh \
     $WIKIDATA \
-    $FRESH
+    $FRESH \
+    $DISCORD_WEBHOOK
 
 # Show stats
 echo
