@@ -1,15 +1,24 @@
 use anyhow::Result;
 use geo::{Coord, LineString, MultiPolygon, Polygon};
 use hashbrown::{HashMap, HashSet};
+use memmap2::Mmap;
 use osmpbfreader::{NodeId, OsmObj, OsmPbfReader, RelationId, WayId};
-use sled::Db;
-use std::io::{Read, Seek};
-use tempfile::Builder;
+use std::io::{BufWriter, Read, Seek, Write};
+use tempfile::tempfile;
 use tracing::info;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct NodeData {
+    id: i64,
+    lon: f64,
+    lat: f64,
+}
 
 /// Manages geometry resolution for Ways and Relations
 pub struct GeometryResolver {
-    node_db: Db,
+    nodes_mmap: Mmap,
+    num_nodes: usize,
     way_nodes: HashMap<WayId, Vec<NodeId>>,
     relation_members: HashMap<RelationId, Vec<WayId>>,
 }
@@ -84,33 +93,100 @@ impl GeometryResolver {
         info!("Pass 3/3: Storing node coordinates...");
         reader.rewind()?;
 
-        let temp_dir = Builder::new().prefix("cypress-geo-").tempdir()?;
-        let db = sled::open(temp_dir.path())?;
-
+        let mut file = tempfile()?;
+        let mut writer = BufWriter::new(&mut file);
         let mut stored_count = 0;
+
+        let mut sorted = true;
+        let mut last_id = i64::MIN;
 
         for obj in reader.iter() {
             let obj = obj?;
             if let OsmObj::Node(node) = obj {
                 if needed_nodes.contains(&node.id) {
-                    let key = node.id.0.to_be_bytes();
-                    let mut value = [0u8; 16];
-                    value[0..8].copy_from_slice(&node.lon().to_be_bytes());
-                    value[8..16].copy_from_slice(&node.lat().to_be_bytes());
-                    db.insert(key, &value)?;
+                    let id = node.id.0;
+                    if id < last_id {
+                        sorted = false;
+                    }
+                    last_id = id;
+
+                    let data = NodeData {
+                        id,
+                        lon: node.lon(),
+                        lat: node.lat(),
+                    };
+
+                    // Safety: NodeData is Repr(C) and contains only plain data types (i64, f64)
+                    // We write the raw bytes directly to the file
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            &data as *const NodeData as *const u8,
+                            std::mem::size_of::<NodeData>(),
+                        )
+                    };
+                    writer.write_all(bytes)?;
                     stored_count += 1;
                 }
             }
         }
 
-        db.flush()?;
-        info!("Stored {} node coordinates", stored_count);
+        writer.flush()?;
+        drop(writer); // Drop writer to release borrow on file
+
+        // Memory map the file
+        file.seek(std::io::SeekFrom::Start(0))?;
+        let mut mmap = unsafe { memmap2::MmapMut::map_mut(&file)? };
+
+        // Ensure we have complete records
+        let struct_size = std::mem::size_of::<NodeData>();
+        assert_eq!(
+            mmap.len() % struct_size,
+            0,
+            "File size must be multiple of struct size"
+        );
+
+        if !sorted && stored_count > 0 {
+            info!("Node data not sorted, sorting in-place...");
+            let slice: &mut [NodeData] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    mmap.as_mut_ptr() as *mut NodeData,
+                    mmap.len() / struct_size,
+                )
+            };
+            slice.sort_unstable_by_key(|n| n.id);
+        }
+
+        let mmap = mmap.make_read_only()?;
+
+        info!(
+            "Stored {} node coordinates using {} bytes",
+            stored_count,
+            mmap.len()
+        );
 
         Ok(Self {
-            node_db: db,
+            nodes_mmap: mmap,
+            num_nodes: stored_count,
             way_nodes: way_nodes_map,
             relation_members: relation_members_map,
         })
+    }
+
+    /// Helper to get node coordinates
+    fn get_node_coords(&self, node_id: NodeId) -> Option<Coord<f64>> {
+        let slice: &[NodeData] = unsafe {
+            std::slice::from_raw_parts(self.nodes_mmap.as_ptr() as *const NodeData, self.num_nodes)
+        };
+
+        if let Ok(idx) = slice.binary_search_by_key(&node_id.0, |n| n.id) {
+            let node = &slice[idx];
+            Some(Coord {
+                x: node.lon,
+                y: node.lat,
+            })
+        } else {
+            None
+        }
     }
 
     /// Resolve geometry for an OSM object (Relation or Way)
@@ -132,21 +208,7 @@ impl GeometryResolver {
             if let Some(nodes) = self.way_nodes.get(way_id) {
                 let coords: Vec<Coord<f64>> = nodes
                     .iter()
-                    .filter_map(|nid| {
-                        let key = nid.0.to_be_bytes();
-                        match self.node_db.get(key) {
-                            Ok(Some(bytes)) => {
-                                if bytes.len() == 16 {
-                                    let lon = f64::from_be_bytes(bytes[0..8].try_into().unwrap());
-                                    let lat = f64::from_be_bytes(bytes[8..16].try_into().unwrap());
-                                    Some(Coord { x: lon, y: lat })
-                                } else {
-                                    None
-                                }
-                            }
-                            _ => None,
-                        }
-                    })
+                    .filter_map(|nid| self.get_node_coords(*nid))
                     .collect();
 
                 if coords.len() >= 2 {
@@ -173,21 +235,7 @@ impl GeometryResolver {
 
         let coords: Vec<Coord<f64>> = nodes
             .iter()
-            .filter_map(|nid| {
-                let key = nid.0.to_be_bytes();
-                match self.node_db.get(key) {
-                    Ok(Some(bytes)) => {
-                        if bytes.len() == 16 {
-                            let lon = f64::from_be_bytes(bytes[0..8].try_into().unwrap());
-                            let lat = f64::from_be_bytes(bytes[8..16].try_into().unwrap());
-                            Some(Coord { x: lon, y: lat })
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
-                }
-            })
+            .filter_map(|nid| self.get_node_coords(*nid))
             .collect();
 
         if coords.len() < 3 {
@@ -350,7 +398,7 @@ mod tests {
         let p3 = Coord { x: 1.0, y: 1.0 };
         let p4 = Coord { x: 0.0, y: 1.0 };
         // p5 disconnect
-        let p5 = Coord { x: 2.0, y: 2.0 };
+        let _p5 = Coord { x: 2.0, y: 2.0 };
 
         // Segment 1: p1 -> p2
         let s1 = vec![p1, p2];
