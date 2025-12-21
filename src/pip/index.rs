@@ -126,4 +126,9 @@ impl AdminSpatialIndex {
     pub fn is_empty(&self) -> bool {
         self.tree.size() == 0
     }
+
+    /// Iterate over all indexed boundaries
+    pub fn boundaries(&self) -> impl Iterator<Item = &Arc<AdminBoundary>> {
+        self.tree.iter().map(|ib| &ib.boundary)
+    }
 }

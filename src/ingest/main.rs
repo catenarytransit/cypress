@@ -145,7 +145,6 @@ async fn main() -> Result<()> {
         );
         let file = File::open(admin_path).context("Failed to open admin PBF file")?;
         let mut reader = OsmPbfReader::new(BufReader::new(file));
-        // No filter needed for pre-filtered file, or ensure we get relations/ways
         let resolver = GeometryResolver::build(&mut reader, |_| true)?;
         (resolver, None)
     } else {
@@ -155,11 +154,6 @@ async fn main() -> Result<()> {
         let mut reader = OsmPbfReader::new(BufReader::new(file));
         let resolver =
             GeometryResolver::build(&mut reader, |tags| determine_layer(tags).is_some())?;
-        // Clone/re-use strategy: GeometryResolver is read-only mostly, but expensive to clone if it owns DB?
-        // Actually GeometryResolver uses sled::Db which is cloneable (handles).
-        // BUT we need a separate one for places if we didn't build the admin one from the main file.
-        // If we build admin from SMALL file, we can't use it for places (missing nodes).
-        // So we need a second build for places later.
         (resolver, Some(&args.file))
     };
 
@@ -174,33 +168,37 @@ async fn main() -> Result<()> {
     }
 
     // Extract admin boundaries using admin_resolver
-    let boundaries = {
+    // Create spatial index immediately to avoid holding Vec<AdminBoundary>
+    let spatial_index = {
         let path = args.admin_file.as_ref().unwrap_or(&args.file);
         info!("Extracting admin boundaries from: {}", path.display());
         let file = File::open(path)?;
         let mut reader = OsmPbfReader::new(BufReader::new(file));
-        extract_admin_boundaries(&mut reader, &admin_resolver)?
-    };
-    let spatial_index = AdminSpatialIndex::build(boundaries.clone());
-    let pip_service = Arc::new(PipService::new(spatial_index));
+        let boundaries = extract_admin_boundaries(&mut reader, &admin_resolver)?;
 
-    if let Some(ref dw) = discord {
-        let _ = dw
-            .send_notification(
-                "Admin Boundaries Extracted",
-                &format!(
-                    "Extracted **{}** admin boundaries for: **{}**",
-                    boundaries.len(),
-                    source_file
-                ),
-                true,
-            )
-            .await;
-    }
+        if let Some(ref dw) = discord {
+            let _ = dw
+                .send_notification(
+                    "Admin Boundaries Extracted",
+                    &format!(
+                        "Extracted **{}** admin boundaries for: **{}**",
+                        boundaries.len(),
+                        source_file
+                    ),
+                    true,
+                )
+                .await;
+        }
+
+        AdminSpatialIndex::build(boundaries)
+    };
+
+    let pip_service = Arc::new(PipService::new(spatial_index));
+    let spatial_index_ref = pip_service.index(); // Access underlying index
 
     info!(
         "PIP service ready with {} boundaries",
-        pip_service.index().len()
+        spatial_index_ref.len()
     );
 
     // Initialize Wikidata fetcher if enabled
@@ -211,30 +209,12 @@ async fn main() -> Result<()> {
     };
 
     // Prepare resolver for places
-    // If we have an admin file, admin_resolver is ONLY for admins. We need a new one for places from MAIN file.
-    // If we don't, admin_resolver IS the place resolver (built from main file).
     let place_resolver = if args.admin_file.is_some() {
         info!("Building place geometry index from main file...");
         let file = File::open(&args.file)?;
         let mut reader = OsmPbfReader::new(BufReader::new(file));
         GeometryResolver::build(&mut reader, |tags| determine_layer(tags).is_some())?
     } else {
-        // We can reuse the admin_resolver since it WAS built from main file
-        // But wait, in the `else` block above we returned `(resolver, Some(&args.file))`
-        // actually `admin_resolver` ignores the second tuple item in this scope?
-        // Let's refine the logic.
-        // GeometryResolver contains a sled::Db. We can clone it?
-        // Struct definition: struct GeometryResolver { node_db: Db, ... }
-        // Db is thread-safe and cloneable.
-        // But we shouldn't re-build it if we don't have to.
-        // The simplistic approach above works: `admin_resolver` is used, we just need to alias it or clone it.
-        // However, Rust ownership.
-        // Let's make `place_resolver` a reference or move it?
-        // We need `admin_resolver` for the PIP service? No, `admin_resolver` was used to Extract Boundaries.
-        // The PIP service uses `boundaries` (Vec<AdminBoundary>).
-        // So `admin_resolver` is DONE after extraction.
-        // So we can move it or drop it.
-        // If we didn't have admin file, `admin_resolver` should be reused as `place_resolver`.
         admin_resolver
     };
 
@@ -267,16 +247,21 @@ async fn main() -> Result<()> {
             .progress_chars("#>-"),
     );
 
-    // Create bulk indexer
-    let mut indexer = BulkIndexer::new(es_client.clone(), args.batch_size);
+    // Create bulk indexer (starts background task)
+    let indexer = BulkIndexer::new(es_client.clone(), args.batch_size);
 
     // Collect Wikidata IDs for batch fetching
     let mut wikidata_ids: Vec<String> = Vec::new();
     let mut places_buffer: Vec<Place> = Vec::new();
 
     // Index Admin Boundaries first
-    info!("Indexing {} administrative boundaries...", boundaries.len());
-    for boundary in boundaries {
+    info!(
+        "Indexing {} administrative boundaries...",
+        spatial_index_ref.len()
+    );
+
+    // Use iterator from spatial_index to avoid looking at "boundaries" Vec (which is gone)
+    for boundary in spatial_index_ref.boundaries() {
         let center = boundary.geometry.centroid().map(|p| GeoPoint {
             lat: p.y(),
             lon: p.x(),
@@ -293,8 +278,8 @@ async fn main() -> Result<()> {
                 center,
                 &source_file,
             );
-            place.name = boundary.area.name;
-            place.wikidata_id = boundary.area.wikidata_id;
+            place.name = boundary.area.name.clone();
+            place.wikidata_id = boundary.area.wikidata_id.clone();
             place.bbox = bbox;
 
             // PIP lookup for admin hierarchy (limit to higher levels)
@@ -311,10 +296,6 @@ async fn main() -> Result<()> {
                     place.importance = map.get(qid).copied();
                 }
             }
-
-            // We could also do PIP lookup for parent, but admin boundaries ARE the parents.
-            // Usually admins form a hierarchy.
-            // Ideally we index them appropriately.
 
             place.sanitize();
             indexer.add(place).await?;
@@ -359,6 +340,7 @@ async fn main() -> Result<()> {
 
             // Batch Wikidata fetch every 1000 places
             if args.wikidata && wikidata_ids.len() >= 1000 {
+                // ... (Wikidata fetching logic remains blocking-ish, but it's separate)
                 if let Some(ref mut wd) = wikidata {
                     wd.fetch_batch(&wikidata_ids).await?;
 
@@ -374,6 +356,19 @@ async fn main() -> Result<()> {
 
             // Index when buffer is full
             if places_buffer.len() >= args.batch_size {
+                // Ensure any pending wikidata is fetched before flush
+                if args.wikidata && !wikidata_ids.is_empty() {
+                    if let Some(ref mut wd) = wikidata {
+                        wd.fetch_batch(&wikidata_ids).await?;
+                        for p in &mut places_buffer {
+                            if let Some(ref qid) = p.wikidata_id {
+                                wd.merge_labels(qid, &mut p.name);
+                            }
+                        }
+                    }
+                    wikidata_ids.clear();
+                }
+
                 for p in places_buffer.drain(..) {
                     indexer.add(p).await?;
                 }
