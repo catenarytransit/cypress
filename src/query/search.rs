@@ -167,6 +167,12 @@ pub async fn execute_search(
 
     // Build function score for location bias + importance
     let mut functions = vec![
+        // Base score to prevent zeroing out documents with 0 importance
+        // (Since boost_mode is multiply, we need a base of 1.0)
+        json!({
+            "filter": { "match_all": {} },
+            "weight": 1.0
+        }),
         // Importance boosting
         json!({
             "field_value_factor": {
