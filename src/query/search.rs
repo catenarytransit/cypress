@@ -96,13 +96,13 @@ pub async fn execute_search(
                 }
             }
         }),
-        // Wildcard search across all name languages
+        // Search across all name languages
         json!({
-            "multi_match": {
-                "query": &params.text,
-                "type": "best_fields",
-                "fields": ["name.*"],
-                "boost": 5.0
+            "match": {
+                "name_all": {
+                    "query": &params.text,
+                    "boost": 5.0
+                }
             }
         }),
         // Address street match

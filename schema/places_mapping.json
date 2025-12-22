@@ -80,6 +80,7 @@
           "path_match": "name.*",
           "mapping": {
             "type": "text",
+            "copy_to": "name_all",
             "analyzer": "peliasIndex",
             "search_analyzer": "peliasQuery",
             "fields": {
@@ -131,12 +132,18 @@
       "categories": {
         "type": "keyword"
       },
+      "name_all": {
+        "type": "text",
+        "analyzer": "peliasIndex",
+        "search_analyzer": "peliasQuery"
+      },
       "name": {
         "type": "object",
         "dynamic": true,
         "properties": {
           "default": {
             "type": "text",
+            "copy_to": "name_all",
             "analyzer": "peliasIndex",
             "search_analyzer": "peliasQuery",
             "fields": {
