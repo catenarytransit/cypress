@@ -3,7 +3,10 @@
 //! Parses OSM data, extracts places, performs PIP lookups,
 //! and indexes into Elasticsearch.
 
+mod batch;
+mod config;
 mod importance;
+mod version;
 
 use std::fs::File;
 use std::io::BufReader;
@@ -12,7 +15,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use geo::{BoundingRect, Centroid};
 use indicatif::{ProgressBar, ProgressStyle};
 use osmpbfreader::OsmPbfReader;
@@ -30,46 +33,68 @@ use crate::importance::{calculate_default_importance, load_importance};
 #[derive(Parser, Debug)]
 #[command(name = "ingest")]
 #[command(about = "Ingest OSM PBF data into Elasticsearch")]
-struct Args {
-    /// OSM PBF file to import
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Ingest a single PBF file
+    Single(Args),
+    /// Run batch ingest from config
+    Batch {
+        /// Path to TOML configuration file
+        #[arg(long, default_value = "regions.toml")]
+        config: PathBuf,
+
+        /// Base arguments to apply to all regions (overridden by config where applicable)
+        #[command(flatten)]
+        args: Args,
+    },
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct Args {
+    /// OSM PBF file to import (required for single mode, ignored in batch mode)
     #[arg(short, long)]
-    file: PathBuf,
+    pub file: Option<PathBuf>,
 
     /// Optional pre-filtered admin boundary file
     #[arg(long)]
-    admin_file: Option<PathBuf>,
+    pub admin_file: Option<PathBuf>,
 
     /// Elasticsearch URL
     #[arg(long, default_value = "http://localhost:9200")]
-    es_url: String,
+    pub es_url: String,
 
     /// Elasticsearch index name
     #[arg(long, default_value = "places")]
-    index: String,
+    pub index: String,
 
     /// Fetch supplemental labels from Wikidata
     #[arg(long)]
-    wikidata: bool,
+    pub wikidata: bool,
 
     /// Delete stale documents from previous import
     #[arg(long)]
-    refresh: bool,
+    pub refresh: bool,
 
     /// Create/recreate index before import
     #[arg(long)]
-    create_index: bool,
+    pub create_index: bool,
 
     /// Batch size for bulk indexing
     #[arg(long, default_value = "5000")]
-    batch_size: usize,
+    pub batch_size: usize,
 
     /// Path to wikimedia-importance.csv (optional)
     #[arg(long)]
-    importance_file: Option<PathBuf>,
+    pub importance_file: Option<PathBuf>,
 
     /// Discord webhook URL for notifications (optional)
     #[arg(long)]
-    discord_webhook: Option<String>,
+    pub discord_webhook: Option<String>,
 }
 
 #[tokio::main]
@@ -80,10 +105,22 @@ async fn main() -> Result<()> {
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
-    let args = Args::parse();
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Single(args) => run_single(args).await,
+        Commands::Batch { config, args } => batch::run_batch(config, args).await,
+    }
+}
+
+pub async fn run_single(args: Args) -> Result<()> {
+    let file_path = args
+        .file
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("Input file is required for single import"))?;
 
     info!("Cypress Ingest Pipeline");
-    info!("File: {}", args.file.display());
+    info!("File: {}", file_path.display());
 
     // Connect to Elasticsearch
     let es_client = EsClient::new(&args.es_url, &args.index)
@@ -102,8 +139,7 @@ async fn main() -> Result<()> {
         .map(|url| DiscordWebhook::new(url.clone()));
 
     // Get source file name for tracking
-    let source_file = args
-        .file
+    let source_file = file_path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("unknown.osm.pbf")
@@ -150,11 +186,11 @@ async fn main() -> Result<()> {
     } else {
         // Use main file for both
         info!("Building geometry index from main file...");
-        let file = File::open(&args.file).context("Failed to open PBF file")?;
+        let file = File::open(&file_path).context("Failed to open PBF file")?;
         let mut reader = OsmPbfReader::new(BufReader::new(file));
         let resolver =
             GeometryResolver::build(&mut reader, |tags| determine_layer(tags).is_some())?;
-        (resolver, Some(&args.file))
+        (resolver, Some(&file_path))
     };
 
     if let Some(ref dw) = discord {
@@ -170,7 +206,7 @@ async fn main() -> Result<()> {
     // Extract admin boundaries using admin_resolver
     // Create spatial index immediately to avoid holding Vec<AdminBoundary>
     let spatial_index = {
-        let path = args.admin_file.as_ref().unwrap_or(&args.file);
+        let path = args.admin_file.as_ref().unwrap_or(&file_path);
         info!("Extracting admin boundaries from: {}", path.display());
         let file = File::open(path)?;
         let mut reader = OsmPbfReader::new(BufReader::new(file));
@@ -211,7 +247,7 @@ async fn main() -> Result<()> {
     // Prepare resolver for places
     let place_resolver = if args.admin_file.is_some() {
         info!("Building place geometry index from main file...");
-        let file = File::open(&args.file)?;
+        let file = File::open(&file_path)?;
         let mut reader = OsmPbfReader::new(BufReader::new(file));
         GeometryResolver::build(&mut reader, |tags| determine_layer(tags).is_some())?
     } else {
@@ -221,7 +257,7 @@ async fn main() -> Result<()> {
     // Re-open file for place extraction (count first)
     // Note: Counting is expensive on large files, maybe skip?
     // User code had it, we'll keep it but it adds a pass.
-    let file = File::open(&args.file)?;
+    let file = File::open(&file_path)?;
     let mut reader = OsmPbfReader::new(BufReader::new(file));
 
     info!("Counting objects...");
@@ -234,7 +270,7 @@ async fn main() -> Result<()> {
     info!("Total OSM objects: {}", total_count);
 
     // Re-open for processing
-    let file = File::open(&args.file)?;
+    let file = File::open(&file_path)?;
     let mut reader = OsmPbfReader::new(BufReader::new(file));
 
     // Create progress bar

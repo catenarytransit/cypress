@@ -1,3 +1,4 @@
 /target
 *.osm.pbf
 wikimedia-importance*
+regions.toml

@@ -6,12 +6,12 @@
 # ============================================
 # ADMIN BOUNDARIES (relations with boundary=administrative)
 # ============================================
-r/boundary=administrative
+nwr/boundary=administrative
 
 # ============================================
 # PLACES (nodes/ways with place tag)
 # ============================================
-nw/place
+nwr/place
 
 # ============================================
 # NAMED FEATURES (anything with a name is potentially searchable)
@@ -19,27 +19,35 @@ nw/place
 # ============================================
 
 # Amenities (restaurants, cafes, banks, hospitals, etc.)
-nw/amenity
+nwr/amenity
+nwr/restaurant
+nwr/cuisine
+nwr/club
 
 # Shops
-nw/shop
+nwr/shop
+nwr/craft
+
+# Healthcare
+nwr/healthcare
+nwr/emergency
 
 # Tourism (hotels, attractions, museums, etc.)  
-nw/tourism
+nwr/tourism
 
 # Leisure (parks, sports, etc.)
-nw/leisure
+nwr/leisure
 
 # Office buildings
-nw/office
+nwr/office
 
 # Named buildings
-nw/building=yes
-nw/building=public
-nw/building=commercial
-nw/building=retail
-nw/building=industrial
-nw/building=residential
+nwr/building=yes
+nwr/building=public
+nwr/building=commercial
+nwr/building=retail
+nwr/building=industrial
+nwr/building=residential
 
 # Public transport
 nw/public_transport
@@ -59,11 +67,12 @@ nw/natural=hot_spring
 nw/natural=spring
 nw/natural=valley
 nw/natural=water
-
-# Waterways
-nw/waterway=river
-nw/waterway=stream
-nw/waterway=canal
+nwr/waterway=waterfall
+nwr/waterway=dam
+nwr/waterway=rapids
+nwr/waterway=river
+nwr/waterway=stream
+nwr/waterway=canal
 
 # Historic sites
 nw/historic
@@ -87,4 +96,5 @@ w/highway=pedestrian
 # ============================================
 # ADDRESSES (nodes/ways with addr:housenumber)
 # ============================================
-nw/addr:housenumber
+nwr/addr:housenumber
+nwr/addr:*

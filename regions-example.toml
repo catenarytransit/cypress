@@ -1,0 +1,243 @@
+[global]
+es_url = "http://localhost:9200"
+tmp_dir = "./data"
+
+[[regions]]
+name = "Shqipëria"
+url = "https://download.geofabrik.de/europe/albania-latest.osm.pbf"
+
+[[regions]]
+name = "Andorra"
+url = "https://download.geofabrik.de/europe/andorra-latest.osm.pbf"
+
+[[regions]]
+name = "Österreich"
+url = "https://download.geofabrik.de/europe/austria-latest.osm.pbf"
+
+[[regions]]
+name = "Açores"
+url = "https://download.geofabrik.de/europe/azores-latest.osm.pbf"
+
+[[regions]]
+name = "Bielaruś"
+url = "https://download.geofabrik.de/europe/belarus-latest.osm.pbf"
+
+[[regions]]
+name = "België"
+url = "https://download.geofabrik.de/europe/belgium-latest.osm.pbf"
+
+[[regions]]
+name = "Bosna_i_Hercegovina"
+url = "https://download.geofabrik.de/europe/bosnia-herzegovina-latest.osm.pbf"
+
+[[regions]]
+name = "Balgariya"
+url = "https://download.geofabrik.de/europe/bulgaria-latest.osm.pbf"
+
+[[regions]]
+name = "Hrvatska"
+url = "https://download.geofabrik.de/europe/croatia-latest.osm.pbf"
+
+[[regions]]
+name = "Kypros"
+url = "https://download.geofabrik.de/europe/cyprus-latest.osm.pbf"
+
+[[regions]]
+name = "Cesko"
+url = "https://download.geofabrik.de/europe/czech-republic-latest.osm.pbf"
+
+[[regions]]
+name = "Danmark"
+url = "https://download.geofabrik.de/europe/denmark-latest.osm.pbf"
+
+[[regions]]
+name = "Eesti"
+url = "https://download.geofabrik.de/europe/estonia-latest.osm.pbf"
+
+[[regions]]
+name = "Føroyar"
+url = "https://download.geofabrik.de/europe/faroe-islands-latest.osm.pbf"
+
+[[regions]]
+name = "Suomi"
+url = "https://download.geofabrik.de/europe/finland-latest.osm.pbf"
+
+[[regions]]
+name = "France"
+url = "https://download.geofabrik.de/europe/france-latest.osm.pbf"
+
+[[regions]]
+name = "Sakartvelo"
+url = "https://download.geofabrik.de/europe/georgia-latest.osm.pbf"
+
+[[regions]]
+name = "Deutschland"
+url = "https://download.geofabrik.de/europe/germany-latest.osm.pbf"
+
+[[regions]]
+name = "Elláda"
+url = "https://download.geofabrik.de/europe/greece-latest.osm.pbf"
+
+[[regions]]
+name = "Guernsey_and_Jersey"
+url = "https://download.geofabrik.de/europe/guernsey-jersey-latest.osm.pbf"
+
+[[regions]]
+name = "Magyarország"
+url = "https://download.geofabrik.de/europe/hungary-latest.osm.pbf"
+
+[[regions]]
+name = "Island"
+url = "https://download.geofabrik.de/europe/iceland-latest.osm.pbf"
+
+[[regions]]
+name = "Eire"
+url = "https://download.geofabrik.de/europe/ireland-and-northern-ireland-latest.osm.pbf"
+
+[[regions]]
+name = "Mannin"
+url = "https://download.geofabrik.de/europe/isle-of-man-latest.osm.pbf"
+
+[[regions]]
+name = "Italia"
+url = "https://download.geofabrik.de/europe/italy-latest.osm.pbf"
+
+[[regions]]
+name = "Kosova"
+url = "https://download.geofabrik.de/europe/kosovo-latest.osm.pbf"
+
+[[regions]]
+name = "Latvija"
+url = "https://download.geofabrik.de/europe/latvia-latest.osm.pbf"
+
+[[regions]]
+name = "Liechtenstein"
+url = "https://download.geofabrik.de/europe/liechtenstein-latest.osm.pbf"
+
+[[regions]]
+name = "Lietuva"
+url = "https://download.geofabrik.de/europe/lithuania-latest.osm.pbf"
+
+[[regions]]
+name = "Luxemburg"
+url = "https://download.geofabrik.de/europe/luxembourg-latest.osm.pbf"
+
+[[regions]]
+name = "Severna_Makedonija"
+url = "https://download.geofabrik.de/europe/macedonia-latest.osm.pbf"
+
+[[regions]]
+name = "Malta"
+url = "https://download.geofabrik.de/europe/malta-latest.osm.pbf"
+
+[[regions]]
+name = "Moldova"
+url = "https://download.geofabrik.de/europe/moldova-latest.osm.pbf"
+
+[[regions]]
+name = "Monaco"
+url = "https://download.geofabrik.de/europe/monaco-latest.osm.pbf"
+
+[[regions]]
+name = "Crna_Gora"
+url = "https://download.geofabrik.de/europe/montenegro-latest.osm.pbf"
+
+[[regions]]
+name = "Nederland"
+url = "https://download.geofabrik.de/europe/netherlands-latest.osm.pbf"
+
+[[regions]]
+name = "Norge"
+url = "https://download.geofabrik.de/europe/norway-latest.osm.pbf"
+
+[[regions]]
+name = "Polska"
+url = "https://download.geofabrik.de/europe/poland-latest.osm.pbf"
+
+[[regions]]
+name = "Portugal"
+url = "https://download.geofabrik.de/europe/portugal-latest.osm.pbf"
+
+[[regions]]
+name = "România"
+url = "https://download.geofabrik.de/europe/romania-latest.osm.pbf"
+
+[[regions]]
+name = "Rossiya"
+url = "https://download.geofabrik.de/russia-latest.osm.pbf"
+
+[[regions]]
+name = "Srbija"
+url = "https://download.geofabrik.de/europe/serbia-latest.osm.pbf"
+
+[[regions]]
+name = "Slovensko"
+url = "https://download.geofabrik.de/europe/slovakia-latest.osm.pbf"
+
+[[regions]]
+name = "Slovenija"
+url = "https://download.geofabrik.de/europe/slovenia-latest.osm.pbf"
+
+[[regions]]
+name = "Espana"
+url = "https://download.geofabrik.de/europe/spain-latest.osm.pbf"
+
+[[regions]]
+name = "Sverige"
+url = "https://download.geofabrik.de/europe/sweden-latest.osm.pbf"
+
+[[regions]]
+name = "Schweiz"
+url = "https://download.geofabrik.de/europe/switzerland-latest.osm.pbf"
+
+[[regions]]
+name = "Türkiye"
+url = "https://download.geofabrik.de/europe/turkey-latest.osm.pbf"
+
+[[regions]]
+name = "Ukraina"
+url = "https://download.geofabrik.de/europe/ukraine-latest.osm.pbf"
+
+[[regions]]
+name = "United_Kingdom"
+url = "https://download.geofabrik.de/europe/united-kingdom-latest.osm.pbf"
+
+[[regions]]
+name = "China"
+url = "https://download.geofabrik.de/asia/china-latest.osm.pbf"
+
+[[regions]]
+name = "Malaysia_Singapore_Brunei"
+url = "https://download.geofabrik.de/asia/malaysia-singapore-brunei-latest.osm.pbf"
+
+[[regions]]
+name = "South_Korea"
+url = "https://download.geofabrik.de/asia/south-korea-latest.osm.pbf"
+
+[[regions]]
+name = "Japan"
+url = "https://download.geofabrik.de/asia/japan-latest.osm.pbf"
+
+[[regions]]
+name = "Thailand"
+url = "https://download.geofabrik.de/asia/thailand-latest.osm.pbf"
+
+[[regions]]
+name = "Taiwan"
+url = "https://download.geofabrik.de/asia/taiwan-latest.osm.pbf"
+
+[[regions]]
+name = "Vietnam"
+url = "https://download.geofabrik.de/asia/vietnam-latest.osm.pbf"
+
+[[regions]]
+name = "United_States"
+url = "https://download.geofabrik.de/north-america/us-latest.osm.pbf"
+
+[[regions]]
+name = "Canada"
+url = "https://download.geofabrik.de/north-america/canada-latest.osm.pbf"
+
+[[regions]]
+name = "Australia_Oceania"
+url = "https://download.geofabrik.de/australia-oceania-latest.osm.pbf"

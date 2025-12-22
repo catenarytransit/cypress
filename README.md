@@ -40,8 +40,8 @@ cargo build --release
 ### 3. Import Data
 
 ```bash
-# Import Switzerland
-./scripts/import_switzerland.sh --fresh
+# Configure regions.toml and run:
+cargo run --release --bin ingest -- batch --config regions.toml
 
 # Or run directly:
 cargo run --release --bin ingest -- \
