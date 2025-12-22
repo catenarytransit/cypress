@@ -115,7 +115,22 @@ pub fn calculate_default_importance(tags: &osmpbfreader::Tags) -> f64 {
         return 0.100;
     }
 
+    // Restaurants / Shops / Common POIs
+    if tags.contains_key("shop")
+        || tags
+            .get("amenity")
+            .map(|v| {
+                matches!(
+                    v.as_str(),
+                    "restaurant" | "cafe" | "fast_food" | "bar" | "pub" | "marketplace"
+                )
+            })
+            .unwrap_or(false)
+    {
+        return 0.05;
+    }
+
     // House / POI
     // place=house or amenity=* etc.
-    0.0
+    0.01
 }
