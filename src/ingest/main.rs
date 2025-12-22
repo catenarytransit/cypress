@@ -59,6 +59,12 @@ enum Commands {
         #[command(flatten)]
         args: Args,
     },
+    /// Reset version history (forces re-import of all regions)
+    ResetVersions {
+        /// Elasticsearch URL
+        #[arg(long, default_value = "http://localhost:9200")]
+        es_url: String,
+    },
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -117,7 +123,21 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Single(args) => run_single(args).await,
         Commands::Batch { config, args } => batch::run_batch(config, args).await,
+        Commands::ResetVersions { es_url } => run_reset(&es_url).await,
     }
+}
+
+pub async fn run_reset(es_url: &str) -> Result<()> {
+    use crate::version::VersionManager;
+
+    info!("Connecting to Elasticsearch at {}...", es_url);
+    let version_manager = VersionManager::new(es_url).await?;
+
+    info!("Resetting version history...");
+    version_manager.reset().await?;
+
+    info!("Version history reset complete.");
+    Ok(())
 }
 
 pub async fn run_single(args: Args) -> Result<()> {

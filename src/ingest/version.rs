@@ -108,6 +108,31 @@ impl VersionManager {
             .await?;
         Ok(())
     }
+
+    pub async fn reset(&self) -> Result<()> {
+        let es = self.es_client.client();
+        let exists = es
+            .indices()
+            .exists(IndicesExistsParts::Index(&[&self.index_name]))
+            .send()
+            .await?
+            .status_code()
+            .is_success();
+
+        if exists {
+            info!("Deleting version index: {}", self.index_name);
+            es.indices()
+                .delete(elasticsearch::indices::IndicesDeleteParts::Index(&[
+                    &self.index_name
+                ]))
+                .send()
+                .await
+                .context("Failed to delete version index")?;
+        } else {
+            info!("Version index {} does not exist", self.index_name);
+        }
+        Ok(())
+    }
 }
 
 pub fn calculate_file_hash<P: AsRef<Path>>(path: P) -> Result<String> {

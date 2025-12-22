@@ -73,6 +73,23 @@ If you need to remove data for a specific region (e.g., to re-import it or free 
 
 The script identifies the correct records using the `source_file` field based on the regions defined in `scripts/import_global.sh`.
 
+### index management
+
+Deleting places index
+```bash
+curl -X DELETE "http://localhost:9200/places"
+```
+
+Deleting versions index
+```bash
+curl -X DELETE "http://localhost:9200/cypress_versions"
+```
+
+or use the wipe versions script:
+```bash
+cargo run --bin ingest -- reset-versions
+```
+
 ## API Endpoints
 
 ### Forward Geocoding
