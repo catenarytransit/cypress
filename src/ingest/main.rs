@@ -30,6 +30,13 @@ use cypress::wikidata::WikidataFetcher;
 
 use crate::importance::{calculate_default_importance, load_importance};
 
+#[cfg(not(target_env = "msvc"))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
 #[derive(Parser, Debug)]
 #[command(name = "ingest")]
 #[command(about = "Ingest OSM PBF data into Elasticsearch")]

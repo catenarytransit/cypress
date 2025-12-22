@@ -66,6 +66,9 @@ flate2 = "1.0"
 toml = "0.8"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"
+
 [profile.release]
 lto = true
 codegen-units = 1
