@@ -474,9 +474,6 @@ fn extract_place(
 
     match obj {
         OsmObj::Node(node) => {
-            if !has_relevant_tags(&node.tags) {
-                return Ok(None);
-            }
             if let Some(layer) = determine_layer(&node.tags) {
                 let center = GeoPoint {
                     lat: node.lat(),
@@ -491,9 +488,6 @@ fn extract_place(
             }
         }
         OsmObj::Way(way) => {
-            if !has_relevant_tags(&way.tags) {
-                return Ok(None);
-            }
             if let Some(layer) = determine_layer(&way.tags) {
                 // Resolve geometry
                 if let Some((lon, lat)) = resolver.resolve_centroid(way.id) {
@@ -523,18 +517,50 @@ fn extract_place(
                 Ok(None)
             }
         }
-        OsmObj::Relation(_rel) => {
-            // Relation handling is complex (multipolygon).
-            // We handled Admin boundaries separately.
-            // Generic multipolygons (POIs) can be handled if we extend GeometryResolver.
-            // For now, we skip non-admin relations.
-            Ok(None)
+        OsmObj::Relation(rel) => {
+            // Check layers/relevance
+            if let Some(layer) = determine_layer(&rel.tags) {
+                // Skip admin boundaries (handled separately)
+                if layer == Layer::Admin {
+                    return Ok(None);
+                }
+
+                // Resolve multipolygon geometry
+                if let Some(multi_poly) = resolver.resolve_relation(rel.id) {
+                    // Calculate centroid
+                    if let Some(centroid) = multi_poly.centroid() {
+                        let center = GeoPoint {
+                            lat: centroid.y(),
+                            lon: centroid.x(),
+                        };
+
+                        let mut place =
+                            Place::new(OsmType::Relation, rel.id.0, layer, center, source_file);
+                        place.importance = Some(calculate_default_importance(&rel.tags));
+                        extract_tags(&mut place, &rel.tags);
+
+                        // Calculate Bbox
+                        if let Some(rect) = multi_poly.bounding_rect() {
+                            place.bbox = Some(GeoBbox::new(
+                                rect.min().x,
+                                rect.min().y,
+                                rect.max().x,
+                                rect.max().y,
+                            ));
+                        }
+
+                        Ok(Some(place))
+                    } else {
+                        Ok(None)
+                    }
+                } else {
+                    Ok(None)
+                }
+            } else {
+                Ok(None)
+            }
         }
     }
-}
-
-fn has_relevant_tags(tags: &osmpbfreader::Tags) -> bool {
-    tags.contains_key("name")
 }
 
 /// Determine the layer/type from OSM tags
@@ -596,19 +622,40 @@ fn extract_tags(place: &mut Place, tags: &osmpbfreader::Tags) {
         if key_str == "name" {
             place.add_name("default", value.to_string());
         } else if let Some(lang) = key_str.strip_prefix("name:") {
-            // Validate language code to prevent field explosion (ES limit 1000)
-            // Allow 2-10 chars, alphanumeric + -_
-            if lang.len() >= 2
-                && lang.len() <= 10
-                && lang
-                    .chars()
-                    .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-            {
+            if is_valid_lang_code(lang) {
                 place.add_name(lang, value.to_string());
             }
+        } else {
+            // Check for alternate names
+            let name_variants = [
+                "alt_name",
+                "old_name",
+                "official_name",
+                "short_name",
+                "int_name",
+                "nat_name",
+                "reg_name",
+                "loc_name",
+            ];
+
+            for variant in &name_variants {
+                if key_str == *variant {
+                    place.add_name(variant, value.to_string());
+                    break;
+                } else if let Some(suffix) = key_str
+                    .strip_prefix(variant)
+                    .and_then(|s| s.strip_prefix(':'))
+                {
+                    if is_valid_lang_code(suffix) {
+                        place.add_name(key_str, value.to_string());
+                    }
+                    break;
+                }
+            }
         }
+
         // Wikidata
-        else if key_str == "wikidata" || key_str == "brand:wikidata" {
+        if key_str == "wikidata" || key_str == "brand:wikidata" {
             place.wikidata_id = Some(value.to_string());
         }
         // Address components
@@ -633,6 +680,16 @@ fn extract_tags(place: &mut Place, tags: &osmpbfreader::Tags) {
             place.add_category(key_str, value);
         }
     }
+}
+
+fn is_valid_lang_code(lang: &str) -> bool {
+    // Validate language code to prevent field explosion (ES limit 1000)
+    // Allow 2-10 chars, alphanumeric + -_
+    lang.len() >= 2
+        && lang.len() <= 10
+        && lang
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
 }
 
 /// Delete documents from previous import of the same file

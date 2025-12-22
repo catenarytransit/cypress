@@ -50,9 +50,9 @@ nwr/building=industrial
 nwr/building=residential
 
 # Public transport
-nw/public_transport
-nw/railway=station
-nw/railway=halt
+#nw/public_transport
+#nw/railway=station
+#nw/railway=halt
 nw/aeroway=aerodrome
 nw/aeroway=terminal
 
