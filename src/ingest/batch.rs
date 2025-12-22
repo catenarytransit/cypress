@@ -41,7 +41,7 @@ pub async fn run_batch(config_path: PathBuf, args: Args) -> Result<()> {
         // Note: This logic assumes strictly sequential processing matching config order.
         let mut is_first_region = true;
 
-        for region in config_clone.regions {
+        for region in &config_clone.regions {
             let res = prepare_region(
                 &region,
                 &config_clone,
