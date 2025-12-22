@@ -98,7 +98,7 @@ pub struct Args {
     pub create_index: bool,
 
     /// Batch size for bulk indexing
-    #[arg(long, default_value = "5000")]
+    #[arg(long, default_value = "500")]
     pub batch_size: usize,
 
     /// Path to wikimedia-importance.csv (optional)
