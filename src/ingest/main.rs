@@ -7,6 +7,7 @@ mod batch;
 mod config;
 mod importance;
 mod version;
+mod way_merger;
 
 use std::fs::File;
 use std::io::BufReader;
@@ -29,6 +30,7 @@ use cypress::pip::{extract_admin_boundaries, AdminSpatialIndex, GeometryResolver
 use cypress::wikidata::WikidataFetcher;
 
 use crate::importance::{calculate_default_importance, load_importance};
+use crate::way_merger::WayMerger;
 
 #[cfg(not(target_env = "msvc"))]
 use tikv_jemallocator::Jemalloc;
@@ -108,6 +110,10 @@ pub struct Args {
     /// Discord webhook URL for notifications (optional)
     #[arg(long)]
     pub discord_webhook: Option<String>,
+
+    /// Merge adjacent road ways with the same name to reduce disk space
+    #[arg(long, default_value = "true")]
+    pub merge_roads: bool,
 }
 
 #[tokio::main]
@@ -276,9 +282,9 @@ pub async fn run_single(args: Args) -> Result<()> {
         info!("Building place geometry index from main file...");
         let file = File::open(&file_path)?;
         let mut reader = OsmPbfReader::new(BufReader::new(file));
-        GeometryResolver::build(&mut reader, |tags| determine_layer(tags).is_some())?
+        Arc::new(GeometryResolver::build(&mut reader, |tags| determine_layer(tags).is_some())?)
     } else {
-        admin_resolver
+        Arc::new(admin_resolver)
     };
 
     // Re-open file for place extraction (count first)
@@ -367,6 +373,13 @@ pub async fn run_single(args: Args) -> Result<()> {
 
     info!("Processing OSM objects...");
 
+    // First pass: collect road ways for merging if enabled
+    let mut way_merger = if args.merge_roads {
+        Some(WayMerger::new(Arc::clone(&place_resolver)))
+    } else {
+        None
+    };
+
     // Process each OSM object
     for obj_result in reader.iter() {
         pb.inc(1);
@@ -379,7 +392,17 @@ pub async fn run_single(args: Args) -> Result<()> {
             }
         };
 
-        // Try to extract a place from this object
+        // If merging enabled and this is a road way, collect it
+        if let Some(ref mut merger) = way_merger {
+            if let osmpbfreader::OsmObj::Way(ref way) = obj {
+                if is_road_way(&way.tags) {
+                    merger.add_road(way.id, way.tags.clone(), way.nodes.iter().map(|n| n.0).collect());
+                    continue; // Don't process this way now
+                }
+            }
+        }
+
+        // Try to extract a place from this object (non-roads or when merging disabled)
         if let Some(mut place) = extract_place(&obj, &source_file, &place_resolver)? {
             // PIP lookup for admin hierarchy
             let hierarchy =
@@ -441,6 +464,49 @@ pub async fn run_single(args: Args) -> Result<()> {
 
     pb.finish_with_message("Processing complete");
 
+    // Process merged roads if enabled
+    if let Some(merger) = way_merger {
+        info!("Processing merged roads...");
+        let merged_roads = merger.merge();
+        
+        for merged_road in merged_roads {
+            if let Some(mut place) = merged_road.to_place(&source_file) {
+                // Extract tags
+                extract_tags(&mut place, &merged_road.tags);
+                
+                // Calculate importance
+                place.importance = Some(calculate_default_importance(&merged_road.tags));
+                
+                // PIP lookup for admin hierarchy
+                let hierarchy =
+                    pip_service.lookup(place.center_point.lon, place.center_point.lat, None);
+                place.parent = hierarchy;
+
+                // Collect Wikidata ID if present
+                if let Some(ref qid) = place.wikidata_id {
+                    wikidata_ids.push(qid.clone());
+
+                    // Assign importance
+                    if let Some(ref map) = importance_map {
+                        if let Some(score) = map.get(qid) {
+                            place.importance = Some(*score);
+                        }
+                    }
+                }
+
+                place.sanitize();
+                places_buffer.push(place);
+
+                // Index when buffer is full
+                if places_buffer.len() >= args.batch_size {
+                    for p in places_buffer.drain(..) {
+                        indexer.add(p).await?;
+                    }
+                }
+            }
+        }
+    }
+
     // Fetch remaining Wikidata labels
     if args.wikidata && !wikidata_ids.is_empty() {
         if let Some(ref mut wd) = wikidata {
@@ -484,11 +550,31 @@ pub async fn run_single(args: Args) -> Result<()> {
     Ok(())
 }
 
+/// Check if an OSM way is a road that should be considered for merging
+fn is_road_way(tags: &osmpbfreader::Tags) -> bool {
+    if let Some(highway) = tags.get("highway") {
+        // Only roads with names can be merged
+        if !tags.contains_key("name") {
+            return false;
+        }
+        
+        // Check if this is a street-type highway (not motorways or links)
+        matches!(
+            highway.as_str(),
+            "residential" | "primary" | "secondary" | "tertiary" | 
+            "unclassified" | "service" | "living_street" | "pedestrian" |
+            "track" | "road" | "footway" | "cycleway" | "path"
+        )
+    } else {
+        false
+    }
+}
+
 /// Extract a Place from an OSM object if it's relevant
 fn extract_place(
     obj: &osmpbfreader::OsmObj,
     source_file: &str,
-    resolver: &GeometryResolver,
+    resolver: &Arc<GeometryResolver>,
 ) -> Result<Option<Place>> {
     use osmpbfreader::OsmObj;
 
@@ -622,12 +708,16 @@ fn determine_layer(tags: &osmpbfreader::Tags) -> Option<Layer> {
     }
 
     // Check for highway (streets)
-    if tags
-        .get("highway")
-        .map(|v| v == "residential" || v == "primary" || v == "secondary" || v == "tertiary")
-        .unwrap_or(false)
-    {
-        return Some(Layer::Street);
+    if let Some(highway) = tags.get("highway") {
+        let highway_str = highway.as_str();
+        if matches!(
+            highway_str,
+            "residential" | "primary" | "secondary" | "tertiary" 
+            | "unclassified" | "service" | "living_street" | "pedestrian"
+            | "track" | "road" | "footway" | "cycleway" | "path"
+        ) {
+            return Some(Layer::Street);
+        }
     }
 
     None

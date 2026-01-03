@@ -173,7 +173,7 @@ impl GeometryResolver {
     }
 
     /// Helper to get node coordinates
-    fn get_node_coords(&self, node_id: NodeId) -> Option<Coord<f64>> {
+    pub fn get_node_coords(&self, node_id: NodeId) -> Option<Coord<f64>> {
         let slice: &[NodeData] = unsafe {
             std::slice::from_raw_parts(self.nodes_mmap.as_ptr() as *const NodeData, self.num_nodes)
         };
