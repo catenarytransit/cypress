@@ -8,6 +8,7 @@ A Rust-based geocoding system with Elasticsearch, inspired by [Pelias](https://p
 ## Features
 
 - **OSM PBF Ingestion** - Parses OpenStreetMap data with multilingual name support
+- **Road Way Merging** - Automatically merges adjacent road segments with the same name to reduce disk space usage
 - **Point-in-Polygon Admin Lookup** - Assigns administrative hierarchy to each place using R-tree spatial indexing
 - **Elasticsearch Backend** - Full-text search with edge n-gram autocomplete
 - **Wikidata Integration** - Enriches place names with multilingual labels from Wikidata
@@ -43,12 +44,21 @@ cargo build --release
 # Configure regions.toml and run:
 cargo run --release --bin ingest -- batch --config regions.toml
 
-# Or run directly:
-cargo run --release --bin ingest -- \
+# Or run directly with road merging enabled (default):
+cargo run --release --bin ingest -- single \
   --file switzerland-latest.osm.pbf \
   --create-index \
   --refresh \
-  --wikidata
+  --wikidata \
+  --merge-roads
+
+# Disable road merging if needed (not recommended):
+cargo run --release --bin ingest -- single \
+  --file switzerland-latest.osm.pbf \
+  --create-index \
+  --refresh \
+  --wikidata \
+  --merge-roads false
 ```
 
 ### 4. Start Query Server
@@ -58,6 +68,31 @@ cargo run --release --bin query -- --listen 0.0.0.0:3000
 ```
 
 ## Data Management
+
+### Road Way Merging
+
+By default, Cypress automatically merges adjacent road segments (ways) that share the same name and highway type. This provides significant benefits:
+
+**Benefits:**
+- **Reduced disk space**: Fewer documents stored in Elasticsearch
+- **Faster search**: Less data to scan during queries
+- **Cleaner results**: One result per street instead of dozens of segments
+- **Lower costs**: Reduced storage and compute requirements
+
+**How it works:**
+1. During ingestion, all road ways with names are collected
+2. Ways are grouped by name and highway type (e.g., "Main Street|residential")
+3. Adjacent ways (sharing endpoint nodes) are merged into single road segments
+4. The merged road is indexed with its full geometry and bounding box
+5. A category tag indicates how many ways were merged (e.g., `merged_ways:5`)
+
+**Which roads are merged:**
+- Residential streets, primary/secondary/tertiary roads
+- Service roads, living streets, pedestrian ways
+- Tracks, footways, cycleways, and paths
+- **NOT merged**: Motorways, motorway links, and other link roads
+
+You can disable this feature with `--merge-roads false`, but this is not recommended for production use.
 
 ### Wiping a Region
 
