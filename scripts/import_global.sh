@@ -248,6 +248,7 @@ for region in "${REGIONS[@]}"; do
             --admin-file "$ADMIN_PBF" \
             --es-url "$ES_URL" \
             --refresh \
+            --merge-roads \
             $WIKIDATA \
             --importance-file "$IMPORTANCE_CSV" \
             $CURRENT_FRESH_ARG \
@@ -257,6 +258,7 @@ for region in "${REGIONS[@]}"; do
             --file "$PBF_TO_IMPORT" \
             --es-url "$ES_URL" \
             --refresh \
+            --merge-roads \
             $WIKIDATA \
             --importance-file "$IMPORTANCE_CSV" \
             $CURRENT_FRESH_ARG \
