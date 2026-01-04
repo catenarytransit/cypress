@@ -217,16 +217,14 @@
       },
       "import_timestamp": {
         "type": "date",
-        "doc_values": true,
-        "norms": false
+        "doc_values": true
       },
       "osm_type": {
         "type": "keyword"
       },
       "osm_id": {
         "type": "long",
-        "doc_values": true,
-        "norms": false
+        "doc_values": true
       },
       "wikidata_id": {
         "type": "keyword",

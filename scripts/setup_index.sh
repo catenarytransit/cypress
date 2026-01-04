@@ -149,8 +149,15 @@ if [ "$SKIP_DOCKER" = false ]; then
             -e "xpack.security.enabled=false" \
             -e "ES_JAVA_OPTS=-Xms1g -Xmx1g" \
             docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+        
+        # Install analysis-icu plugin
+        echo "Installing analysis-icu plugin..."
+        docker exec "$CONTAINER_NAME" elasticsearch-plugin install --batch analysis-icu
+        echo "Restarting container to apply plugin..."
+        docker restart "$CONTAINER_NAME"
     fi
 fi
+
 
 # Wait for health
 echo "Waiting for Elasticsearch to be ready at $URL ..."
