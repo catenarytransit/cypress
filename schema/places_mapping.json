@@ -124,7 +124,7 @@
         "type": "keyword"
       },
       "importance": {
-        "type": "double"
+        "type": "float"
       },
       "layer": {
         "type": "keyword"
