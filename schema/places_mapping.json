@@ -3,6 +3,7 @@
     "number_of_shards": 1,
     "number_of_replicas": 0,
     "index": {
+      "codec": "best_compression",
       "refresh_interval": "10s",
       "mapping": {
         "total_fields": {
