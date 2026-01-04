@@ -64,29 +64,13 @@ pub struct Properties {
     pub confidence: f64,
 }
 
-/// List of fields required for reconstruction when using synthetic source.
-const REQUIRED_FIELDS: &[&str] = &[
-    "source_id",
-    "layer",
-    "center_point",
-    "name.*",
-    "address.housenumber",
-    "address.street",
-    "address.postcode",
-    "categories",
-    "parent.country.name",
-    "parent.region.name",
-    "parent.county.name",
-    "parent.locality.name",
-    "parent.neighbourhood.name",
-];
-
 /// Execute a forward geocoding search
 pub async fn execute_search(
     client: &EsClient,
     params: SearchParams,
     autocomplete: bool,
 ) -> Result<Vec<SearchResult>> {
+    // Build multi-match query across name fields
     let name_field = if autocomplete {
         "name.default.autocomplete"
     } else {
@@ -94,6 +78,7 @@ pub async fn execute_search(
     };
 
     let should_clauses = vec![
+        // Main name match
         json!({
             "match": {
                 name_field: {
@@ -102,6 +87,7 @@ pub async fn execute_search(
                 }
             }
         }),
+        // Phrase match for exact ordering
         json!({
             "match_phrase": {
                 "phrase": {
@@ -110,6 +96,7 @@ pub async fn execute_search(
                 }
             }
         }),
+        // Search across all name languages
         json!({
             "match": {
                 "name_all": {
@@ -118,6 +105,7 @@ pub async fn execute_search(
                 }
             }
         }),
+        // Address street match
         json!({
             "match": {
                 "address.street": {
@@ -126,6 +114,7 @@ pub async fn execute_search(
                 }
             }
         }),
+        // Parent admin matches (for "city" or "country" searches)
         json!({
             "multi_match": {
                 "query": &params.text,
@@ -139,6 +128,7 @@ pub async fn execute_search(
                 "boost": 2.0
             }
         }),
+        // Name + Admin hybrid search (e.g. "Los Angeles California")
         json!({
             "multi_match": {
                 "query": &params.text,
@@ -162,38 +152,51 @@ pub async fn execute_search(
         }),
     ];
 
+    // Build query with optional filters
     let mut bool_query = json!({
         "should": should_clauses,
         "minimum_should_match": 1
     });
 
+    // Add layer filter
     if let Some(ref layers) = params.layers {
         bool_query["filter"] = json!([{
             "terms": { "layer": layers }
         }]);
     }
 
+    // Build function score for location bias + importance
     let mut functions = vec![
+        // Base score to prevent zeroing out documents with 0 importance
+        // (Since boost_mode is multiply, we need a base of 1.0)
         json!({
             "filter": { "match_all": {} },
             "weight": 1.0
         }),
+        // Importance boosting
         json!({
             "field_value_factor": {
                 "field": "importance",
-                "missing": 0.0,
-                "factor": 1.0,
-                "modifier": "log1p",
+                "missing": 0.0, // Default importance if missing
+                "factor": 1.0,  // Tuning parameter
+                "modifier": "log1p", // log(1 + importance) - smooth curve
+                // Importance is 0..1 usually. log1p(1) = 0.69.
+                // If we want importance to significantly affect ranking, we might want a different modifier or factor.
+                // But log1p is a safe start to avoid huge multipliers.
+                // Actually, often we want linear boost + 1.
+                // Let's stick to log1p for now as it's standard.
             },
-             "weight": 2.0
+             "weight": 2.0 // Boost importance influence
         }),
     ];
 
-    if let (Some(lat), Some(lon)) = (params.focus_lat, params.focus_lon) {
+    if params.focus_lat.is_some() && params.focus_lon.is_some() {
+        let focus_lat = params.focus_lat.unwrap();
+        let focus_lon = params.focus_lon.unwrap();
         functions.push(json!({
             "gauss": {
                 "center_point": {
-                    "origin": { "lat": lat, "lon": lon },
+                    "origin": { "lat": focus_lat, "lon": focus_lon },
                     "scale": "50km",
                     "offset": "10km",
                     "decay": 0.5
@@ -207,18 +210,18 @@ pub async fn execute_search(
         "function_score": {
             "query": { "bool": bool_query },
             "functions": functions,
-            "score_mode": "sum",
-            "boost_mode": "multiply"
+            "score_mode": "sum",    // Sum the scores from functions (importance + geo)
+            "boost_mode": "multiply" // Multiply original text score by function score
         }
     });
 
+    // Build full request body
     let mut body = json!({
         "query": query,
-        "size": params.size,
-        "fields": REQUIRED_FIELDS,
-        "_source": false
+        "size": params.size
     });
 
+    // Add bounding box filter
     if let Some(bbox) = params.bbox {
         let filter = json!({
             "geo_bounding_box": {
@@ -229,17 +232,22 @@ pub async fn execute_search(
             }
         });
 
-        // Simplified filter insertion logic for clarity
-        if let Some(bool_obj) = body["query"]["function_score"]["query"]["bool"].as_object_mut() {
-            let filters = bool_obj.entry("filter").or_insert(json!([]));
-            if let Some(filters_arr) = filters.as_array_mut() {
-                filters_arr.push(filter);
-            }
+        if let Some(existing_filter) = body["query"]["bool"]["filter"].as_array_mut() {
+            existing_filter.push(filter);
+        } else if body["query"]["bool"].is_object() {
+            body["query"]["bool"]["filter"] = json!([filter]);
+        } else if let Some(fq) =
+            body["query"]["function_score"]["query"]["bool"]["filter"].as_array_mut()
+        {
+            fq.push(filter);
+        } else if body["query"]["function_score"]["query"]["bool"].is_object() {
+            body["query"]["function_score"]["query"]["bool"]["filter"] = json!([filter]);
         }
     }
 
     debug!("Search query: {}", serde_json::to_string_pretty(&body)?);
 
+    // Execute search
     let response = client
         .client()
         .search(elasticsearch::SearchParts::Index(&[&client.index_name]))
@@ -248,6 +256,8 @@ pub async fn execute_search(
         .await?;
 
     let response_body = response.json::<serde_json::Value>().await?;
+
+    // Parse results
     let hits = response_body["hits"]["hits"]
         .as_array()
         .map(|a| a.to_vec())
@@ -294,9 +304,7 @@ pub async fn execute_reverse(
                 }
             }
         ],
-        "size": size,
-        "fields": REQUIRED_FIELDS,
-        "_source": false
+        "size": size
     });
 
     let response = client
@@ -307,6 +315,7 @@ pub async fn execute_reverse(
         .await?;
 
     let response_body = response.json::<serde_json::Value>().await?;
+
     let hits = response_body["hits"]["hits"]
         .as_array()
         .map(|a| a.to_vec())
@@ -320,38 +329,24 @@ pub async fn execute_reverse(
     Ok(results)
 }
 
-/// Helper to get a string value from the Elasticsearch 'fields' response object.
-/// Elasticsearch returns fields as arrays, e.g., "layer": ["venue"].
-fn get_field_str(fields: &serde_json::Value, path: &str) -> Option<String> {
-    fields[path].as_array()?.first()?.as_str().map(String::from)
-}
-
 /// Parse an Elasticsearch hit into a SearchResult
 fn parse_hit(hit: serde_json::Value, preferred_lang: &Option<String>) -> Option<SearchResult> {
-    // When using synthetic source and the 'fields' parameter, data is in hit["fields"]
-    let fields = &hit["fields"];
+    let source = &hit["_source"];
     let score = hit["_score"].as_f64().unwrap_or(0.0);
 
-    // Get coordinates from center_point. Synthetic source/fields returns geo_point as strings or objects in array
-    // Standard format for geo_point in 'fields' is an array of strings: ["lat,lon"]
-    let lat_lon_str = fields["center_point"].as_array()?.first()?.as_str()?;
-    let coords: Vec<&str> = lat_lon_str.split(',').collect();
-    let lat = coords.get(0)?.parse::<f64>().ok()?;
-    let lon = coords.get(1)?.parse::<f64>().ok()?;
+    // Get coordinates
+    let center_point = &source["center_point"];
+    let lat = center_point["lat"].as_f64()?;
+    let lon = center_point["lon"].as_f64()?;
 
-    // Reconstruct names map from fields matching "name.*"
-    let mut names = HashMap::new();
-    if let Some(obj) = fields.as_object() {
-        for (key, value) in obj {
-            if key.starts_with("name.") {
-                let lang = key.strip_prefix("name.").unwrap_or("default");
-                if let Some(val_str) = value.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()) {
-                    names.insert(lang.to_string(), val_str.to_string());
-                }
-            }
-        }
-    }
+    // Get all names
+    let names_obj = source["name"].as_object()?;
+    let names: HashMap<String, String> = names_obj
+        .iter()
+        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+        .collect();
 
+    // Pick display name based on language preference
     let display_name = preferred_lang
         .as_ref()
         .and_then(|lang| names.get(lang))
@@ -360,6 +355,9 @@ fn parse_hit(hit: serde_json::Value, preferred_lang: &Option<String>) -> Option<
         .cloned()
         .unwrap_or_default();
 
+    // Get admin hierarchy for display
+    let parent = &source["parent"];
+
     Some(SearchResult {
         result_type: "Feature".to_string(),
         geometry: Geometry {
@@ -367,19 +365,19 @@ fn parse_hit(hit: serde_json::Value, preferred_lang: &Option<String>) -> Option<
             coordinates: [lon, lat],
         },
         properties: Properties {
-            id: get_field_str(fields, "source_id")?,
-            layer: get_field_str(fields, "layer")?,
+            id: source["source_id"].as_str()?.to_string(),
+            layer: source["layer"].as_str()?.to_string(),
             name: display_name,
             names,
-            housenumber: get_field_str(fields, "address.housenumber"),
-            street: get_field_str(fields, "address.street"),
-            postcode: get_field_str(fields, "address.postcode"),
-            country: get_field_str(fields, "parent.country.name"),
-            region: get_field_str(fields, "parent.region.name"),
-            county: get_field_str(fields, "parent.county.name"),
-            locality: get_field_str(fields, "parent.locality.name"),
-            neighbourhood: get_field_str(fields, "parent.neighbourhood.name"),
-            categories: fields["categories"]
+            housenumber: source["address"]["housenumber"].as_str().map(String::from),
+            street: source["address"]["street"].as_str().map(String::from),
+            postcode: source["address"]["postcode"].as_str().map(String::from),
+            country: parent["country"]["name"].as_str().map(String::from),
+            region: parent["region"]["name"].as_str().map(String::from),
+            county: parent["county"]["name"].as_str().map(String::from),
+            locality: parent["locality"]["name"].as_str().map(String::from),
+            neighbourhood: parent["neighbourhood"]["name"].as_str().map(String::from),
+            categories: source["categories"]
                 .as_array()
                 .map(|a| {
                     a.iter()
