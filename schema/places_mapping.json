@@ -67,6 +67,7 @@
     }
   },
   "mappings": {
+    "_source": { "mode": "synthetic" },
     "dynamic": "true",
     "dynamic_templates": [
       {
