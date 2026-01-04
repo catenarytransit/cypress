@@ -28,6 +28,11 @@
           "type": "pattern_replace",
           "pattern": "[^0-9]",
           "replacement": " "
+        },
+        "nfkc_normalizer": {
+          "type": "icu_normalizer",
+          "name": "nfkc",
+          "mode": "compose"
         }
       },
       "filter": {
@@ -77,6 +82,9 @@
         "peliasIndex": {
           "type": "custom",
           "tokenizer": "peliasTokenizer",
+          "char_filter": [
+            "nfkc_normalizer"
+          ],
           "filter": [
             "lowercase",
             "trim",
@@ -88,6 +96,9 @@
         "peliasIndexOneEdgeGram": {
           "type": "custom",
           "tokenizer": "peliasTokenizer",
+          "char_filter": [
+            "nfkc_normalizer"
+          ],
           "filter": [
             "lowercase",
             "trim",
@@ -100,6 +111,9 @@
         "peliasQuery": {
           "type": "custom",
           "tokenizer": "peliasTokenizer",
+          "char_filter": [
+            "nfkc_normalizer"
+          ],
           "filter": [
             "lowercase",
             "trim",
@@ -112,6 +126,9 @@
         "peliasAdmin": {
           "type": "custom",
           "tokenizer": "peliasTokenizer",
+          "char_filter": [
+            "nfkc_normalizer"
+          ],
           "filter": [
             "lowercase",
             "trim",
@@ -123,6 +140,9 @@
         "peliasStreet": {
           "type": "custom",
           "tokenizer": "peliasTokenizer",
+          "char_filter": [
+            "nfkc_normalizer"
+          ],
           "filter": [
             "lowercase",
             "trim",
@@ -138,7 +158,8 @@
           "type": "custom",
           "tokenizer": "keyword",
           "char_filter": [
-            "alphanumeric"
+            "alphanumeric",
+            "nfkc_normalizer"
           ],
           "filter": [
             "lowercase",
