@@ -4,7 +4,7 @@
     "number_of_replicas": 0,
     "index": {
       "codec": "best_compression",
-      "refresh_interval": "10s",
+      "refresh_interval": "60s",
       "mapping": {
         "total_fields": {
           "limit": 10000
@@ -13,13 +13,25 @@
     },
     "analysis": {
       "tokenizer": {
-        "peliasNameTokenizer": {
+        "peliasTokenizer": {
           "type": "pattern",
           "pattern": "[\\s,/\\\\-]+"
         }
       },
+      "char_filter": {
+        "alphanumeric": {
+          "type": "pattern_replace",
+          "pattern": "[^a-zA-Z0-9]",
+          "replacement": ""
+        },
+        "numeric": {
+          "type": "pattern_replace",
+          "pattern": "[^0-9]",
+          "replacement": " "
+        }
+      },
       "filter": {
-        "peliasASCIIFolding": {
+        "peliasAsciiFolding": {
           "type": "asciifolding",
           "preserve_original": true
         },
@@ -37,37 +49,103 @@
             "court,ct"
           ]
         },
-        "peliasEdgeNGram": {
+        "peliasOneEdgeGramFilter": {
           "type": "edge_ngram",
           "min_gram": 1,
           "max_gram": 24
+        },
+        "notnull": {
+          "type": "length",
+          "min": 1
+        },
+        "unique_only_same_position": {
+          "type": "unique",
+          "only_on_same_position": true
+        },
+        "remove_duplicate_spaces": {
+          "type": "pattern_replace",
+          "pattern": " +",
+          "replacement": " "
+        },
+        "remove_ordinals": {
+          "type": "pattern_replace",
+          "pattern": "(?i)((^| )((1)st?|(2)nd?|(3)rd?|([4-9])th?)|(([0-9]*)(1[0-9])th?)|(([0-9]*[02-9])((1)st?|(2)nd?|(3)rd?|([04-9])th?))($| ))",
+          "replacement": "$2$4$5$6$7$9$10$12$14$15$16$17$18"
         }
       },
       "analyzer": {
-        "peliasQuery": {
-          "type": "custom",
-          "tokenizer": "peliasNameTokenizer",
-          "filter": [
-            "lowercase",
-            "peliasASCIIFolding",
-            "peliasSynonymFilter"
-          ]
-        },
         "peliasIndex": {
           "type": "custom",
-          "tokenizer": "peliasNameTokenizer",
+          "tokenizer": "peliasTokenizer",
           "filter": [
             "lowercase",
-            "peliasASCIIFolding"
+            "trim",
+            "peliasAsciiFolding",
+            "unique_only_same_position",
+            "notnull"
           ]
         },
-        "peliasAutocomplete": {
+        "peliasIndexOneEdgeGram": {
           "type": "custom",
-          "tokenizer": "peliasNameTokenizer",
+          "tokenizer": "peliasTokenizer",
           "filter": [
             "lowercase",
-            "peliasASCIIFolding",
-            "peliasEdgeNGram"
+            "trim",
+            "peliasAsciiFolding",
+            "peliasOneEdgeGramFilter",
+            "unique_only_same_position",
+            "notnull"
+          ]
+        },
+        "peliasQuery": {
+          "type": "custom",
+          "tokenizer": "peliasTokenizer",
+          "filter": [
+            "lowercase",
+            "trim",
+            "peliasAsciiFolding",
+            "peliasSynonymFilter",
+            "unique_only_same_position",
+            "notnull"
+          ]
+        },
+        "peliasAdmin": {
+          "type": "custom",
+          "tokenizer": "peliasTokenizer",
+          "filter": [
+            "lowercase",
+            "trim",
+            "peliasAsciiFolding",
+            "unique_only_same_position",
+            "notnull"
+          ]
+        },
+        "peliasStreet": {
+          "type": "custom",
+          "tokenizer": "peliasTokenizer",
+          "filter": [
+            "lowercase",
+            "trim",
+            "remove_duplicate_spaces",
+            "peliasSynonymFilter",
+            "peliasAsciiFolding",
+            "remove_ordinals",
+            "unique_only_same_position",
+            "notnull"
+          ]
+        },
+        "peliasZip": {
+          "type": "custom",
+          "tokenizer": "keyword",
+          "char_filter": [
+            "alphanumeric"
+          ],
+          "filter": [
+            "lowercase",
+            "trim",
+            "peliasAsciiFolding",
+            "unique_only_same_position",
+            "notnull"
           ]
         }
       }
@@ -87,7 +165,7 @@
             "fields": {
               "autocomplete": {
                 "type": "text",
-                "analyzer": "peliasAutocomplete",
+                "analyzer": "peliasIndexOneEdgeGram",
                 "search_analyzer": "peliasQuery"
               }
             }
@@ -99,7 +177,7 @@
           "path_match": "parent.*.name_*",
           "mapping": {
             "type": "text",
-            "analyzer": "peliasIndex",
+            "analyzer": "peliasAdmin",
             "search_analyzer": "peliasQuery"
           }
         }
@@ -107,22 +185,32 @@
     ],
     "properties": {
       "source_id": {
-        "type": "keyword"
+        "type": "keyword",
+        "doc_values": true,
+        "norms": false
       },
       "source_file": {
-        "type": "keyword"
+        "type": "keyword",
+        "doc_values": true,
+        "norms": false
       },
       "import_timestamp": {
-        "type": "date"
+        "type": "date",
+        "doc_values": true,
+        "norms": false
       },
       "osm_type": {
         "type": "keyword"
       },
       "osm_id": {
-        "type": "long"
+        "type": "long",
+        "doc_values": true,
+        "norms": false
       },
       "wikidata_id": {
-        "type": "keyword"
+        "type": "keyword",
+        "doc_values": true,
+        "norms": false
       },
       "importance": {
         "type": "float"
@@ -150,7 +238,7 @@
             "fields": {
               "autocomplete": {
                 "type": "text",
-                "analyzer": "peliasAutocomplete",
+                "analyzer": "peliasIndexOneEdgeGram",
                 "search_analyzer": "peliasQuery"
               }
             }
@@ -170,15 +258,17 @@
           },
           "street": {
             "type": "text",
-            "analyzer": "peliasIndex",
+            "analyzer": "peliasStreet",
             "search_analyzer": "peliasQuery"
           },
           "postcode": {
-            "type": "keyword"
+            "type": "text",
+            "analyzer": "peliasZip",
+            "search_analyzer": "peliasZip"
           },
           "city": {
             "type": "text",
-            "analyzer": "peliasIndex",
+            "analyzer": "peliasAdmin",
             "search_analyzer": "peliasQuery"
           }
         }
@@ -197,7 +287,8 @@
             "properties": {
               "name": {
                 "type": "text",
-                "analyzer": "peliasIndex"
+                "analyzer": "peliasAdmin",
+                "search_analyzer": "peliasQuery"
               },
               "abbr": {
                 "type": "keyword"
@@ -212,7 +303,7 @@
             "properties": {
               "name": {
                 "type": "text",
-                "analyzer": "peliasIndex",
+                "analyzer": "peliasAdmin",
                 "search_analyzer": "peliasQuery"
               },
               "abbr": {
@@ -228,7 +319,7 @@
             "properties": {
               "name": {
                 "type": "text",
-                "analyzer": "peliasIndex",
+                "analyzer": "peliasAdmin",
                 "search_analyzer": "peliasQuery"
               },
               "abbr": {
@@ -244,7 +335,7 @@
             "properties": {
               "name": {
                 "type": "text",
-                "analyzer": "peliasIndex",
+                "analyzer": "peliasAdmin",
                 "search_analyzer": "peliasQuery"
               },
               "abbr": {
@@ -260,7 +351,7 @@
             "properties": {
               "name": {
                 "type": "text",
-                "analyzer": "peliasIndex",
+                "analyzer": "peliasAdmin",
                 "search_analyzer": "peliasQuery"
               },
               "abbr": {
@@ -276,7 +367,7 @@
             "properties": {
               "name": {
                 "type": "text",
-                "analyzer": "peliasIndex",
+                "analyzer": "peliasAdmin",
                 "search_analyzer": "peliasQuery"
               },
               "abbr": {
@@ -292,7 +383,7 @@
             "properties": {
               "name": {
                 "type": "text",
-                "analyzer": "peliasIndex",
+                "analyzer": "peliasAdmin",
                 "search_analyzer": "peliasQuery"
               },
               "abbr": {
@@ -308,7 +399,7 @@
             "properties": {
               "name": {
                 "type": "text",
-                "analyzer": "peliasIndex",
+                "analyzer": "peliasAdmin",
                 "search_analyzer": "peliasQuery"
               },
               "abbr": {
@@ -324,7 +415,7 @@
             "properties": {
               "name": {
                 "type": "text",
-                "analyzer": "peliasIndex",
+                "analyzer": "peliasAdmin",
                 "search_analyzer": "peliasQuery"
               },
               "abbr": {

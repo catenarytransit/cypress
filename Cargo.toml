@@ -65,6 +65,8 @@ memmap2 = "0.9"
 flate2 = "1.0"
 toml = "0.8"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
+regex = "1.10"
+walkdir = "2.3"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.6"

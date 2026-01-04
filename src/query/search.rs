@@ -74,7 +74,7 @@ pub async fn execute_search(
     let name_field = if autocomplete {
         "name.default.autocomplete"
     } else {
-        "name.default"
+        "name_all"
     };
 
     let should_clauses = vec![
@@ -96,21 +96,28 @@ pub async fn execute_search(
                 }
             }
         }),
-        // Search across all name languages
+        // Address matches
         json!({
             "match": {
-                "name_all": {
+                "address.street": {
                     "query": &params.text,
                     "boost": 5.0
                 }
             }
         }),
-        // Address street match
         json!({
             "match": {
-                "address.street": {
+                "address.city": {
                     "query": &params.text,
                     "boost": 3.0
+                }
+            }
+        }),
+        json!({
+            "match": {
+                "address.postcode": {
+                    "query": &params.text,
+                    "boost": 5.0
                 }
             }
         }),
@@ -120,21 +127,28 @@ pub async fn execute_search(
                 "query": &params.text,
                 "fields": [
                     "parent.country.name",
+                    "parent.macro_region.name",
                     "parent.region.name",
+                    "parent.macro_county.name",
                     "parent.county.name",
+                    "parent.local_admin.name",
                     "parent.locality.name",
+                    "parent.borough.name",
                     "parent.neighbourhood.name"
                 ],
                 "boost": 2.0
             }
         }),
-        // Name + Admin hybrid search (e.g. "Los Angeles California")
+        // Name + Address + Admin hybrid search
         json!({
             "multi_match": {
                 "query": &params.text,
                 "type": "cross_fields",
                 "fields": [
-                    "name.default",
+                    "name_all",
+                    "address.street",
+                    "address.city",
+                    "address.postcode",
                     "parent.country.name",
                     "parent.macro_region.name",
                     "parent.region.name",
@@ -147,7 +161,7 @@ pub async fn execute_search(
                 ],
                 "analyzer": "peliasQuery",
                 "operator": "and",
-                "boost": 8.0
+                "boost": 15.0
             }
         }),
     ];

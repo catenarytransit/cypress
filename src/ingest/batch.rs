@@ -17,7 +17,11 @@ struct PreparedRegion {
     import_start: chrono::DateTime<Utc>,
 }
 
-pub async fn run_batch(config_path: PathBuf, args: Args) -> Result<()> {
+pub async fn run_batch(
+    config_path: PathBuf,
+    args: Args,
+    synonyms: Arc<crate::synonyms::SynonymService>,
+) -> Result<()> {
     let config = Config::load_from_file(config_path)?;
     let version_manager = Arc::new(VersionManager::new(&config.global.es_url).await?);
 
@@ -111,7 +115,7 @@ pub async fn run_batch(config_path: PathBuf, args: Args) -> Result<()> {
     while let Some(prepared) = rx.recv().await {
         info!("Starting ingest for {}", prepared.region.name);
 
-        let res = crate::run_single(prepared.args).await;
+        let res = crate::run_single(prepared.args, synonyms.clone()).await;
         if let Err(e) = res {
             error!("Ingest failed for {}: {:?}", prepared.region.name, e);
             continue;

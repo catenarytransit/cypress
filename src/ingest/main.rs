@@ -6,6 +6,7 @@
 mod batch;
 mod config;
 mod importance;
+mod synonyms;
 mod version;
 mod way_merger;
 
@@ -30,6 +31,7 @@ use cypress::pip::{extract_admin_boundaries, AdminSpatialIndex, GeometryResolver
 use cypress::wikidata::WikidataFetcher;
 
 use crate::importance::{calculate_default_importance, load_importance};
+use crate::synonyms::SynonymService;
 use crate::way_merger::WayMerger;
 
 #[cfg(not(target_env = "msvc"))]
@@ -126,9 +128,21 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // Initialize synonym service
+    let mut synonym_service = SynonymService::new();
+    // Try to load from standard locations
+    if Path::new("schema/synonyms").exists() {
+        synonym_service.load_from_dir("schema/synonyms")?;
+    } else if Path::new("../schema/synonyms").exists() {
+        synonym_service.load_from_dir("../schema/synonyms")?;
+    } else {
+        warn!("Could not find schema/synonyms directory. Running without synonyms.");
+    }
+    let synonym_service = Arc::new(synonym_service);
+
     match cli.command {
-        Commands::Single(args) => run_single(args).await,
-        Commands::Batch { config, args } => batch::run_batch(config, args).await,
+        Commands::Single(args) => run_single(args, synonym_service).await,
+        Commands::Batch { config, args } => batch::run_batch(config, args, synonym_service).await,
         Commands::ResetVersions { es_url } => run_reset(&es_url).await,
     }
 }
@@ -146,7 +160,7 @@ pub async fn run_reset(es_url: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn run_single(args: Args) -> Result<()> {
+pub async fn run_single(args: Args, synonyms: Arc<SynonymService>) -> Result<()> {
     let file_path = args
         .file
         .clone()
@@ -282,7 +296,9 @@ pub async fn run_single(args: Args) -> Result<()> {
         info!("Building place geometry index from main file...");
         let file = File::open(&file_path)?;
         let mut reader = OsmPbfReader::new(BufReader::new(file));
-        Arc::new(GeometryResolver::build(&mut reader, |tags| determine_layer(tags).is_some())?)
+        Arc::new(GeometryResolver::build(&mut reader, |tags| {
+            determine_layer(tags).is_some()
+        })?)
     } else {
         Arc::new(admin_resolver)
     };
@@ -396,14 +412,21 @@ pub async fn run_single(args: Args) -> Result<()> {
         if let Some(ref mut merger) = way_merger {
             if let osmpbfreader::OsmObj::Way(ref way) = obj {
                 if is_road_way(&way.tags) {
-                    merger.add_road(way.id, way.tags.clone(), way.nodes.iter().map(|n| n.0).collect());
+                    // Normalize name in tags before adding to merger
+                    // This improves merger grouping
+                    let mut tags = way.tags.clone();
+                    if let Some(name) = tags.get("name") {
+                        let normalized = synonyms.normalize(name);
+                        tags.insert("name".into(), normalized.into());
+                    }
+                    merger.add_road(way.id, tags, way.nodes.iter().map(|n| n.0).collect());
                     continue; // Don't process this way now
                 }
             }
         }
 
         // Try to extract a place from this object (non-roads or when merging disabled)
-        if let Some(mut place) = extract_place(&obj, &source_file, &place_resolver)? {
+        if let Some(mut place) = extract_place(&obj, &source_file, &place_resolver, &synonyms)? {
             // PIP lookup for admin hierarchy
             let hierarchy =
                 pip_service.lookup(place.center_point.lon, place.center_point.lat, None);
@@ -468,15 +491,15 @@ pub async fn run_single(args: Args) -> Result<()> {
     if let Some(merger) = way_merger {
         info!("Processing merged roads...");
         let merged_roads = merger.merge();
-        
+
         for merged_road in merged_roads {
             if let Some(mut place) = merged_road.to_place(&source_file) {
                 // Extract tags
-                extract_tags(&mut place, &merged_road.tags);
-                
+                extract_tags(&mut place, &merged_road.tags, &synonyms);
+
                 // Calculate importance
                 place.importance = Some(calculate_default_importance(&merged_road.tags));
-                
+
                 // PIP lookup for admin hierarchy
                 let hierarchy =
                     pip_service.lookup(place.center_point.lon, place.center_point.lat, None);
@@ -557,13 +580,23 @@ fn is_road_way(tags: &osmpbfreader::Tags) -> bool {
         if !tags.contains_key("name") {
             return false;
         }
-        
+
         // Check if this is a street-type highway (not motorways or links)
         matches!(
             highway.as_str(),
-            "residential" | "primary" | "secondary" | "tertiary" | 
-            "unclassified" | "service" | "living_street" | "pedestrian" |
-            "track" | "road" | "footway" | "cycleway" | "path"
+            "residential"
+                | "primary"
+                | "secondary"
+                | "tertiary"
+                | "unclassified"
+                | "service"
+                | "living_street"
+                | "pedestrian"
+                | "track"
+                | "road"
+                | "footway"
+                | "cycleway"
+                | "path"
         )
     } else {
         false
@@ -575,6 +608,7 @@ fn extract_place(
     obj: &osmpbfreader::OsmObj,
     source_file: &str,
     resolver: &Arc<GeometryResolver>,
+    synonyms: &SynonymService,
 ) -> Result<Option<Place>> {
     use osmpbfreader::OsmObj;
 
@@ -587,7 +621,7 @@ fn extract_place(
                 };
                 let mut place = Place::new(OsmType::Node, node.id.0, layer, center, source_file);
                 place.importance = Some(calculate_default_importance(&node.tags));
-                extract_tags(&mut place, &node.tags);
+                extract_tags(&mut place, &node.tags, synonyms);
                 Ok(Some(place))
             } else {
                 Ok(None)
@@ -600,7 +634,7 @@ fn extract_place(
                     let center = GeoPoint { lat, lon };
                     let mut place = Place::new(OsmType::Way, way.id.0, layer, center, source_file);
                     place.importance = Some(calculate_default_importance(&way.tags));
-                    extract_tags(&mut place, &way.tags);
+                    extract_tags(&mut place, &way.tags, synonyms);
 
                     // Optional: Add Bbox
                     if let Some(poly) = resolver.resolve_way(way.id) {
@@ -643,7 +677,7 @@ fn extract_place(
                         let mut place =
                             Place::new(OsmType::Relation, rel.id.0, layer, center, source_file);
                         place.importance = Some(calculate_default_importance(&rel.tags));
-                        extract_tags(&mut place, &rel.tags);
+                        extract_tags(&mut place, &rel.tags, synonyms);
 
                         // Calculate Bbox
                         if let Some(rect) = multi_poly.bounding_rect() {
@@ -667,6 +701,89 @@ fn extract_place(
             }
         }
     }
+}
+
+// Skipping determine_layer...
+
+/// Extract all relevant tags from OSM object
+fn extract_tags(place: &mut Place, tags: &osmpbfreader::Tags, synonyms: &SynonymService) {
+    for (key, value) in tags.iter() {
+        let key_str = key.as_str();
+
+        // Names
+        if key_str == "name" {
+            place.add_name("default", synonyms.normalize(value));
+        } else if let Some(lang) = key_str.strip_prefix("name:") {
+            if is_valid_lang_code(lang) {
+                place.add_name(lang, value.to_string());
+            }
+        } else {
+            // Check for alternate names
+            let name_variants = [
+                "alt_name",
+                "old_name",
+                "official_name",
+                "short_name",
+                "int_name",
+                "nat_name",
+                "reg_name",
+                "loc_name",
+            ];
+
+            for variant in &name_variants {
+                if key_str == *variant {
+                    place.add_name(variant, value.to_string());
+                    break;
+                } else if let Some(suffix) = key_str
+                    .strip_prefix(variant)
+                    .and_then(|s| s.strip_prefix(':'))
+                {
+                    if is_valid_lang_code(suffix) {
+                        place.add_name(key_str, value.to_string());
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Wikidata
+        if key_str == "wikidata" || key_str == "brand:wikidata" {
+            place.wikidata_id = Some(value.to_string());
+        }
+        // Address components
+        else if key_str == "addr:housenumber" {
+            place
+                .address
+                .get_or_insert_with(Address::default)
+                .housenumber = Some(value.to_string());
+        } else if key_str == "addr:street" {
+            place.address.get_or_insert_with(Address::default).street =
+                Some(synonyms.normalize(value));
+        } else if key_str == "addr:postcode" {
+            place.address.get_or_insert_with(Address::default).postcode = Some(value.to_string());
+        } else if key_str == "addr:city" {
+            place.address.get_or_insert_with(Address::default).city =
+                Some(synonyms.normalize(value));
+        }
+        // Categories (POI types)
+        else if [
+            "amenity", "shop", "tourism", "leisure", "cuisine", "building", "historic", "office",
+        ]
+        .contains(&key_str)
+        {
+            place.add_category(key_str, value);
+        }
+    }
+}
+
+fn is_valid_lang_code(lang: &str) -> bool {
+    // Validate language code to prevent field explosion (ES limit 1000)
+    // Allow 2-10 chars, alphanumeric + -_
+    lang.len() >= 2
+        && lang.len() <= 10
+        && lang
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
 }
 
 /// Determine the layer/type from OSM tags
@@ -712,94 +829,25 @@ fn determine_layer(tags: &osmpbfreader::Tags) -> Option<Layer> {
         let highway_str = highway.as_str();
         if matches!(
             highway_str,
-            "residential" | "primary" | "secondary" | "tertiary" 
-            | "unclassified" | "service" | "living_street" | "pedestrian"
-            | "track" | "road" | "footway" | "cycleway" | "path"
+            "residential"
+                | "primary"
+                | "secondary"
+                | "tertiary"
+                | "unclassified"
+                | "service"
+                | "living_street"
+                | "pedestrian"
+                | "track"
+                | "road"
+                | "footway"
+                | "cycleway"
+                | "path"
         ) {
             return Some(Layer::Street);
         }
     }
 
     None
-}
-
-/// Extract all relevant tags from OSM object
-fn extract_tags(place: &mut Place, tags: &osmpbfreader::Tags) {
-    for (key, value) in tags.iter() {
-        let key_str = key.as_str();
-
-        // Names
-        if key_str == "name" {
-            place.add_name("default", value.to_string());
-        } else if let Some(lang) = key_str.strip_prefix("name:") {
-            if is_valid_lang_code(lang) {
-                place.add_name(lang, value.to_string());
-            }
-        } else {
-            // Check for alternate names
-            let name_variants = [
-                "alt_name",
-                "old_name",
-                "official_name",
-                "short_name",
-                "int_name",
-                "nat_name",
-                "reg_name",
-                "loc_name",
-            ];
-
-            for variant in &name_variants {
-                if key_str == *variant {
-                    place.add_name(variant, value.to_string());
-                    break;
-                } else if let Some(suffix) = key_str
-                    .strip_prefix(variant)
-                    .and_then(|s| s.strip_prefix(':'))
-                {
-                    if is_valid_lang_code(suffix) {
-                        place.add_name(key_str, value.to_string());
-                    }
-                    break;
-                }
-            }
-        }
-
-        // Wikidata
-        if key_str == "wikidata" || key_str == "brand:wikidata" {
-            place.wikidata_id = Some(value.to_string());
-        }
-        // Address components
-        else if key_str == "addr:housenumber" {
-            place
-                .address
-                .get_or_insert_with(Address::default)
-                .housenumber = Some(value.to_string());
-        } else if key_str == "addr:street" {
-            place.address.get_or_insert_with(Address::default).street = Some(value.to_string());
-        } else if key_str == "addr:postcode" {
-            place.address.get_or_insert_with(Address::default).postcode = Some(value.to_string());
-        } else if key_str == "addr:city" {
-            place.address.get_or_insert_with(Address::default).city = Some(value.to_string());
-        }
-        // Categories (POI types)
-        else if [
-            "amenity", "shop", "tourism", "leisure", "cuisine", "building", "historic", "office",
-        ]
-        .contains(&key_str)
-        {
-            place.add_category(key_str, value);
-        }
-    }
-}
-
-fn is_valid_lang_code(lang: &str) -> bool {
-    // Validate language code to prevent field explosion (ES limit 1000)
-    // Allow 2-10 chars, alphanumeric + -_
-    lang.len() >= 2
-        && lang.len() <= 10
-        && lang
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
 }
 
 /// Delete documents from previous import of the same file
