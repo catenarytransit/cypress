@@ -122,6 +122,10 @@ pub struct Place {
     /// Multilingual names: {"default": "...", "de": "...", "fr": "..."}
     pub name: HashMap<String, String>,
 
+    /// Aggregated name field containing all name variants
+    #[serde(default)]
+    pub name_all: String,
+
     /// Phrase field for exact matching (copy of default name)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phrase: Option<String>,
@@ -161,6 +165,7 @@ impl Place {
             layer,
             categories: Vec::new(),
             name: HashMap::new(),
+            name_all: String::new(),
             phrase: None,
             address: None,
             center_point: center,
@@ -221,5 +226,17 @@ impl Place {
                 self.importance = Some(imp.clamp(0.0, 1.0));
             }
         }
+
+        // Populate name_all
+        let mut all_names = std::collections::HashSet::new();
+        if let Some(ref phrase) = self.phrase {
+            all_names.insert(phrase.clone());
+        }
+        for name in self.name.values() {
+            all_names.insert(name.clone());
+        }
+        let mut sorted_names: Vec<_> = all_names.into_iter().collect();
+        sorted_names.sort();
+        self.name_all = sorted_names.join(" ");
     }
 }

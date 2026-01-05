@@ -173,37 +173,11 @@
     }
   },
   "mappings": {
+    "_source": {
+      "enabled": false
+    },
     "dynamic": "true",
-    "dynamic_templates": [
-      {
-        "name_fields": {
-          "path_match": "name.*",
-          "mapping": {
-            "type": "text",
-            "copy_to": "name_all",
-            "analyzer": "peliasIndex",
-            "search_analyzer": "peliasQuery",
-            "fields": {
-              "autocomplete": {
-                "type": "text",
-                "analyzer": "peliasIndexOneEdgeGram",
-                "search_analyzer": "peliasQuery"
-              }
-            }
-          }
-        }
-      },
-      {
-        "parent_name_fields": {
-          "path_match": "parent.*.name_*",
-          "mapping": {
-            "type": "text",
-            "analyzer": "peliasAdmin",
-            "search_analyzer": "peliasQuery"
-          }
-        }
-      }
-    ],
+    "dynamic_templates": [],
     "properties": {
       "source_id": {
         "type": "keyword",
@@ -243,26 +217,18 @@
       "name_all": {
         "type": "text",
         "analyzer": "peliasIndex",
-        "search_analyzer": "peliasQuery"
+        "search_analyzer": "peliasQuery",
+        "fields": {
+          "autocomplete": {
+            "type": "text",
+            "analyzer": "peliasIndexOneEdgeGram",
+            "search_analyzer": "peliasQuery"
+          }
+        }
       },
       "name": {
         "type": "object",
-        "dynamic": true,
-        "properties": {
-          "default": {
-            "type": "text",
-            "copy_to": "name_all",
-            "analyzer": "peliasIndex",
-            "search_analyzer": "peliasQuery",
-            "fields": {
-              "autocomplete": {
-                "type": "text",
-                "analyzer": "peliasIndexOneEdgeGram",
-                "search_analyzer": "peliasQuery"
-              }
-            }
-          }
-        }
+        "enabled": false
       },
       "phrase": {
         "type": "text",

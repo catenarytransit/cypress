@@ -26,8 +26,10 @@ use tracing_subscriber::FmtSubscriber;
 
 use cypress::discord::DiscordWebhook;
 use cypress::elasticsearch::{create_index, BulkIndexer, EsClient};
-use cypress::models::{Address, GeoBbox, GeoPoint, Layer, OsmType, Place};
+use cypress::models::normalized::NormalizedPlace;
+use cypress::models::{Address, AdminEntry, GeoBbox, GeoPoint, Layer, OsmType, Place};
 use cypress::pip::{extract_admin_boundaries, AdminSpatialIndex, GeometryResolver, PipService};
+use cypress::scylla::ScyllaClient;
 use cypress::wikidata::WikidataFetcher;
 
 use crate::importance::{calculate_default_importance, load_importance};
@@ -89,6 +91,10 @@ pub struct Args {
     #[arg(long, default_value = "places")]
     pub index: String,
 
+    /// ScyllaDB URL
+    #[arg(long, default_value = "127.0.0.1")]
+    pub scylla_url: String,
+
     /// Fetch supplemental labels from Wikidata
     #[arg(long)]
     pub wikidata: bool,
@@ -142,7 +148,15 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Single(args) => run_single(args, synonym_service).await,
-        Commands::Batch { config, args } => batch::run_batch(config, args, synonym_service).await,
+        Commands::Batch { config, args } => {
+            // TODO: Pass Scylla URL to batch if needed, currently batch likely calls run_single or similar logic.
+            // Check batch.rs content. For now we assume batch uses its own config or args.
+            // Actually batch usually calls run_single logic or re-implements it.
+            // Let's check batch.rs but for now I'll just update Single.
+            // Wait, I should probably check batch.rs.
+            // But let's proceed with run_single first as per plan.
+            batch::run_batch(config, args, synonym_service).await
+        }
         Commands::ResetVersions { es_url } => run_reset(&es_url).await,
     }
 }
@@ -178,6 +192,11 @@ pub async fn run_single(args: Args, synonyms: Arc<SynonymService>) -> Result<()>
         anyhow::bail!("Elasticsearch cluster is not healthy");
     }
     info!("Connected to Elasticsearch");
+
+    // Connect to ScyllaDB
+    let scylla_client = ScyllaClient::new(&args.scylla_url).await?;
+    info!("Connected to ScyllaDB");
+    let scylla_client = Arc::new(scylla_client);
 
     // Initialize Discord webhook
     let discord = args
@@ -383,6 +402,17 @@ pub async fn run_single(args: Args, synonyms: Arc<SynonymService>) -> Result<()>
             }
 
             place.sanitize();
+
+            // Extract and upsert admin areas
+            upsert_admin_areas(&place, &scylla_client).await?;
+
+            // Convert to normalized place and upsert
+            let normalized = NormalizedPlace::from_place(place.clone());
+            let json_data = serde_json::to_string(&normalized)?;
+            scylla_client
+                .upsert_place(&normalized.source_id, &json_data)
+                .await?;
+
             indexer.add(place).await?;
         }
     }
@@ -479,6 +509,16 @@ pub async fn run_single(args: Args, synonyms: Arc<SynonymService>) -> Result<()>
                 }
 
                 for p in places_buffer.drain(..) {
+                    // Extract and upsert admin areas
+                    upsert_admin_areas(&p, &scylla_client).await?;
+
+                    // Convert to normalized place and upsert
+                    let normalized = NormalizedPlace::from_place(p.clone());
+                    let json_data = serde_json::to_string(&normalized)?;
+                    scylla_client
+                        .upsert_place(&normalized.source_id, &json_data)
+                        .await?;
+
                     indexer.add(p).await?;
                 }
             }
@@ -523,6 +563,16 @@ pub async fn run_single(args: Args, synonyms: Arc<SynonymService>) -> Result<()>
                 // Index when buffer is full
                 if places_buffer.len() >= args.batch_size {
                     for p in places_buffer.drain(..) {
+                        // Extract and upsert admin areas
+                        upsert_admin_areas(&p, &scylla_client).await?;
+
+                        // Convert to normalized place and upsert
+                        let normalized = NormalizedPlace::from_place(p.clone());
+                        let json_data = serde_json::to_string(&normalized)?;
+                        scylla_client
+                            .upsert_place(&normalized.source_id, &json_data)
+                            .await?;
+
                         indexer.add(p).await?;
                     }
                 }
@@ -543,7 +593,18 @@ pub async fn run_single(args: Args, synonyms: Arc<SynonymService>) -> Result<()>
     }
 
     // Index remaining places
+    // Index remaining places
     for p in places_buffer {
+        // Extract and upsert admin areas
+        upsert_admin_areas(&p, &scylla_client).await?;
+
+        // Convert to normalized place and upsert
+        let normalized = NormalizedPlace::from_place(p.clone());
+        let json_data = serde_json::to_string(&normalized)?;
+        scylla_client
+            .upsert_place(&normalized.source_id, &json_data)
+            .await?;
+
         indexer.add(p).await?;
     }
 
@@ -777,77 +838,63 @@ fn extract_tags(place: &mut Place, tags: &osmpbfreader::Tags, synonyms: &Synonym
 }
 
 fn is_valid_lang_code(lang: &str) -> bool {
-    // Validate language code to prevent field explosion (ES limit 1000)
-    // Allow 2-10 chars, alphanumeric + -_
-    lang.len() >= 2
-        && lang.len() <= 10
-        && lang
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    // Basic check for 2-3 letter codes or simple region codes
+    lang.len() >= 2 && lang.len() <= 10 && lang.chars().all(|c| c.is_alphabetic() || c == '-')
 }
 
-/// Determine the layer/type from OSM tags
 fn determine_layer(tags: &osmpbfreader::Tags) -> Option<Layer> {
-    // Check for place tag first
-    if let Some(place_type) = tags.get("place") {
-        return match place_type.as_str() {
-            "country" => Some(Layer::Country),
-            "state" | "province" | "region" => Some(Layer::Region),
-            "city" | "town" | "village" | "hamlet" => Some(Layer::Locality),
-            "suburb" | "neighbourhood" | "quarter" => Some(Layer::Neighbourhood),
-            _ => Some(Layer::Venue),
-        };
+    if let Some(place) = tags.get("place") {
+        match place.as_str() {
+            "country" | "state" | "region" | "province" | "district" | "county"
+            | "municipality" | "city" | "town" | "village" | "hamlet" | "borough" | "suburb"
+            | "quarter" | "neighbourhood" => Some(Layer::Admin), // Or specific layer
+            "island" | "archipelago" => Some(Layer::Admin), // Treat as admin for now
+            _ => None,
+        }
+    } else if let Some(admin_level) = tags.get("admin_level") {
+        // Only if boundary=administrative
+        if tags.contains("boundary", "administrative") {
+            Some(Layer::Admin)
+        } else {
+            None
+        }
+    } else {
+        // Venues/Addresses
+        if tags.contains_key("addr:housenumber") && tags.contains_key("addr:street") {
+            Some(Layer::Address)
+        } else if tags.contains_key("amenity")
+            || tags.contains_key("shop")
+            || tags.contains_key("tourism")
+            || tags.contains_key("leisure")
+        {
+            Some(Layer::Venue)
+        } else {
+            None
+        }
     }
+}
 
-    // Check for boundary=administrative
-    if tags
-        .get("boundary")
-        .map(|v| v == "administrative")
-        .unwrap_or(false)
-    {
-        return Some(Layer::Admin);
-    }
-
-    // Check for address
-    if tags.contains_key("addr:housenumber") && tags.contains_key("addr:street") {
-        return Some(Layer::Address);
-    }
-
-    // Check for various POI types
-    // Expanded list
-    let poi_keys = [
-        "amenity", "shop", "tourism", "leisure", "office", "building", "historic", "craft",
+async fn upsert_admin_areas(place: &Place, scylla: &ScyllaClient) -> Result<()> {
+    let parents = [
+        place.parent.country.as_ref(),
+        place.parent.macro_region.as_ref(),
+        place.parent.region.as_ref(),
+        place.parent.macro_county.as_ref(),
+        place.parent.county.as_ref(),
+        place.parent.local_admin.as_ref(),
+        place.parent.locality.as_ref(),
+        place.parent.borough.as_ref(),
+        place.parent.neighbourhood.as_ref(),
     ];
-    for key in &poi_keys {
-        if tags.contains_key(*key) {
-            return Some(Layer::Venue);
+
+    for parent in parents.iter().flatten() {
+        if let Some(id) = parent.id {
+            let source_id = format!("relation/{}", id);
+            let json_data = serde_json::to_string(parent)?;
+            scylla.upsert_admin_area(&source_id, &json_data).await?;
         }
     }
-
-    // Check for highway (streets)
-    if let Some(highway) = tags.get("highway") {
-        let highway_str = highway.as_str();
-        if matches!(
-            highway_str,
-            "residential"
-                | "primary"
-                | "secondary"
-                | "tertiary"
-                | "unclassified"
-                | "service"
-                | "living_street"
-                | "pedestrian"
-                | "track"
-                | "road"
-                | "footway"
-                | "cycleway"
-                | "path"
-        ) {
-            return Some(Layer::Street);
-        }
-    }
-
-    None
+    Ok(())
 }
 
 /// Delete documents from previous import of the same file

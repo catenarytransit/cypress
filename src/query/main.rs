@@ -21,6 +21,7 @@ use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use cypress::elasticsearch::EsClient;
+use cypress::scylla::ScyllaClient;
 
 mod search;
 use search::{execute_search, SearchParams, SearchResult};
@@ -40,11 +41,16 @@ struct Args {
     /// Elasticsearch index name
     #[arg(long, default_value = "places")]
     index: String,
+
+    /// ScyllaDB URL
+    #[arg(long, default_value = "127.0.0.1")]
+    scylla_url: String,
 }
 
 /// Application state shared across handlers
 struct AppState {
     es_client: EsClient,
+    scylla_client: ScyllaClient,
 }
 
 #[tokio::main]
@@ -73,7 +79,14 @@ async fn main() -> Result<()> {
         args.index, doc_count
     );
 
-    let state = Arc::new(AppState { es_client });
+    // Connect to ScyllaDB
+    info!("Connecting to ScyllaDB at {}", args.scylla_url);
+    let scylla_client = ScyllaClient::new(&args.scylla_url).await?;
+
+    let state = Arc::new(AppState {
+        es_client,
+        scylla_client,
+    });
 
     // Build router
     let app = Router::new()
@@ -130,7 +143,7 @@ async fn search_handler(
         size: params.size.unwrap_or(10).min(40),
     };
 
-    let results = execute_search(&state.es_client, search_params, false)
+    let results = execute_search(&state.es_client, &state.scylla_client, search_params, false)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -156,7 +169,7 @@ async fn autocomplete_handler(
         size: params.size.unwrap_or(10).min(20),
     };
 
-    let results = execute_search(&state.es_client, search_params, true)
+    let results = execute_search(&state.es_client, &state.scylla_client, search_params, true)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -170,6 +183,7 @@ async fn reverse_handler(
 ) -> Result<Json<SearchResponse>, (StatusCode, String)> {
     let results = search::execute_reverse(
         &state.es_client,
+        &state.scylla_client,
         params.point_lon,
         params.point_lat,
         params.size.unwrap_or(10).min(40),

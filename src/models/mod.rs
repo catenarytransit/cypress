@@ -1,6 +1,7 @@
 //! Core data models for the geocoding system.
 
-mod admin;
+pub mod admin;
+pub mod normalized;
 pub mod place;
 
 pub use admin::{AdminArea, AdminEntry, AdminHierarchy, AdminLevel};

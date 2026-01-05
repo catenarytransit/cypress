@@ -1,6 +1,6 @@
 //! Wikidata label fetcher using SPARQL queries.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -103,13 +103,13 @@ impl WikidataFetcher {
         while attempts < max_attempts {
             attempts += 1;
 
-            let response = match self
-                .client
-                .get(WIKIDATA_SPARQL_ENDPOINT)
-                .query(&[("query", &query), ("format", &"json".to_string())])
-                .send()
-                .await
-            {
+            let url = url::Url::parse_with_params(
+                WIKIDATA_SPARQL_ENDPOINT,
+                &[("query", &query), ("format", &"json".to_string())],
+            )
+            .context("Failed to build URL")?;
+
+            let response = match self.client.get(url).send().await {
                 Ok(r) => r,
                 Err(e) => {
                     warn!(

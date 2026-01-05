@@ -6,6 +6,7 @@ pub mod discord;
 pub mod elasticsearch;
 pub mod models;
 pub mod pip;
+pub mod scylla;
 pub mod wikidata;
 
 pub use models::{AdminLevel, Layer, OsmType, Place};

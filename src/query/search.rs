@@ -7,6 +7,9 @@ use std::collections::HashMap;
 use tracing::debug;
 
 use cypress::elasticsearch::EsClient;
+use cypress::models::normalized::NormalizedPlace;
+use cypress::models::{AdminEntry, Place};
+use cypress::scylla::ScyllaClient;
 
 /// Search parameters
 pub struct SearchParams {
@@ -67,12 +70,14 @@ pub struct Properties {
 /// Execute a forward geocoding search
 pub async fn execute_search(
     client: &EsClient,
+    scylla_client: &ScyllaClient,
     params: SearchParams,
     autocomplete: bool,
 ) -> Result<Vec<SearchResult>> {
     // Build multi-match query across name fields
+    // Build multi-match query across name fields
     let name_field = if autocomplete {
-        "name.default.autocomplete"
+        "name_all.autocomplete"
     } else {
         "name_all"
     };
@@ -90,7 +95,7 @@ pub async fn execute_search(
         // Phrase match for exact ordering
         json!({
             "match_phrase": {
-                "phrase": {
+                "name_all": {
                     "query": &params.text,
                     "boost": 20.0
                 }
@@ -121,7 +126,7 @@ pub async fn execute_search(
                 }
             }
         }),
-        // Parent admin matches (for "city" or "country" searches)
+        // Parent admin matches (aggregated name support)
         json!({
             "multi_match": {
                 "query": &params.text,
@@ -139,7 +144,7 @@ pub async fn execute_search(
                 "boost": 2.0
             }
         }),
-        // Name + Address + Admin hybrid search
+        // Name + Address + Admin hybrid search (Cross Fields)
         json!({
             "multi_match": {
                 "query": &params.text,
@@ -232,7 +237,8 @@ pub async fn execute_search(
     // Build full request body
     let mut body = json!({
         "query": query,
-        "size": params.size
+        "size": params.size,
+        "stored_fields": ["_id"]
     });
 
     // Add bounding box filter
@@ -271,16 +277,63 @@ pub async fn execute_search(
 
     let response_body = response.json::<serde_json::Value>().await?;
 
-    // Parse results
+    // Parse results and fetch from Scylla
     let hits = response_body["hits"]["hits"]
         .as_array()
         .map(|a| a.to_vec())
         .unwrap_or_default();
 
-    let results: Vec<SearchResult> = hits
+    let mut places_to_fetch = Vec::new();
+    let mut scores = HashMap::new();
+
+    for hit in hits {
+        if let Some(id) = hit["_id"].as_str() {
+            places_to_fetch.push(id.to_string());
+            let score = hit["_score"].as_f64().unwrap_or(0.0);
+            scores.insert(id.to_string(), score);
+        }
+    }
+
+    // Fetch from Scylla in parallel
+    let fetch_futures = places_to_fetch.iter().map(|id| scylla_client.get_place(id));
+    let mut normalized_places = Vec::new();
+    let mut admin_ids = std::collections::HashSet::new();
+
+    for (i, fetch_result) in futures::future::join_all(fetch_futures)
+        .await
         .into_iter()
-        .filter_map(|hit| parse_hit(hit, &params.lang))
+        .enumerate()
+    {
+        if let Ok(Some(json_data)) = fetch_result {
+            if let Ok(place) = serde_json::from_str::<NormalizedPlace>(&json_data) {
+                let id = places_to_fetch[i].clone();
+                let score = scores.get(&id).copied().unwrap_or(0.0);
+
+                // Collect admin IDs
+                collect_admin_ids(&place, &mut admin_ids);
+
+                normalized_places.push((place, score));
+            }
+        }
+    }
+
+    // Batch fetch admin areas
+    let admin_ids_vec: Vec<String> = admin_ids.into_iter().collect();
+    let admin_map = scylla_client.get_admin_areas(&admin_ids_vec).await?;
+
+    // Parse admin entries map once
+    let parsed_admin_map: HashMap<String, AdminEntry> = admin_map
+        .iter()
+        .filter_map(|(k, v)| serde_json::from_str(v).ok().map(|entry| (k.clone(), entry)))
         .collect();
+
+    let mut results = Vec::new();
+    for (place, score) in normalized_places {
+        if let Some(result) = place_to_search_result(place, score, &params.lang, &parsed_admin_map)
+        {
+            results.push(result);
+        }
+    }
 
     Ok(results)
 }
@@ -288,6 +341,7 @@ pub async fn execute_search(
 /// Execute a reverse geocoding search
 pub async fn execute_reverse(
     client: &EsClient,
+    scylla_client: &ScyllaClient,
     lon: f64,
     lat: f64,
     size: usize,
@@ -318,7 +372,8 @@ pub async fn execute_reverse(
                 }
             }
         ],
-        "size": size
+        "size": size,
+        "stored_fields": ["_id"]
     });
 
     let response = client
@@ -335,70 +390,134 @@ pub async fn execute_reverse(
         .map(|a| a.to_vec())
         .unwrap_or_default();
 
-    let results: Vec<SearchResult> = hits
-        .into_iter()
-        .filter_map(|hit| parse_hit(hit, &None))
+    let mut places_to_fetch = Vec::new();
+
+    for hit in hits {
+        if let Some(id) = hit["_id"].as_str() {
+            places_to_fetch.push(id.to_string());
+        }
+    }
+
+    // Fetch from Scylla
+    let fetch_futures = places_to_fetch.iter().map(|id| scylla_client.get_place(id));
+    let mut normalized_places = Vec::new();
+    let mut admin_ids = std::collections::HashSet::new();
+
+    for fetch_result in futures::future::join_all(fetch_futures).await {
+        if let Ok(Some(json_data)) = fetch_result {
+            if let Ok(place) = serde_json::from_str::<NormalizedPlace>(&json_data) {
+                collect_admin_ids(&place, &mut admin_ids);
+                normalized_places.push(place);
+            }
+        }
+    }
+
+    // Batch fetch admin areas
+    let admin_ids_vec: Vec<String> = admin_ids.into_iter().collect();
+    let admin_map = scylla_client.get_admin_areas(&admin_ids_vec).await?;
+
+    let parsed_admin_map: HashMap<String, AdminEntry> = admin_map
+        .iter()
+        .filter_map(|(k, v)| serde_json::from_str(v).ok().map(|entry| (k.clone(), entry)))
         .collect();
 
+    let mut results = Vec::new();
+    for place in normalized_places {
+        if let Some(result) = place_to_search_result(place, 1.0, &None, &parsed_admin_map) {
+            results.push(result);
+        }
+    }
     Ok(results)
 }
 
 /// Parse an Elasticsearch hit into a SearchResult
-fn parse_hit(hit: serde_json::Value, preferred_lang: &Option<String>) -> Option<SearchResult> {
-    let source = &hit["_source"];
-    let score = hit["_score"].as_f64().unwrap_or(0.0);
+fn collect_admin_ids(place: &NormalizedPlace, ids: &mut std::collections::HashSet<String>) {
+    if let Some(ref id) = place.parent.country {
+        ids.insert(id.clone());
+    }
+    if let Some(ref id) = place.parent.macro_region {
+        ids.insert(id.clone());
+    }
+    if let Some(ref id) = place.parent.region {
+        ids.insert(id.clone());
+    }
+    if let Some(ref id) = place.parent.macro_county {
+        ids.insert(id.clone());
+    }
+    if let Some(ref id) = place.parent.county {
+        ids.insert(id.clone());
+    }
+    if let Some(ref id) = place.parent.local_admin {
+        ids.insert(id.clone());
+    }
+    if let Some(ref id) = place.parent.locality {
+        ids.insert(id.clone());
+    }
+    if let Some(ref id) = place.parent.borough {
+        ids.insert(id.clone());
+    }
+    if let Some(ref id) = place.parent.neighbourhood {
+        ids.insert(id.clone());
+    }
+}
 
-    // Get coordinates
-    let center_point = &source["center_point"];
-    let lat = center_point["lat"].as_f64()?;
-    let lon = center_point["lon"].as_f64()?;
+fn resolve_admin_name(
+    id: &Option<String>,
+    map: &HashMap<String, AdminEntry>,
+    lang: &Option<String>,
+) -> Option<String> {
+    id.as_ref().and_then(|id_str| {
+        map.get(id_str).and_then(|entry| {
+            lang.as_ref()
+                .and_then(|l| entry.names.get(&format!("name_{}", l))) // AdminEntry stores keys as "name_fr" etc? Check model.
+                // Looking at AdminEntry::from_area: keys are "name_de", etc.
+                // But AdminEntry also has `name` field for default.
+                .cloned()
+                .or_else(|| entry.name.clone())
+        })
+    })
+}
 
-    // Get all names
-    let names_obj = source["name"].as_object()?;
-    let names: HashMap<String, String> = names_obj
-        .iter()
-        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-        .collect();
-
+/// Convert a Place model to SearchResult
+fn place_to_search_result(
+    place: NormalizedPlace,
+    score: f64,
+    preferred_lang: &Option<String>,
+    admin_map: &HashMap<String, AdminEntry>,
+) -> Option<SearchResult> {
     // Pick display name based on language preference
     let display_name = preferred_lang
         .as_ref()
-        .and_then(|lang| names.get(lang))
-        .or_else(|| names.get("default"))
-        .or_else(|| names.values().next())
+        .and_then(|lang| place.name.get(lang))
+        .or_else(|| place.name.get("default"))
+        .or_else(|| place.name.values().next())
         .cloned()
         .unwrap_or_default();
-
-    // Get admin hierarchy for display
-    let parent = &source["parent"];
 
     Some(SearchResult {
         result_type: "Feature".to_string(),
         geometry: Geometry {
             geo_type: "Point".to_string(),
-            coordinates: [lon, lat],
+            coordinates: [place.center_point.lon, place.center_point.lat],
         },
         properties: Properties {
-            id: source["source_id"].as_str()?.to_string(),
-            layer: source["layer"].as_str()?.to_string(),
+            id: place.source_id,
+            layer: format!("{:?}", place.layer).to_lowercase(), // format! using generic debug or we can impl Display
             name: display_name,
-            names,
-            housenumber: source["address"]["housenumber"].as_str().map(String::from),
-            street: source["address"]["street"].as_str().map(String::from),
-            postcode: source["address"]["postcode"].as_str().map(String::from),
-            country: parent["country"]["name"].as_str().map(String::from),
-            region: parent["region"]["name"].as_str().map(String::from),
-            county: parent["county"]["name"].as_str().map(String::from),
-            locality: parent["locality"]["name"].as_str().map(String::from),
-            neighbourhood: parent["neighbourhood"]["name"].as_str().map(String::from),
-            categories: source["categories"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default(),
+            names: place.name,
+            housenumber: place.address.as_ref().and_then(|a| a.housenumber.clone()),
+            street: place.address.as_ref().and_then(|a| a.street.clone()),
+            postcode: place.address.as_ref().and_then(|a| a.postcode.clone()),
+            country: resolve_admin_name(&place.parent.country, admin_map, preferred_lang),
+            region: resolve_admin_name(&place.parent.region, admin_map, preferred_lang),
+            county: resolve_admin_name(&place.parent.county, admin_map, preferred_lang),
+            locality: resolve_admin_name(&place.parent.locality, admin_map, preferred_lang),
+            neighbourhood: resolve_admin_name(
+                &place.parent.neighbourhood,
+                admin_map,
+                preferred_lang,
+            ),
+            categories: place.categories,
             confidence: score,
         },
     })
