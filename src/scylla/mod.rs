@@ -47,7 +47,7 @@ impl ScyllaClient {
                 "CREATE TABLE IF NOT EXISTS cypress.places (
                     id text PRIMARY KEY,
                     data text
-                )",
+                ) WITH compression = { 'sstable_compression': 'ZstdCompressor', 'chunk_length_in_kb': 64 }",
                 &[],
             )
             .await?;
@@ -58,7 +58,7 @@ impl ScyllaClient {
                 "CREATE TABLE IF NOT EXISTS cypress.admin_areas (
                     id text PRIMARY KEY,
                     data text
-                )",
+                ) WITH compression = { 'sstable_compression': 'ZstdCompressor', 'chunk_length_in_kb': 64 }",
                 &[],
             )
             .await?;
