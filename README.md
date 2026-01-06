@@ -19,18 +19,17 @@ A Rust-based geocoding system with Elasticsearch, inspired by [Pelias](https://p
 
 - Rust 1.70+
 - Elasticsearch 8.x
+- ScyllaDB 5.x+
 - 8GB+ RAM for Switzerland import
 
 ## Quick Start
 
-### 1. Start Elasticsearch
+### 1. Prerequisites
 
-```bash
-docker run -d --name cypress-es -p 9200:9200 \
-  -e "discovery.type=single-node" \
-  -e "xpack.security.enabled=false" \
-  docker.elastic.co/elasticsearch/elasticsearch:8.11.0
-```
+Ensure you have the following services installed and running:
+
+- **Elasticsearch 8.x** (Default: http://localhost:9200)
+- **ScyllaDB 5.x+** (Default: 127.0.0.1:9042)
 
 ### 2. Build
 
@@ -44,21 +43,21 @@ cargo build --release
 # Configure regions.toml and run:
 cargo run --release --bin ingest -- batch --config regions.toml
 
-# Or run directly with road merging enabled (default):
+# Or run directly (Scylla defaults to 127.0.0.1):
 cargo run --release --bin ingest -- single \
   --file switzerland-latest.osm.pbf \
   --create-index \
   --refresh \
   --wikidata \
-  --merge-roads
+  --scylla-url 127.0.0.1
 
-# Disable road merging if needed (not recommended):
+# With custom Scylla and Elasticsearch URLs:
 cargo run --release --bin ingest -- single \
   --file switzerland-latest.osm.pbf \
+  --es-url http://elasticsearch:9200 \
+  --scylla-url 10.0.0.5 \
   --create-index \
-  --refresh \
-  --wikidata \
-  --merge-roads false
+  --refresh
 ```
 
 ### 4. Start Query Server
