@@ -4,15 +4,17 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use tracing::{debug, info, warn};
 
 const WIKIDATA_SPARQL_ENDPOINT: &str = "https://query.wikidata.org/sparql";
 
 /// Fetches multilingual labels from Wikidata
+#[derive(Clone)]
 pub struct WikidataFetcher {
     client: Client,
     /// Cache of Q-ID → language → label
-    cache: HashMap<String, HashMap<String, String>>,
+    cache: Arc<RwLock<HashMap<String, HashMap<String, String>>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,21 +49,24 @@ impl WikidataFetcher {
                 .timeout(std::time::Duration::from_secs(60))
                 .build()
                 .expect("Failed to create HTTP client"),
-            cache: HashMap::new(),
+            cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     /// Fetch labels for a batch of Wikidata Q-IDs
-    pub async fn fetch_batch(&mut self, qids: &[String]) -> Result<()> {
+    pub async fn fetch_batch(&self, qids: &[String]) -> Result<()> {
         if qids.is_empty() {
             return Ok(());
         }
 
         // Filter out already cached
-        let to_fetch: Vec<&String> = qids
-            .iter()
-            .filter(|q| !self.cache.contains_key(*q))
-            .collect();
+        let to_fetch: Vec<String> = {
+            let cache = self.cache.read().expect("Cache lock poisoned");
+            qids.iter()
+                .filter(|q| !cache.contains_key(*q))
+                .cloned()
+                .collect()
+        };
 
         if to_fetch.is_empty() {
             return Ok(());
@@ -79,7 +84,7 @@ impl WikidataFetcher {
         Ok(())
     }
 
-    async fn fetch_chunk(&mut self, qids: &[&String]) -> Result<()> {
+    async fn fetch_chunk(&self, qids: &[String]) -> Result<()> {
         // Build VALUES clause
         let values: String = qids
             .iter()
@@ -148,26 +153,29 @@ impl WikidataFetcher {
             };
 
             // Process results
-            for binding in data.results.bindings {
-                // Extract Q-ID from URI
-                let qid = binding
-                    .item
-                    .value
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
+            {
+                let mut cache = self.cache.write().expect("Cache lock poisoned");
+                for binding in data.results.bindings {
+                    // Extract Q-ID from URI
+                    let qid = binding
+                        .item
+                        .value
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
 
-                if qid.is_empty() {
-                    continue;
+                    if qid.is_empty() {
+                        continue;
+                    }
+
+                    let lang = binding.label.lang.unwrap_or_else(|| "default".to_string());
+
+                    cache
+                        .entry(qid)
+                        .or_insert_with(HashMap::new)
+                        .insert(lang, binding.label.value);
                 }
-
-                let lang = binding.label.lang.unwrap_or_else(|| "default".to_string());
-
-                self.cache
-                    .entry(qid)
-                    .or_insert_with(HashMap::new)
-                    .insert(lang, binding.label.value);
             }
 
             debug!("Fetched labels for {} items", qids.len());
@@ -178,13 +186,18 @@ impl WikidataFetcher {
     }
 
     /// Get cached labels for a Q-ID
-    pub fn get_labels(&self, qid: &str) -> Option<&HashMap<String, String>> {
-        self.cache.get(qid)
+    pub fn get_labels(&self, qid: &str) -> Option<HashMap<String, String>> {
+        let cache = self.cache.read().expect("Cache lock poisoned");
+        cache.get(qid).cloned()
     }
 
     /// Merge Wikidata labels into existing name map (Wikidata fills gaps, doesn't override)
     pub fn merge_labels(&self, qid: &str, names: &mut HashMap<String, String>) {
-        if let Some(labels) = self.cache.get(qid) {
+        // Only hold the lock to get the data, not while modifying `names` (though that's fast)
+        // We need to clone the internal map to exit the lock quickly if we want, or just iterate.
+        // Since `names` is a different lock (or mutable ref), it's fine.
+        let cache = self.cache.read().expect("Cache lock poisoned");
+        if let Some(labels) = cache.get(qid) {
             for (lang, label) in labels {
                 // Only add if not already present from OSM
                 names.entry(lang.clone()).or_insert_with(|| label.clone());
@@ -194,7 +207,8 @@ impl WikidataFetcher {
 
     /// Get cache size
     pub fn cache_size(&self) -> usize {
-        self.cache.len()
+        let cache = self.cache.read().expect("Cache lock poisoned");
+        cache.len()
     }
 }
 

@@ -34,6 +34,11 @@ impl BulkIndexer {
             .map_err(|_| anyhow::anyhow!("Indexer task closed unexpectedly"))
     }
 
+    /// Get a clone of the sender to send from other tasks
+    pub fn sender_clone(&self) -> mpsc::Sender<Place> {
+        self.sender.clone()
+    }
+
     /// Finish indexing and return statistics
     pub async fn finish(self) -> Result<(usize, usize)> {
         // Drop sender to signal completion

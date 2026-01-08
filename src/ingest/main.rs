@@ -21,7 +21,8 @@ use clap::{Parser, Subcommand};
 use geo::{BoundingRect, Centroid};
 use indicatif::{ProgressBar, ProgressStyle};
 use osmpbfreader::OsmPbfReader;
-use tracing::{info, warn, Level};
+use tokio::sync::mpsc;
+use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use cypress::discord::DiscordWebhook;
@@ -308,7 +309,7 @@ pub async fn run_single(args: Args, synonyms: Arc<SynonymService>) -> Result<()>
     );
 
     // Initialize Wikidata fetcher if enabled
-    let mut wikidata = if args.wikidata {
+    let wikidata = if args.wikidata {
         Some(WikidataFetcher::new())
     } else {
         None
@@ -358,9 +359,17 @@ pub async fn run_single(args: Args, synonyms: Arc<SynonymService>) -> Result<()>
     // Create bulk indexer (starts background task)
     let indexer = BulkIndexer::new(es_client.clone(), args.batch_size);
 
-    // Collect Wikidata IDs for batch fetching
-    let mut wikidata_ids: Vec<String> = Vec::new();
-    let mut places_buffer: Vec<Place> = Vec::new();
+    // Create pipeline channel
+    let (tx, rx) = mpsc::channel::<Place>(2000);
+
+    // Spawn processing pipeline
+    let pipeline_handle = tokio::spawn(run_processing_pipeline(
+        rx,
+        wikidata,
+        scylla_client.clone(),
+        indexer.sender_clone(),
+        args.batch_size,
+    ));
 
     // Index Admin Boundaries first
     info!(
@@ -407,17 +416,10 @@ pub async fn run_single(args: Args, synonyms: Arc<SynonymService>) -> Result<()>
 
             place.sanitize();
 
-            // Extract and upsert admin areas
-            upsert_admin_areas(&place, &scylla_client).await?;
-
-            // Convert to normalized place and upsert
-            let normalized = NormalizedPlace::from_place(place.clone());
-            let json_data = serde_json::to_string(&normalized)?;
-            scylla_client
-                .upsert_place(&normalized.source_id, &json_data)
-                .await?;
-
-            indexer.add(place).await?;
+            if let Err(_) = tx.send(place).await {
+                error!("Pipeline receiver dropped encountered during admin indexing");
+                break;
+            }
         }
     }
 
@@ -466,11 +468,13 @@ pub async fn run_single(args: Args, synonyms: Arc<SynonymService>) -> Result<()>
                 pip_service.lookup(place.center_point.lon, place.center_point.lat, None);
             place.parent = hierarchy;
 
-            // Collect Wikidata ID if present
-            if let Some(ref qid) = place.wikidata_id {
-                wikidata_ids.push(qid.clone());
+            // Collect Wikidata ID is redundant here as we moved it to process_batch,
+            // BUT we still need to assign importance if we have it locally?
+            // Or can we move importance lookup to pipeline too?
+            // Importance map is available here. Pipeline doesn't have it.
+            // Let's keep importance assignment here.
 
-                // Assign importance
+            if let Some(ref qid) = place.wikidata_id {
                 if let Some(ref map) = importance_map {
                     if let Some(score) = map.get(qid) {
                         place.importance = Some(*score);
@@ -479,52 +483,10 @@ pub async fn run_single(args: Args, synonyms: Arc<SynonymService>) -> Result<()>
             }
 
             place.sanitize();
-            places_buffer.push(place);
 
-            // Batch Wikidata fetch every 1000 places
-            if args.wikidata && wikidata_ids.len() >= 1000 {
-                // ... (Wikidata fetching logic remains blocking-ish, but it's separate)
-                if let Some(ref mut wd) = wikidata {
-                    wd.fetch_batch(&wikidata_ids).await?;
-
-                    // Merge labels into buffered places
-                    for p in &mut places_buffer {
-                        if let Some(ref qid) = p.wikidata_id {
-                            wd.merge_labels(qid, &mut p.name);
-                        }
-                    }
-                }
-                wikidata_ids.clear();
-            }
-
-            // Index when buffer is full
-            if places_buffer.len() >= args.batch_size {
-                // Ensure any pending wikidata is fetched before flush
-                if args.wikidata && !wikidata_ids.is_empty() {
-                    if let Some(ref mut wd) = wikidata {
-                        wd.fetch_batch(&wikidata_ids).await?;
-                        for p in &mut places_buffer {
-                            if let Some(ref qid) = p.wikidata_id {
-                                wd.merge_labels(qid, &mut p.name);
-                            }
-                        }
-                    }
-                    wikidata_ids.clear();
-                }
-
-                for p in places_buffer.drain(..) {
-                    // Extract and upsert admin areas
-                    upsert_admin_areas(&p, &scylla_client).await?;
-
-                    // Convert to normalized place and upsert
-                    let normalized = NormalizedPlace::from_place(p.clone());
-                    let json_data = serde_json::to_string(&normalized)?;
-                    scylla_client
-                        .upsert_place(&normalized.source_id, &json_data)
-                        .await?;
-
-                    indexer.add(p).await?;
-                }
+            if let Err(_) = tx.send(place).await {
+                error!("Pipeline receiver dropped");
+                break;
             }
         }
     }
@@ -549,11 +511,7 @@ pub async fn run_single(args: Args, synonyms: Arc<SynonymService>) -> Result<()>
                     pip_service.lookup(place.center_point.lon, place.center_point.lat, None);
                 place.parent = hierarchy;
 
-                // Collect Wikidata ID if present
                 if let Some(ref qid) = place.wikidata_id {
-                    wikidata_ids.push(qid.clone());
-
-                    // Assign importance
                     if let Some(ref map) = importance_map {
                         if let Some(score) = map.get(qid) {
                             place.importance = Some(*score);
@@ -562,54 +520,21 @@ pub async fn run_single(args: Args, synonyms: Arc<SynonymService>) -> Result<()>
                 }
 
                 place.sanitize();
-                places_buffer.push(place);
 
-                // Index when buffer is full
-                if places_buffer.len() >= args.batch_size {
-                    for p in places_buffer.drain(..) {
-                        // Extract and upsert admin areas
-                        upsert_admin_areas(&p, &scylla_client).await?;
-
-                        // Convert to normalized place and upsert
-                        let normalized = NormalizedPlace::from_place(p.clone());
-                        let json_data = serde_json::to_string(&normalized)?;
-                        scylla_client
-                            .upsert_place(&normalized.source_id, &json_data)
-                            .await?;
-
-                        indexer.add(p).await?;
-                    }
+                if let Err(_) = tx.send(place).await {
+                    error!("Pipeline receiver dropped during merged roads");
+                    break;
                 }
             }
         }
     }
 
-    // Fetch remaining Wikidata labels
-    if args.wikidata && !wikidata_ids.is_empty() {
-        if let Some(ref mut wd) = wikidata {
-            wd.fetch_batch(&wikidata_ids).await?;
-            for p in &mut places_buffer {
-                if let Some(ref qid) = p.wikidata_id {
-                    wd.merge_labels(qid, &mut p.name);
-                }
-            }
-        }
-    }
+    // Close channel by dropping sender
+    drop(tx);
 
-    // Index remaining places
-    // Index remaining places
-    for p in places_buffer {
-        // Extract and upsert admin areas
-        upsert_admin_areas(&p, &scylla_client).await?;
-
-        // Convert to normalized place and upsert
-        let normalized = NormalizedPlace::from_place(p.clone());
-        let json_data = serde_json::to_string(&normalized)?;
-        scylla_client
-            .upsert_place(&normalized.source_id, &json_data)
-            .await?;
-
-        indexer.add(p).await?;
+    // Wait for pipeline to finish
+    if let Err(e) = pipeline_handle.await {
+        error!("Pipeline task failed: {}", e);
     }
 
     // Finish indexing
@@ -633,6 +558,77 @@ pub async fn run_single(args: Args, synonyms: Arc<SynonymService>) -> Result<()>
             &format!("Successfully indexed **{}** documents (with **{}** errors) for **{}**.\nTotal documents in index: **{}**", indexed, errors, source_file, doc_count),
             true
         ).await;
+    }
+
+    Ok(())
+}
+
+async fn run_processing_pipeline(
+    mut rx: mpsc::Receiver<Place>,
+    wikidata: Option<WikidataFetcher>,
+    scylla: Arc<ScyllaClient>,
+    indexer_tx: mpsc::Sender<Place>,
+    batch_size: usize,
+) {
+    let mut buffer = Vec::with_capacity(batch_size);
+
+    while let Some(place) = rx.recv().await {
+        buffer.push(place);
+
+        if buffer.len() >= batch_size {
+            if let Err(e) = process_buffer(&mut buffer, &wikidata, &scylla, &indexer_tx).await {
+                error!("Error processing batch: {}", e);
+            }
+            buffer.clear();
+        }
+    }
+
+    // Process remaining
+    if !buffer.is_empty() {
+        if let Err(e) = process_buffer(&mut buffer, &wikidata, &scylla, &indexer_tx).await {
+            error!("Error processing final batch: {}", e);
+        }
+    }
+}
+
+async fn process_buffer(
+    places: &mut [Place],
+    wikidata: &Option<WikidataFetcher>,
+    scylla: &ScyllaClient,
+    indexer_tx: &mpsc::Sender<Place>,
+) -> Result<()> {
+    // 1. Fetch Wikidata
+    if let Some(wd) = wikidata {
+        let qids: Vec<String> = places
+            .iter()
+            .filter_map(|p| p.wikidata_id.clone())
+            .collect();
+
+        if !qids.is_empty() {
+            wd.fetch_batch(&qids).await?;
+
+            for place in places.iter_mut() {
+                if let Some(ref qid) = place.wikidata_id {
+                    wd.merge_labels(qid, &mut place.name);
+                }
+            }
+        }
+    }
+
+    // 2. Scylla Upsert & Indexer Send
+    for place in places.iter() {
+        // Upsert Admin Areas (Scylla)
+        upsert_admin_areas(place, scylla).await?;
+
+        // Upsert Normalized Place (Scylla)
+        let normalized = NormalizedPlace::from_place(place.clone());
+        let json_data = serde_json::to_string(&normalized)?;
+        scylla
+            .upsert_place(&normalized.source_id, &json_data)
+            .await?;
+
+        // Send to Indexer
+        indexer_tx.send(place.clone()).await?;
     }
 
     Ok(())
