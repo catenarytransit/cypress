@@ -164,7 +164,7 @@ async fn prepare_region(
     let raw_pbf = config.global.tmp_dir.join(&filename);
 
     // 1. Download
-    if !raw_pbf.exists() {
+    if !raw_pbf.exists() || base_args.force_download {
         info!("Downloading {}...", region.name);
         let status = Command::new("curl")
             .args(["-L", "-o", raw_pbf.to_str().unwrap(), &region.url])

@@ -122,6 +122,10 @@ pub struct Args {
     /// Merge adjacent road ways with the same name to reduce disk space
     #[arg(long, default_value = "true")]
     pub merge_roads: bool,
+
+    /// Force fresh download of PBF files even if they exist
+    #[arg(long)]
+    pub force_download: bool,
 }
 
 #[tokio::main]
