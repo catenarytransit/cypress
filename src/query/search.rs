@@ -90,13 +90,23 @@ pub struct PropertiesV2 {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub country: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub country_names: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region_names: Option<HashMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub county: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub county_names: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub locality: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub locality_names: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub neighbourhood: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub neighbourhood_names: Option<HashMap<String, String>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub categories: Vec<String>,
     pub confidence: f64,
@@ -552,6 +562,14 @@ fn resolve_admin_name(
     })
 }
 
+fn resolve_admin_names(
+    id: &Option<String>,
+    map: &HashMap<String, AdminEntry>,
+) -> Option<HashMap<String, String>> {
+    id.as_ref()
+        .and_then(|id_str| map.get(id_str).map(|entry| entry.names.clone()))
+}
+
 /// Convert a Place model to SearchResult
 fn place_to_search_result(
     place: NormalizedPlace,
@@ -628,14 +646,19 @@ fn place_to_search_result_v2(
             street: place.address.as_ref().and_then(|a| a.street.clone()),
             postcode: place.address.as_ref().and_then(|a| a.postcode.clone()),
             country: resolve_admin_name(&place.parent.country, admin_map, preferred_lang),
+            country_names: resolve_admin_names(&place.parent.country, admin_map),
             region: resolve_admin_name(&place.parent.region, admin_map, preferred_lang),
+            region_names: resolve_admin_names(&place.parent.region, admin_map),
             county: resolve_admin_name(&place.parent.county, admin_map, preferred_lang),
+            county_names: resolve_admin_names(&place.parent.county, admin_map),
             locality: resolve_admin_name(&place.parent.locality, admin_map, preferred_lang),
+            locality_names: resolve_admin_names(&place.parent.locality, admin_map),
             neighbourhood: resolve_admin_name(
                 &place.parent.neighbourhood,
                 admin_map,
                 preferred_lang,
             ),
+            neighbourhood_names: resolve_admin_names(&place.parent.neighbourhood, admin_map),
             categories: place.categories,
             confidence: score,
         },
@@ -645,8 +668,8 @@ fn place_to_search_result_v2(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cypress::models::place::{GeoPoint, Layer, OsmType};
     use cypress::models::normalized::{AdminHierarchyIds, NormalizedPlace};
+    use cypress::models::place::{GeoPoint, Layer, OsmType};
     use std::collections::HashMap;
 
     #[test]
@@ -655,7 +678,22 @@ mod tests {
         names.insert("default".to_string(), "London".to_string());
         names.insert("fr".to_string(), "Londres".to_string());
 
-        let place = NormalizedPlace {
+        let mut country_names = HashMap::new();
+        country_names.insert("default".to_string(), "United Kingdom".to_string());
+        country_names.insert("de".to_string(), "Vereinigtes Königreich".to_string());
+
+        let country_entry = AdminEntry {
+            name: Some("United Kingdom".to_string()),
+            abbr: Some("UK".to_string()),
+            id: Some(1),
+            bbox: None,
+            names: country_names.clone(),
+        };
+
+        let mut admin_map = HashMap::new();
+        admin_map.insert("relation/1".to_string(), country_entry);
+
+        let mut place = NormalizedPlace {
             source_id: "test:1".to_string(),
             source_file: "test.osm".to_string(),
             import_timestamp: chrono::Utc::now(),
@@ -668,16 +706,102 @@ mod tests {
             name: names.clone(),
             phrase: None,
             address: None,
-            center_point: GeoPoint { lon: 0.1, lat: 51.5 },
+            center_point: GeoPoint {
+                lon: 0.1,
+                lat: 51.5,
+            },
             bbox: None,
             parent: AdminHierarchyIds::default(),
         };
+        place.parent.country = Some("relation/1".to_string());
 
-        let admin_map = HashMap::new();
-        let result = place_to_search_result_v2(place, 1.0, &Some("fr".to_string()), &admin_map).unwrap();
+        let result =
+            place_to_search_result_v2(place, 1.0, &Some("fr".to_string()), &admin_map).unwrap();
 
         assert_eq!(result.properties.name, "Londres");
         assert_eq!(result.properties.names.get("default").unwrap(), "London");
         assert_eq!(result.properties.names.get("fr").unwrap(), "Londres");
+
+        // Verify country names
+        assert!(result.properties.country_names.is_some());
+        let c_names = result.properties.country_names.unwrap();
+        assert_eq!(c_names.get("default").unwrap(), "United Kingdom");
+        assert_eq!(c_names.get("de").unwrap(), "Vereinigtes Königreich");
+
+        // Verify that other fields (like region) would also work if populated (mocking logic verification)
+        // Since we mocked country, we know the logic is generic.
+        // But let's add a region just to be sure.
+    }
+
+    #[test]
+    fn test_place_to_search_result_v2_full_hierarchy() {
+        let mut names = HashMap::new();
+        names.insert("default".to_string(), "Paris".to_string());
+
+        let mut country_names = HashMap::new();
+        country_names.insert("default".to_string(), "France".to_string());
+
+        let mut region_names = HashMap::new();
+        region_names.insert("default".to_string(), "Ile-de-France".to_string());
+        region_names.insert("en".to_string(), "Isle of France".to_string());
+
+        let admin_map = HashMap::from([
+            (
+                "relation/1".to_string(),
+                AdminEntry {
+                    name: Some("France".to_string()),
+                    names: country_names,
+                    ..Default::default()
+                },
+            ),
+            (
+                "relation/2".to_string(),
+                AdminEntry {
+                    name: Some("Ile-de-France".to_string()),
+                    names: region_names,
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        let mut place = NormalizedPlace {
+            source_id: "test:2".to_string(),
+            source_file: "test.osm".to_string(),
+            import_timestamp: chrono::Utc::now(),
+            osm_type: OsmType::Node,
+            osm_id: 456,
+            wikidata_id: None,
+            importance: Some(0.8),
+            layer: Layer::Locality,
+            categories: vec![],
+            name: names,
+            phrase: None,
+            address: None,
+            center_point: GeoPoint {
+                lon: 2.35,
+                lat: 48.85,
+            },
+            bbox: None,
+            parent: AdminHierarchyIds::default(),
+        };
+        place.parent.country = Some("relation/1".to_string());
+        place.parent.region = Some("relation/2".to_string());
+
+        let result =
+            place_to_search_result_v2(place, 1.0, &Some("en".to_string()), &admin_map).unwrap();
+
+        assert_eq!(
+            result
+                .properties
+                .country_names
+                .unwrap()
+                .get("default")
+                .unwrap(),
+            "France"
+        );
+        assert_eq!(
+            result.properties.region_names.unwrap().get("en").unwrap(),
+            "Isle of France"
+        );
     }
 }
