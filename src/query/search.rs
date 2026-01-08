@@ -1,5 +1,3 @@
-//! Search query building and execution.
-
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -8,7 +6,7 @@ use tracing::debug;
 
 use cypress::elasticsearch::EsClient;
 use cypress::models::normalized::NormalizedPlace;
-use cypress::models::{AdminEntry, Place};
+use cypress::models::AdminEntry;
 use cypress::scylla::ScyllaClient;
 
 /// Search parameters
@@ -30,6 +28,15 @@ pub struct SearchResult {
     pub result_type: String,
     pub geometry: Geometry,
     pub properties: Properties,
+}
+
+/// Search result V2 in GeoJSON-like format
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SearchResultV2 {
+    #[serde(rename = "type")]
+    pub result_type: String,
+    pub geometry: Geometry,
+    pub properties: PropertiesV2,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -67,6 +74,34 @@ pub struct Properties {
     pub confidence: f64,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PropertiesV2 {
+    pub id: String,
+    pub layer: String,
+    pub name: String,
+    /// All available language variants
+    pub names: HashMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub housenumber: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub street: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub postcode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub county: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub locality: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub neighbourhood: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub categories: Vec<String>,
+    pub confidence: f64,
+}
+
 /// Execute a forward geocoding search
 pub async fn execute_search(
     client: &EsClient,
@@ -74,7 +109,54 @@ pub async fn execute_search(
     params: SearchParams,
     autocomplete: bool,
 ) -> Result<Vec<SearchResult>> {
-    // Build multi-match query across name fields
+    let results = execute_search_internal(client, scylla_client, params, autocomplete).await?;
+    let mut search_results = Vec::new();
+
+    for (place, score, preferred_lang, parsed_admin_map) in results {
+        if let Some(result) =
+            place_to_search_result(place, score, &preferred_lang, &parsed_admin_map)
+        {
+            search_results.push(result);
+        }
+    }
+
+    Ok(search_results)
+}
+
+/// Execute a forward geocoding search V2
+pub async fn execute_search_v2(
+    client: &EsClient,
+    scylla_client: &ScyllaClient,
+    params: SearchParams,
+    autocomplete: bool,
+) -> Result<Vec<SearchResultV2>> {
+    let results = execute_search_internal(client, scylla_client, params, autocomplete).await?;
+    let mut search_results = Vec::new();
+
+    for (place, score, preferred_lang, parsed_admin_map) in results {
+        if let Some(result) =
+            place_to_search_result_v2(place, score, &preferred_lang, &parsed_admin_map)
+        {
+            search_results.push(result);
+        }
+    }
+
+    Ok(search_results)
+}
+
+async fn execute_search_internal(
+    client: &EsClient,
+    scylla_client: &ScyllaClient,
+    params: SearchParams,
+    autocomplete: bool,
+) -> Result<
+    Vec<(
+        NormalizedPlace,
+        f64,
+        Option<String>,
+        HashMap<String, AdminEntry>,
+    )>,
+> {
     // Build multi-match query across name fields
     let name_field = if autocomplete {
         "name_all.autocomplete"
@@ -199,11 +281,6 @@ pub async fn execute_search(
                 "missing": 0.0, // Default importance if missing
                 "factor": 1.0,  // Tuning parameter
                 "modifier": "log1p", // log(1 + importance) - smooth curve
-                // Importance is 0..1 usually. log1p(1) = 0.69.
-                // If we want importance to significantly affect ranking, we might want a different modifier or factor.
-                // But log1p is a safe start to avoid huge multipliers.
-                // Actually, often we want linear boost + 1.
-                // Let's stick to log1p for now as it's standard.
             },
              "weight": 2.0 // Boost importance influence
         }),
@@ -329,10 +406,7 @@ pub async fn execute_search(
 
     let mut results = Vec::new();
     for (place, score) in normalized_places {
-        if let Some(result) = place_to_search_result(place, score, &params.lang, &parsed_admin_map)
-        {
-            results.push(result);
-        }
+        results.push((place, score, params.lang.clone(), parsed_admin_map.clone()));
     }
 
     Ok(results)
@@ -521,4 +595,89 @@ fn place_to_search_result(
             confidence: score,
         },
     })
+}
+
+/// Convert a Place model to SearchResult V2
+fn place_to_search_result_v2(
+    place: NormalizedPlace,
+    score: f64,
+    preferred_lang: &Option<String>,
+    admin_map: &HashMap<String, AdminEntry>,
+) -> Option<SearchResultV2> {
+    // Pick display name based on language preference
+    let display_name = preferred_lang
+        .as_ref()
+        .and_then(|lang| place.name.get(lang))
+        .or_else(|| place.name.get("default"))
+        .or_else(|| place.name.values().next())
+        .cloned()
+        .unwrap_or_default();
+
+    Some(SearchResultV2 {
+        result_type: "Feature".to_string(),
+        geometry: Geometry {
+            geo_type: "Point".to_string(),
+            coordinates: [place.center_point.lon, place.center_point.lat],
+        },
+        properties: PropertiesV2 {
+            id: place.source_id,
+            layer: format!("{:?}", place.layer).to_lowercase(),
+            name: display_name,
+            names: place.name,
+            housenumber: place.address.as_ref().and_then(|a| a.housenumber.clone()),
+            street: place.address.as_ref().and_then(|a| a.street.clone()),
+            postcode: place.address.as_ref().and_then(|a| a.postcode.clone()),
+            country: resolve_admin_name(&place.parent.country, admin_map, preferred_lang),
+            region: resolve_admin_name(&place.parent.region, admin_map, preferred_lang),
+            county: resolve_admin_name(&place.parent.county, admin_map, preferred_lang),
+            locality: resolve_admin_name(&place.parent.locality, admin_map, preferred_lang),
+            neighbourhood: resolve_admin_name(
+                &place.parent.neighbourhood,
+                admin_map,
+                preferred_lang,
+            ),
+            categories: place.categories,
+            confidence: score,
+        },
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cypress::models::place::{GeoPoint, Layer, OsmType};
+    use cypress::models::normalized::{AdminHierarchyIds, NormalizedPlace};
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_place_to_search_result_v2() {
+        let mut names = HashMap::new();
+        names.insert("default".to_string(), "London".to_string());
+        names.insert("fr".to_string(), "Londres".to_string());
+
+        let place = NormalizedPlace {
+            source_id: "test:1".to_string(),
+            source_file: "test.osm".to_string(),
+            import_timestamp: chrono::Utc::now(),
+            osm_type: OsmType::Node,
+            osm_id: 123,
+            wikidata_id: None,
+            importance: Some(0.5),
+            layer: Layer::Locality,
+            categories: vec![],
+            name: names.clone(),
+            phrase: None,
+            address: None,
+            center_point: GeoPoint { lon: 0.1, lat: 51.5 },
+            bbox: None,
+            parent: AdminHierarchyIds::default(),
+        };
+
+        let admin_map = HashMap::new();
+        let result = place_to_search_result_v2(place, 1.0, &Some("fr".to_string()), &admin_map).unwrap();
+
+        assert_eq!(result.properties.name, "Londres");
+        assert_eq!(result.properties.names.get("default").unwrap(), "London");
+        assert_eq!(result.properties.names.get("fr").unwrap(), "Londres");
+    }
 }

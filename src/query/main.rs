@@ -24,7 +24,7 @@ use cypress::elasticsearch::EsClient;
 use cypress::scylla::ScyllaClient;
 
 mod search;
-use search::{execute_search, SearchParams, SearchResult};
+use search::{execute_search, execute_search_v2, SearchParams, SearchResult, SearchResultV2};
 
 #[derive(Parser, Debug)]
 #[command(name = "query")]
@@ -92,6 +92,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/health", get(health_handler))
         .route("/v1/search", get(search_handler))
+        .route("/v2/search", get(search_v2_handler))
         .route("/v1/reverse", get(reverse_handler))
         .route("/v1/autocomplete", get(autocomplete_handler))
         .layer(CorsLayer::permissive())
@@ -176,6 +177,32 @@ async fn autocomplete_handler(
     Ok(Json(SearchResponse { features: results }))
 }
 
+/// Forward geocoding search V2
+async fn search_v2_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<SearchQueryParams>,
+) -> Result<Json<SearchResponseV2>, (StatusCode, String)> {
+    let search_params = SearchParams {
+        text: params.text.clone(),
+        lang: params.lang.clone(),
+        bbox: parse_bbox(&params.bbox),
+        focus_lat: params.focus_point_lat,
+        focus_lon: params.focus_point_lon,
+        focus_weight: params.focus_point_weight,
+        layers: params
+            .layers
+            .as_ref()
+            .map(|l| l.split(',').map(String::from).collect()),
+        size: params.size.unwrap_or(10).min(40),
+    };
+
+    let results = execute_search_v2(&state.es_client, &state.scylla_client, search_params, false)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(SearchResponseV2 { features: results }))
+}
+
 /// Reverse geocoding
 async fn reverse_handler(
     State(state): State<Arc<AppState>>,
@@ -238,6 +265,11 @@ struct ReverseQueryParams {
 #[derive(Serialize)]
 struct SearchResponse {
     features: Vec<SearchResult>,
+}
+
+#[derive(Serialize)]
+struct SearchResponseV2 {
+    features: Vec<SearchResultV2>,
 }
 
 /// Parse bbox string "minLon,minLat,maxLon,maxLat"

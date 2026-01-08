@@ -186,7 +186,7 @@ impl AdminEntry {
             abbr: area.abbr.clone(),
             id: Some(area.osm_id),
             bbox: area.bbox.clone(),
-            names: HashMap::new(), // Clear detailed names to reduce index size
+            names: area.name.clone(),
         }
     }
 }
