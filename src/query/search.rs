@@ -552,11 +552,12 @@ fn resolve_admin_name(
 ) -> Option<String> {
     id.as_ref().and_then(|id_str| {
         map.get(id_str).and_then(|entry| {
+            // Try language-specific name first, then fall back to default name
+            // Names HashMap uses simple language codes: "de", "fr", "id", etc.
             lang.as_ref()
-                .and_then(|l| entry.names.get(&format!("name_{}", l))) // AdminEntry stores keys as "name_fr" etc? Check model.
-                // Looking at AdminEntry::from_area: keys are "name_de", etc.
-                // But AdminEntry also has `name` field for default.
+                .and_then(|l| entry.names.get(l))
                 .cloned()
+                .or_else(|| entry.names.get("default").cloned())
                 .or_else(|| entry.name.clone())
         })
     })

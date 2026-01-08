@@ -134,14 +134,21 @@ impl AdminArea {
     }
 }
 
-/// Single admin level entry in the hierarchy
+/// Single admin level entry in the hierarchy.
+///
+/// # Serialization Notes
+/// - **Elasticsearch**: Only `name`, `abbr`, `id`, and `bbox` fields are indexed.
+///   The `names` field is skipped during serialization to avoid conflicts with
+///   language codes like "id" (Indonesian) that would overwrite the numeric `id` field.
+/// - **ScyllaDB**: Use `to_scylla_json()` to get full multilingual names preserved
+///   as a nested `names` object for later retrieval.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AdminEntry {
-    /// Default name
+    /// Default name (concatenated from all language variants for Elasticsearch full-text search)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 
-    /// Abbreviation
+    /// Abbreviation (e.g., "AT" for Austria)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub abbr: Option<String>,
 
@@ -153,12 +160,43 @@ pub struct AdminEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bbox: Option<super::place::GeoBbox>,
 
-    /// Multilingual names: {"de": "...", "fr": "..."}
-    #[serde(flatten, skip_serializing_if = "HashMap::is_empty")]
+    /// Multilingual names: {"default": "Austria", "de": "Österreich", "id": "Austria", ...}
+    /// Skipped in default serialization (for Elasticsearch) to prevent language codes
+    /// like "id" (Indonesian) from conflicting with the `id` field.
+    /// Use `to_scylla_json()` to include this field for ScyllaDB storage.
+    #[serde(skip)]
+    pub names: HashMap<String, String>,
+}
+
+/// ScyllaDB-specific representation that includes the full `names` HashMap.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminEntryScylla {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub abbr: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bbox: Option<super::place::GeoBbox>,
+    /// Full multilingual names preserved for ScyllaDB
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub names: HashMap<String, String>,
 }
 
 impl AdminEntry {
+    /// Serialize to JSON for ScyllaDB storage (preserves full multilingual `names`).
+    pub fn to_scylla_json(&self) -> Result<String, serde_json::Error> {
+        let scylla_entry = AdminEntryScylla {
+            name: self.name.clone(),
+            abbr: self.abbr.clone(),
+            id: self.id,
+            bbox: self.bbox.clone(),
+            names: self.names.clone(),
+        };
+        serde_json::to_string(&scylla_entry)
+    }
+
     pub fn from_area(area: &AdminArea) -> Self {
         // Collect all names (default + all multilingual variants)
         let mut all_names = std::collections::HashSet::new();

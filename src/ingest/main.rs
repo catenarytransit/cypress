@@ -890,7 +890,8 @@ async fn upsert_admin_areas(place: &Place, scylla: &ScyllaClient) -> Result<()> 
     for parent in parents.iter().flatten() {
         if let Some(id) = parent.id {
             let source_id = format!("relation/{}", id);
-            let json_data = serde_json::to_string(parent)?;
+            // Use to_scylla_json() to preserve full multilingual names for ScyllaDB
+            let json_data = parent.to_scylla_json()?;
             scylla.upsert_admin_area(&source_id, &json_data).await?;
         }
     }
