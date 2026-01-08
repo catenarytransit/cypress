@@ -615,19 +615,35 @@ async fn process_buffer(
         }
     }
 
-    // 2. Scylla Upsert & Indexer Send
+    // 2. Scylla Upsert (parallel) & Indexer Send
+    // Prepare all upsert futures for parallel execution
+    let upsert_futures: Vec<_> = places
+        .iter()
+        .map(|place| async {
+            // Upsert Admin Areas (Scylla)
+            upsert_admin_areas(place, scylla).await?;
+
+            // Upsert Normalized Place (Scylla)
+            let normalized = NormalizedPlace::from_place(place.clone());
+            let json_data = serde_json::to_string(&normalized)?;
+            scylla
+                .upsert_place(&normalized.source_id, &json_data)
+                .await?;
+
+            Ok::<(), anyhow::Error>(())
+        })
+        .collect();
+
+    // Execute all ScyllaDB writes in parallel
+    let results = futures::future::join_all(upsert_futures).await;
+
+    // Check for errors
+    for result in results {
+        result?;
+    }
+
+    // Send to Indexer (sequential - channel ordering)
     for place in places.iter() {
-        // Upsert Admin Areas (Scylla)
-        upsert_admin_areas(place, scylla).await?;
-
-        // Upsert Normalized Place (Scylla)
-        let normalized = NormalizedPlace::from_place(place.clone());
-        let json_data = serde_json::to_string(&normalized)?;
-        scylla
-            .upsert_place(&normalized.source_id, &json_data)
-            .await?;
-
-        // Send to Indexer
         indexer_tx.send(place.clone()).await?;
     }
 
