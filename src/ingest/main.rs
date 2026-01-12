@@ -28,7 +28,7 @@ use tracing_subscriber::FmtSubscriber;
 use cypress::discord::DiscordWebhook;
 use cypress::elasticsearch::{create_index, BulkIndexer, EsClient};
 use cypress::models::normalized::NormalizedPlace;
-use cypress::models::{Address, AdminEntry, GeoBbox, GeoPoint, Layer, OsmType, Place};
+use cypress::models::{Address, GeoBbox, GeoPoint, Layer, OsmType, Place};
 use cypress::pip::{extract_admin_boundaries, AdminSpatialIndex, GeometryResolver, PipService};
 use cypress::scylla::ScyllaClient;
 use cypress::wikidata::WikidataFetcher;

@@ -197,6 +197,17 @@ impl AdminEntry {
         serde_json::to_string(&scylla_entry)
     }
 
+    /// Deserialize from ScyllaDB JSON (includes multilingual `names`).
+    pub fn from_scylla(scylla_entry: AdminEntryScylla) -> Self {
+        Self {
+            name: scylla_entry.name,
+            abbr: scylla_entry.abbr,
+            id: scylla_entry.id,
+            bbox: scylla_entry.bbox,
+            names: scylla_entry.names,
+        }
+    }
+
     pub fn from_area(area: &AdminArea) -> Self {
         // Use only the default name (or first available) for the name field.
         // All multilingual variants are stored in the names HashMap.

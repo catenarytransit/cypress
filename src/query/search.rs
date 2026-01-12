@@ -411,7 +411,11 @@ async fn execute_search_internal(
     // Parse admin entries map once
     let parsed_admin_map: HashMap<String, AdminEntry> = admin_map
         .iter()
-        .filter_map(|(k, v)| serde_json::from_str(v).ok().map(|entry| (k.clone(), entry)))
+        .filter_map(|(k, v)| {
+            serde_json::from_str::<cypress::models::admin::AdminEntryScylla>(v)
+                .ok()
+                .map(|scylla_entry| (k.clone(), AdminEntry::from_scylla(scylla_entry)))
+        })
         .collect();
 
     let mut results = Vec::new();
@@ -502,7 +506,11 @@ pub async fn execute_reverse(
 
     let parsed_admin_map: HashMap<String, AdminEntry> = admin_map
         .iter()
-        .filter_map(|(k, v)| serde_json::from_str(v).ok().map(|entry| (k.clone(), entry)))
+        .filter_map(|(k, v)| {
+            serde_json::from_str::<cypress::models::admin::AdminEntryScylla>(v)
+                .ok()
+                .map(|scylla_entry| (k.clone(), AdminEntry::from_scylla(scylla_entry)))
+        })
         .collect();
 
     let mut results = Vec::new();
