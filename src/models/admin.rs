@@ -198,29 +198,16 @@ impl AdminEntry {
     }
 
     pub fn from_area(area: &AdminArea) -> Self {
-        // Collect all names (default + all multilingual variants)
-        let mut all_names = std::collections::HashSet::new();
-
-        if let Some(default) = area.name.get("default") {
-            all_names.insert(default.clone());
-        }
-
-        for name in area.name.values() {
-            all_names.insert(name.clone());
-        }
-
-        // Join deduplicated names
-        let joined_name = if !all_names.is_empty() {
-            // Sor for deterministic output
-            let mut sorted_names: Vec<_> = all_names.into_iter().collect();
-            sorted_names.sort();
-            Some(sorted_names.join(" "))
-        } else {
-            None
-        };
+        // Use only the default name (or first available) for the name field.
+        // All multilingual variants are stored in the names HashMap.
+        let default_name = area
+            .name
+            .get("default")
+            .or_else(|| area.name.values().next())
+            .cloned();
 
         Self {
-            name: joined_name,
+            name: default_name,
             abbr: area.abbr.clone(),
             id: Some(area.osm_id),
             bbox: area.bbox.clone(),
