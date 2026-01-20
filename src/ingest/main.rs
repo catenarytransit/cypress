@@ -844,7 +844,18 @@ fn extract_tags(place: &mut Place, tags: &osmpbfreader::Tags, synonyms: &Synonym
         }
         // Categories (POI types)
         else if [
-            "amenity", "shop", "tourism", "leisure", "cuisine", "building", "historic", "office",
+            "amenity",
+            "shop",
+            "tourism",
+            "leisure",
+            "cuisine",
+            "building",
+            "historic",
+            "office",
+            "railway",
+            "public_transport",
+            "aeroway",
+            "station",
         ]
         .contains(&key_str)
         {

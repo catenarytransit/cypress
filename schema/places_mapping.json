@@ -206,7 +206,7 @@
         "norms": false
       },
       "importance": {
-        "type": "float"
+        "type": "rank_feature"
       },
       "layer": {
         "type": "keyword"

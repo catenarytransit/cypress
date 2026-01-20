@@ -112,17 +112,41 @@ pub struct PropertiesV2 {
     pub confidence: f64,
 }
 
+pub struct TimedSearchResults {
+    pub results: Vec<SearchResult>,
+    pub es_took_ms: u128,
+    pub scylla_took_ms: u128,
+}
+
+pub struct TimedSearchResultsV2 {
+    pub results: Vec<SearchResultV2>,
+    pub es_took_ms: u128,
+    pub scylla_took_ms: u128,
+}
+
+struct InternalTimedResults {
+    places: Vec<(
+        NormalizedPlace,
+        f64,
+        Option<String>,
+        HashMap<String, AdminEntry>,
+    )>,
+    es_took_ms: u128,
+    scylla_took_ms: u128,
+}
+
 /// Execute a forward geocoding search
 pub async fn execute_search(
     client: &EsClient,
     scylla_client: &ScyllaClient,
     params: SearchParams,
     autocomplete: bool,
-) -> Result<Vec<SearchResult>> {
-    let results = execute_search_internal(client, scylla_client, params, autocomplete).await?;
+) -> Result<TimedSearchResults> {
+    let internal_results =
+        execute_search_internal(client, scylla_client, params, autocomplete).await?;
     let mut search_results = Vec::new();
 
-    for (place, score, preferred_lang, parsed_admin_map) in results {
+    for (place, score, preferred_lang, parsed_admin_map) in internal_results.places {
         if let Some(result) =
             place_to_search_result(place, score, &preferred_lang, &parsed_admin_map)
         {
@@ -130,7 +154,11 @@ pub async fn execute_search(
         }
     }
 
-    Ok(search_results)
+    Ok(TimedSearchResults {
+        results: search_results,
+        es_took_ms: internal_results.es_took_ms,
+        scylla_took_ms: internal_results.scylla_took_ms,
+    })
 }
 
 /// Execute a forward geocoding search V2
@@ -139,11 +167,12 @@ pub async fn execute_search_v2(
     scylla_client: &ScyllaClient,
     params: SearchParams,
     autocomplete: bool,
-) -> Result<Vec<SearchResultV2>> {
-    let results = execute_search_internal(client, scylla_client, params, autocomplete).await?;
+) -> Result<TimedSearchResultsV2> {
+    let internal_results =
+        execute_search_internal(client, scylla_client, params, autocomplete).await?;
     let mut search_results = Vec::new();
 
-    for (place, score, preferred_lang, parsed_admin_map) in results {
+    for (place, score, preferred_lang, parsed_admin_map) in internal_results.places {
         if let Some(result) =
             place_to_search_result_v2(place, score, &preferred_lang, &parsed_admin_map)
         {
@@ -151,7 +180,11 @@ pub async fn execute_search_v2(
         }
     }
 
-    Ok(search_results)
+    Ok(TimedSearchResultsV2 {
+        results: search_results,
+        es_took_ms: internal_results.es_took_ms,
+        scylla_took_ms: internal_results.scylla_took_ms,
+    })
 }
 
 async fn execute_search_internal(
@@ -159,174 +192,9 @@ async fn execute_search_internal(
     scylla_client: &ScyllaClient,
     params: SearchParams,
     autocomplete: bool,
-) -> Result<
-    Vec<(
-        NormalizedPlace,
-        f64,
-        Option<String>,
-        HashMap<String, AdminEntry>,
-    )>,
-> {
-    // Build multi-match query across name fields
-    let name_field = if autocomplete {
-        "name_all.autocomplete"
-    } else {
-        "name_all"
-    };
-
-    let should_clauses = vec![
-        // Main name match
-        json!({
-            "match": {
-                name_field: {
-                    "query": &params.text,
-                    "boost": 10.0
-                }
-            }
-        }),
-        // Phrase match for exact ordering
-        json!({
-            "match_phrase": {
-                "name_all": {
-                    "query": &params.text,
-                    "boost": 20.0
-                }
-            }
-        }),
-        // Address matches
-        json!({
-            "match": {
-                "address.street": {
-                    "query": &params.text,
-                    "boost": 5.0
-                }
-            }
-        }),
-        json!({
-            "match": {
-                "address.city": {
-                    "query": &params.text,
-                    "boost": 3.0
-                }
-            }
-        }),
-        json!({
-            "match": {
-                "address.postcode": {
-                    "query": &params.text,
-                    "boost": 5.0
-                }
-            }
-        }),
-        // Parent admin matches (aggregated name support)
-        json!({
-            "multi_match": {
-                "query": &params.text,
-                "fields": [
-                    "parent.country.name",
-                    "parent.macro_region.name",
-                    "parent.region.name",
-                    "parent.macro_county.name",
-                    "parent.county.name",
-                    "parent.local_admin.name",
-                    "parent.locality.name",
-                    "parent.borough.name",
-                    "parent.neighbourhood.name"
-                ],
-                "boost": 2.0
-            }
-        }),
-        // Name + Address + Admin hybrid search (Cross Fields)
-        json!({
-            "multi_match": {
-                "query": &params.text,
-                "type": "cross_fields",
-                "fields": [
-                    "name_all",
-                    "address.street",
-                    "address.city",
-                    "address.postcode",
-                    "parent.country.name",
-                    "parent.macro_region.name",
-                    "parent.region.name",
-                    "parent.macro_county.name",
-                    "parent.county.name",
-                    "parent.local_admin.name",
-                    "parent.locality.name",
-                    "parent.borough.name",
-                    "parent.neighbourhood.name"
-                ],
-                "analyzer": "peliasQuery",
-                "operator": "and",
-                "boost": 15.0
-            }
-        }),
-    ];
-
-    // Build query with optional filters
-    let mut bool_query = json!({
-        "should": should_clauses,
-        "minimum_should_match": 1
-    });
-
-    // Add layer filter
-    if let Some(ref layers) = params.layers {
-        bool_query["filter"] = json!([{
-            "terms": { "layer": layers }
-        }]);
-    }
-
-    // Build function score for location bias + importance
-    let mut functions = vec![
-        // Base score to prevent zeroing out documents with 0 importance
-        // (Since boost_mode is multiply, we need a base of 1.0)
-        json!({
-            "filter": { "match_all": {} },
-            "weight": 1.0
-        }),
-        // Importance boosting
-        json!({
-            "field_value_factor": {
-                "field": "importance",
-                "missing": 0.0, // Default importance if missing
-                "factor": 1.0,  // Tuning parameter
-                "modifier": "log1p", // log(1 + importance) - smooth curve
-            },
-             "weight": 2.0 // Boost importance influence
-        }),
-    ];
-
-    if params.focus_lat.is_some() && params.focus_lon.is_some() {
-        let focus_lat = params.focus_lat.unwrap();
-        let focus_lon = params.focus_lon.unwrap();
-        functions.push(json!({
-            "gauss": {
-                "center_point": {
-                    "origin": { "lat": focus_lat, "lon": focus_lon },
-                    "scale": "50km",
-                    "offset": "10km",
-                    "decay": 0.5
-                }
-            },
-            "weight": params.focus_weight.unwrap_or(3.0)
-        }));
-    }
-
-    let query = json!({
-        "function_score": {
-            "query": { "bool": bool_query },
-            "functions": functions,
-            "score_mode": "sum",    // Sum the scores from functions (importance + geo)
-            "boost_mode": "multiply" // Multiply original text score by function score
-        }
-    });
-
+) -> Result<InternalTimedResults> {
     // Build full request body
-    let mut body = json!({
-        "query": query,
-        "size": params.size,
-        "stored_fields": ["_id"]
-    });
+    let mut body = build_search_query(&params, autocomplete);
 
     // Add bounding box filter
     if let Some(bbox) = params.bbox {
@@ -355,12 +223,15 @@ async fn execute_search_internal(
     debug!("Search query: {}", serde_json::to_string_pretty(&body)?);
 
     // Execute search
+    // Execute search
+    let start_es = std::time::Instant::now();
     let response = client
         .client()
         .search(elasticsearch::SearchParts::Index(&[&client.index_name]))
         .body(body)
         .send()
         .await?;
+    let es_took_ms = start_es.elapsed().as_millis();
 
     let response_body = response.json::<serde_json::Value>().await?;
 
@@ -369,6 +240,9 @@ async fn execute_search_internal(
         .as_array()
         .map(|a| a.to_vec())
         .unwrap_or_default();
+    
+    // ... rest of function matches exactly ...
+
 
     let mut places_to_fetch = Vec::new();
     let mut scores = HashMap::new();
@@ -382,6 +256,7 @@ async fn execute_search_internal(
     }
 
     // Fetch from Scylla in parallel
+    let start_scylla = std::time::Instant::now();
     let fetch_futures = places_to_fetch.iter().map(|id| scylla_client.get_place(id));
     let mut normalized_places = Vec::new();
     let mut admin_ids = std::collections::HashSet::new();
@@ -407,6 +282,7 @@ async fn execute_search_internal(
     // Batch fetch admin areas
     let admin_ids_vec: Vec<String> = admin_ids.into_iter().collect();
     let admin_map = scylla_client.get_admin_areas(&admin_ids_vec).await?;
+    let scylla_took_ms = start_scylla.elapsed().as_millis();
 
     // Parse admin entries map once
     let parsed_admin_map: HashMap<String, AdminEntry> = admin_map
@@ -423,7 +299,11 @@ async fn execute_search_internal(
         results.push((place, score, params.lang.clone(), parsed_admin_map.clone()));
     }
 
-    Ok(results)
+    Ok(InternalTimedResults {
+        places: results,
+        es_took_ms,
+        scylla_took_ms,
+    })
 }
 
 /// Execute a reverse geocoding search
@@ -674,6 +554,150 @@ fn place_to_search_result_v2(
     })
 }
 
+fn build_search_query(params: &SearchParams, autocomplete: bool) -> serde_json::Value {
+    // Build function score for layer biasing
+    let functions = vec![
+        json!({
+            "filter": { "term": { "layer": "country" } },
+            "weight": 3.0
+        }),
+        json!({
+            "filter": { "term": { "layer": "macro_region" } },
+            "weight": 2.5
+        }),
+        json!({
+            "filter": { "term": { "layer": "region" } },
+            "weight": 2.0
+        }),
+        json!({
+            "filter": { "terms": { "layer": ["local_admin", "locality"] } },
+            "weight": 1.5
+        }),
+        // Public Transport / Station Boosts
+        // Categories typically formatted as "key=value" or just "key" depending on ingest
+        // In ingest/main.rs: place.add_category(key_str, value) -> usually stores "key=value" string in `categories` list?
+        // Checking `Place::add_category`: it usually stores just the value? Or "key=value"?
+        // Wait, I need to check `Place::add_category` implementation or usage. 
+        // Assuming "railway=station" format or just "station" if mapped.
+        // Let's assume standard "key=value" or just "value" if the field is text.
+        // `categories` in schema is `keyword`.
+        // Let's verify `add_category` behavior effectively by being broad:
+        // We will wildcard match or term match common values.
+        
+        // Boost for railway stations (Standard)
+        json!({
+            "filter": {
+                "bool": {
+                    "should": [
+                       { "term": { "categories": "railway:station" } },
+                       { "term": { "categories": "railway:halt" } },
+                       { "term": { "categories": "public_transport:station" } },
+                       { "term": { "categories": "public_transport:stop_position" } },
+                       { "term": { "categories": "aeroway:aerodrome" } }
+                    ]
+                }
+            },
+            "weight": 1.5
+        }),
+        // Boost for Subway and Tram (High Priority)
+        json!({
+             "filter": {
+                "bool": {
+                    "should": [
+                       { "term": { "categories": "railway:tram_stop" } },
+                       { "term": { "categories": "railway:subway" } },
+                       { "term": { "categories": "railway:light_rail" } },
+                       { "term": { "categories": "station:subway" } },
+                       { "term": { "categories": "station:light_rail" } }
+                    ]
+                }
+            },
+            "weight": 2.0
+        }),
+    ];
+
+    // Core bool query
+    let mut bool_query = json!({
+        "should": [
+            // Text Match: Phrase Prefix for Name
+            {
+                "match_phrase_prefix": {
+                    "name_all": {
+                        "query": &params.text,
+                        "boost": 10.0
+                    }
+                }
+            },
+            {
+                "match_phrase_prefix": {
+                    "name_all.autocomplete": {
+                        "query": &params.text,
+                        "boost": 5.0
+                    }
+                }
+            },
+            // Importance Rank Feature
+            {
+                "rank_feature": {
+                    "field": "importance",
+                    "saturation": {
+                        "pivot": 0.5
+                    },
+                    "boost": 5.0
+                }
+            }
+        ],
+        "minimum_should_match": 1
+    });
+
+    // Add layer filter
+    if let Some(ref layers) = params.layers {
+        let filter_clause = json!({
+            "terms": { "layer": layers }
+        });
+        
+        if let Some(filter_arr) = bool_query["filter"].as_array_mut() {
+            filter_arr.push(filter_clause);
+        } else {
+            bool_query["filter"] = json!([filter_clause]);
+        }
+    }
+
+    // Combine with function score
+    let mut function_score_functions = functions;
+    
+    if params.focus_lat.is_some() && params.focus_lon.is_some() {
+        let focus_lat = params.focus_lat.unwrap();
+        let focus_lon = params.focus_lon.unwrap();
+        function_score_functions.push(json!({
+            "gauss": {
+                "center_point": {
+                    "origin": { "lat": focus_lat, "lon": focus_lon },
+                    "scale": "50km",
+                    "offset": "10km",
+                    "decay": 0.5
+                }
+            },
+            "weight": 3.0
+        }));
+    }
+
+    let query = json!({
+        "function_score": {
+            "query": { "bool": bool_query },
+            "functions": function_score_functions,
+            "score_mode": "multiply",
+            "boost_mode": "multiply"
+        }
+    });
+
+    json!({
+        "query": query,
+        "size": params.size,
+        "stored_fields": ["_id"]
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -812,5 +836,45 @@ mod tests {
             result.properties.region_names.unwrap().get("en").unwrap(),
             "Isle of France"
         );
+    }
+    #[test]
+    fn test_build_search_query() {
+        let params = SearchParams {
+            text: "Munchen".to_string(),
+            lang: None,
+            bbox: None,
+            focus_lat: None,
+            focus_lon: None,
+            focus_weight: None,
+            layers: None,
+            size: 10,
+        };
+
+        let query_json = build_search_query(&params, false);
+        let query_str = query_json.to_string();
+
+        // Verify Rank Feature
+        assert!(query_str.contains("rank_feature"));
+        assert!(query_str.contains("importance"));
+        assert!(query_str.contains("saturation"));
+
+        // Verify Match Phrase Prefix
+        assert!(query_str.contains("match_phrase_prefix"));
+        assert!(query_str.contains("Munchen"));
+
+        // Verify Layer Biasing
+        assert!(query_str.contains("function_score"));
+        assert!(query_str.contains("country"));
+        assert!(query_str.contains("weight\":3.0")); // Country boost
+
+        // Verify Category Biasing
+        
+        // Standard (1.5)
+        assert!(query_str.contains("railway:station"));
+        assert!(query_str.contains("weight\":1.5"));
+        
+        // High Priority (2.0)
+        assert!(query_str.contains("railway:tram_stop"));
+        assert!(query_str.contains("weight\":2.0"));
     }
 }

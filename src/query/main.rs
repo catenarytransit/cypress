@@ -148,7 +148,11 @@ async fn search_handler(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(Json(SearchResponse { features: results }))
+    Ok(Json(SearchResponse {
+        features: results.results,
+        es_took_ms: results.es_took_ms,
+        scylla_took_ms: results.scylla_took_ms,
+    }))
 }
 
 /// Autocomplete endpoint (uses edge n-grams)
@@ -174,7 +178,11 @@ async fn autocomplete_handler(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(Json(SearchResponse { features: results }))
+    Ok(Json(SearchResponse {
+        features: results.results,
+        es_took_ms: results.es_took_ms,
+        scylla_took_ms: results.scylla_took_ms,
+    }))
 }
 
 /// Forward geocoding search V2
@@ -200,7 +208,11 @@ async fn search_v2_handler(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(Json(SearchResponseV2 { features: results }))
+    Ok(Json(SearchResponseV2 {
+        features: results.results,
+        es_took_ms: results.es_took_ms,
+        scylla_took_ms: results.scylla_took_ms,
+    }))
 }
 
 /// Reverse geocoding
@@ -222,7 +234,11 @@ async fn reverse_handler(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(Json(SearchResponse { features: results }))
+    Ok(Json(SearchResponse {
+        features: results,
+        es_took_ms: 0,
+        scylla_took_ms: 0,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -265,11 +281,15 @@ struct ReverseQueryParams {
 #[derive(Serialize)]
 struct SearchResponse {
     features: Vec<SearchResult>,
+    es_took_ms: u128,
+    scylla_took_ms: u128,
 }
 
 #[derive(Serialize)]
 struct SearchResponseV2 {
     features: Vec<SearchResultV2>,
+    es_took_ms: u128,
+    scylla_took_ms: u128,
 }
 
 /// Parse bbox string "minLon,minLat,maxLon,maxLat"
