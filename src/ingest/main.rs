@@ -933,7 +933,17 @@ fn determine_layer(tags: &osmpbfreader::Tags) -> Option<Layer> {
         if tags.contains("boundary", "administrative") {
             if let Ok(level) = admin_level.parse::<u8>() {
                 if let Some(admin_level_enum) = AdminLevel::from_osm_level(level) {
-                   return Some(admin_level_to_layer(admin_level_enum));
+                    if admin_level_enum == AdminLevel::Country {
+                        // Strict check: Must have ISO3166-1 tag to be a country
+                        let has_iso = tags.contains_key("ISO3166-1")
+                            || tags.contains_key("ISO3166-1:alpha2")
+                            || tags.contains_key("ISO3166-1:alpha3");
+
+                        if !has_iso {
+                            return None;
+                        }
+                    }
+                    return Some(admin_level_to_layer(admin_level_enum));
                 }
             }
             Some(Layer::Admin)
