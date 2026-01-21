@@ -243,6 +243,10 @@ async fn execute_search_internal(
 
     debug!("ES has {} took {} ms", hits.len(), es_took_ms);
 
+    if hits.is_empty() {
+        debug!("ES returned 0 hits. Raw response: {}", response_body);
+    }
+
     let mut places_to_fetch = Vec::new();
     let mut scores = HashMap::new();
 
