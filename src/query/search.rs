@@ -240,9 +240,8 @@ async fn execute_search_internal(
         .as_array()
         .map(|a| a.to_vec())
         .unwrap_or_default();
-    
-    // ... rest of function matches exactly ...
 
+    debug!("ES has {} took {} ms", hits.len(), es_took_ms);
 
     let mut places_to_fetch = Vec::new();
     let mut scores = HashMap::new();
@@ -253,6 +252,7 @@ async fn execute_search_internal(
             let score = hit["_score"].as_f64().unwrap_or(0.0);
             scores.insert(id.to_string(), score);
         }
+        debug!("ES hit: {:?}", hit);
     }
 
     // Fetch from Scylla in parallel
