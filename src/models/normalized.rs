@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::place::{Address, GeoBbox, GeoPoint, Layer, OsmType};
-use super::{AdminLevel, Place};
+use super::Place;
 
 /// Normalized version of Place for ScyllaDB storage.
 /// Reduces duplication by referencing admin areas by ID.

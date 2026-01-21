@@ -882,7 +882,7 @@ fn determine_layer(tags: &osmpbfreader::Tags) -> Option<Layer> {
             "island" | "archipelago" => Some(Layer::Admin), // Treat as admin for now
             _ => None,
         }
-    } else if let Some(admin_level) = tags.get("admin_level") {
+    } else if let Some(_admin_level) = tags.get("admin_level") {
         // Only if boundary=administrative
         if tags.contains("boundary", "administrative") {
             Some(Layer::Admin)
