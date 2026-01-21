@@ -275,7 +275,11 @@ async fn execute_search_internal(
                 collect_admin_ids(&place, &mut admin_ids);
 
                 normalized_places.push((place, score));
+            } else {
+                debug!("Failed to deserialize place from Scylla: {}", places_to_fetch[i]);
             }
+        } else {
+            debug!("Place not found in Scylla or error: {} (Result: {:?})", places_to_fetch[i], fetch_result);
         }
     }
 

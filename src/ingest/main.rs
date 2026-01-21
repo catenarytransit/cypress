@@ -741,10 +741,8 @@ fn extract_place(
         OsmObj::Relation(rel) => {
             // Check layers/relevance
             if let Some(layer) = determine_layer(&rel.tags) {
-                // Skip admin boundaries (handled separately)
-                if layer == Layer::Admin {
-                    return Ok(None);
-                }
+                // Removed explicit skip for Layer::Admin to allow places like archipelagos to be indexed
+                // even if they are not picked up by extract_admin_boundaries.
 
                 // Resolve multipolygon geometry
                 if let Some(multi_poly) = resolver.resolve_relation(rel.id) {
