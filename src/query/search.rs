@@ -6,6 +6,7 @@ use tracing::debug;
 
 use cypress::elasticsearch::EsClient;
 use cypress::models::normalized::NormalizedPlace;
+use cypress::models::place::Layer;
 use cypress::models::AdminEntry;
 use cypress::scylla::ScyllaClient;
 
@@ -483,6 +484,16 @@ fn place_to_search_result(
         .cloned()
         .unwrap_or_default();
 
+    let place_rank = get_layer_rank(place.layer);
+
+    let resolve_if_larger = |layer_variant: Layer, id: &Option<String>| {
+        if get_layer_rank(layer_variant) > place_rank {
+            resolve_admin_name(id, admin_map, preferred_lang)
+        } else {
+            None
+        }
+    };
+
     Some(SearchResult {
         result_type: "Feature".to_string(),
         geometry: Geometry {
@@ -497,15 +508,11 @@ fn place_to_search_result(
             housenumber: place.address.as_ref().and_then(|a| a.housenumber.clone()),
             street: place.address.as_ref().and_then(|a| a.street.clone()),
             postcode: place.address.as_ref().and_then(|a| a.postcode.clone()),
-            country: resolve_admin_name(&place.parent.country, admin_map, preferred_lang),
-            region: resolve_admin_name(&place.parent.region, admin_map, preferred_lang),
-            county: resolve_admin_name(&place.parent.county, admin_map, preferred_lang),
-            locality: resolve_admin_name(&place.parent.locality, admin_map, preferred_lang),
-            neighbourhood: resolve_admin_name(
-                &place.parent.neighbourhood,
-                admin_map,
-                preferred_lang,
-            ),
+            country: resolve_if_larger(Layer::Country, &place.parent.country),
+            region: resolve_if_larger(Layer::Region, &place.parent.region),
+            county: resolve_if_larger(Layer::County, &place.parent.county),
+            locality: resolve_if_larger(Layer::Locality, &place.parent.locality),
+            neighbourhood: resolve_if_larger(Layer::Neighbourhood, &place.parent.neighbourhood),
             categories: place.categories,
             confidence: score,
         },
@@ -528,6 +535,24 @@ fn place_to_search_result_v2(
         .cloned()
         .unwrap_or_default();
 
+    let place_rank = get_layer_rank(place.layer);
+
+    let resolve_if_larger = |layer_variant: Layer, id: &Option<String>| {
+        if get_layer_rank(layer_variant) > place_rank {
+            resolve_admin_name(id, admin_map, preferred_lang)
+        } else {
+            None
+        }
+    };
+
+    let resolve_names_if_larger = |layer_variant: Layer, id: &Option<String>| {
+        if get_layer_rank(layer_variant) > place_rank {
+            resolve_admin_names(id, admin_map)
+        } else {
+            None
+        }
+    };
+
     Some(SearchResultV2 {
         result_type: "Feature".to_string(),
         geometry: Geometry {
@@ -542,24 +567,36 @@ fn place_to_search_result_v2(
             housenumber: place.address.as_ref().and_then(|a| a.housenumber.clone()),
             street: place.address.as_ref().and_then(|a| a.street.clone()),
             postcode: place.address.as_ref().and_then(|a| a.postcode.clone()),
-            country: resolve_admin_name(&place.parent.country, admin_map, preferred_lang),
-            country_names: resolve_admin_names(&place.parent.country, admin_map),
-            region: resolve_admin_name(&place.parent.region, admin_map, preferred_lang),
-            region_names: resolve_admin_names(&place.parent.region, admin_map),
-            county: resolve_admin_name(&place.parent.county, admin_map, preferred_lang),
-            county_names: resolve_admin_names(&place.parent.county, admin_map),
-            locality: resolve_admin_name(&place.parent.locality, admin_map, preferred_lang),
-            locality_names: resolve_admin_names(&place.parent.locality, admin_map),
-            neighbourhood: resolve_admin_name(
-                &place.parent.neighbourhood,
-                admin_map,
-                preferred_lang,
-            ),
-            neighbourhood_names: resolve_admin_names(&place.parent.neighbourhood, admin_map),
+            country: resolve_if_larger(Layer::Country, &place.parent.country),
+            country_names: resolve_names_if_larger(Layer::Country, &place.parent.country),
+            region: resolve_if_larger(Layer::Region, &place.parent.region),
+            region_names: resolve_names_if_larger(Layer::Region, &place.parent.region),
+            county: resolve_if_larger(Layer::County, &place.parent.county),
+            county_names: resolve_names_if_larger(Layer::County, &place.parent.county),
+            locality: resolve_if_larger(Layer::Locality, &place.parent.locality),
+            locality_names: resolve_names_if_larger(Layer::Locality, &place.parent.locality),
+            neighbourhood: resolve_if_larger(Layer::Neighbourhood, &place.parent.neighbourhood),
+            neighbourhood_names: resolve_names_if_larger(Layer::Neighbourhood, &place.parent.neighbourhood),
             categories: place.categories,
             confidence: score,
         },
     })
+}
+
+fn get_layer_rank(layer: Layer) -> u8 {
+    match layer {
+        Layer::Country => 100,
+        Layer::MacroRegion => 90,
+        Layer::Region => 80,
+        Layer::MacroCounty => 70,
+        Layer::County => 60,
+        Layer::LocalAdmin => 50,
+        Layer::Locality => 40,
+        Layer::Borough => 30,
+        Layer::Neighbourhood => 20,
+        Layer::Street | Layer::Address | Layer::Venue => 10,
+        Layer::Admin => 50, // Generic admin, treat as mid-level
+    }
 }
 
 fn build_search_query(params: &SearchParams, autocomplete: bool) -> serde_json::Value {
@@ -905,5 +942,68 @@ mod tests {
         // High Priority (2.0)
         assert!(query_str.contains("railway:tram_stop"));
         assert!(query_str.contains("weight\":2.0"));
+    }
+
+    #[test]
+    fn test_place_to_search_result_v2_hierarchy_filtering() {
+        let mut names = HashMap::new();
+        names.insert("default".to_string(), "Catalonia".to_string());
+
+        let mut country_names = HashMap::new();
+        country_names.insert("default".to_string(), "Spain".to_string());
+
+        let mut county_names = HashMap::new();
+        county_names.insert("default".to_string(), "Barcelona".to_string());
+
+        let admin_map = HashMap::from([
+            (
+                "relation/1".to_string(),
+                AdminEntry {
+                    name: Some("Spain".to_string()),
+                    names: country_names,
+                    ..Default::default()
+                },
+            ),
+            (
+                "relation/3".to_string(),
+                AdminEntry {
+                    name: Some("Barcelona".to_string()),
+                    names: county_names,
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        let mut place = NormalizedPlace {
+            source_id: "test:region".to_string(),
+            source_file: "test.osm".to_string(),
+            import_timestamp: chrono::Utc::now(),
+            osm_type: OsmType::Relation,
+            osm_id: 111,
+            wikidata_id: None,
+            importance: Some(1.0),
+            layer: Layer::Region, // Rank 80
+            categories: vec![],
+            name: names,
+            phrase: None,
+            address: None,
+            center_point: GeoPoint {
+                lon: 2.0,
+                lat: 41.0,
+            },
+            bbox: None,
+            parent: AdminHierarchyIds::default(),
+        };
+        place.parent.country = Some("relation/1".to_string()); // Rank 100
+        place.parent.county = Some("relation/3".to_string());  // Rank 60
+
+        let result =
+            place_to_search_result_v2(place, 1.0, &None, &admin_map).unwrap();
+
+        // Country (Rank 100) > Region (Rank 80) -> Should be present
+        assert_eq!(result.properties.country.as_deref(), Some("Spain"));
+        
+        // County (Rank 60) <= Region (Rank 80) -> Should be filtered out
+        assert_eq!(result.properties.county, None);
     }
 }

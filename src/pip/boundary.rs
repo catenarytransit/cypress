@@ -40,10 +40,9 @@ pub fn extract_admin_boundaries<R: std::io::Read + std::io::Seek>(
     for obj in reader.iter() {
         let obj = obj?;
 
-        // We only care about Relations (standard) or Ways (occasional old data) that are administrative
-        let tags = match &obj {
-            OsmObj::Relation(r) => &r.tags,
-            OsmObj::Way(w) => &w.tags,
+        // We only care about Relations for admin boundaries (ways are border segments)
+        let (r, tags) = match &obj {
+            OsmObj::Relation(r) => (r, &r.tags),
             _ => continue,
         };
 
@@ -54,6 +53,12 @@ pub fn extract_admin_boundaries<R: std::io::Read + std::io::Seek>(
             .unwrap_or(false);
 
         if !is_admin {
+            continue;
+        }
+
+        // Must be type=boundary or type=multipolygon
+        let type_tag = tags.get("type").map(|v| v.as_str());
+        if !matches!(type_tag, Some("boundary") | Some("multipolygon")) {
             continue;
         }
 
@@ -73,12 +78,19 @@ pub fn extract_admin_boundaries<R: std::io::Read + std::io::Seek>(
             None => continue,
         };
 
+        // Strict Country Check: Must have ISO3166 code
+        if level == AdminLevel::Country {
+            let has_iso = tags.contains_key("ISO3166-1")
+                || tags.contains_key("ISO3166-1:alpha2")
+                || tags.contains_key("ISO3166-1:alpha3");
+
+            if !has_iso {
+                continue;
+            }
+        }
+
         // Build AdminArea with multilingual names
-        let id = match &obj {
-            OsmObj::Relation(r) => r.id.0,
-            OsmObj::Way(w) => w.id.0,
-            _ => 0,
-        };
+        let id = r.id.0;
 
         let mut area = AdminArea::new(id, level);
 

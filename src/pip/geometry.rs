@@ -238,21 +238,17 @@ impl GeometryResolver {
             .filter_map(|nid| self.get_node_coords(*nid))
             .collect();
 
-        if coords.len() < 3 {
+        // Need at least 4 points for a closed polygon (3 points + 1 repeat)
+        if coords.len() < 4 {
             return None;
         }
 
-        // Close the ring if needed
-        let mut ring = coords;
-        if ring.first() != ring.last() {
-            ring.push(ring[0]);
-        }
-
-        if ring.len() < 4 {
+        // IMPORTANT: Do NOT auto-close rings. If it's not closed, it's not a polygon for our purposes.
+        if coords.first() != coords.last() {
             return None;
         }
 
-        Some(Polygon::new(LineString::new(ring), vec![]))
+        Some(Polygon::new(LineString::new(coords), vec![]))
     }
 
     /// Get centroid for a Way

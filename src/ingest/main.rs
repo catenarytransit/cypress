@@ -255,7 +255,14 @@ pub async fn run_single(args: Args, synonyms: Arc<SynonymService>) -> Result<()>
         );
         let file = File::open(admin_path).context("Failed to open admin PBF file")?;
         let mut reader = OsmPbfReader::new(BufReader::new(file));
-        let resolver = GeometryResolver::build(&mut reader, |_| true)?;
+        let resolver = GeometryResolver::build(&mut reader, |tags| {
+            tags.contains("boundary", "administrative")
+                && tags.contains_key("admin_level")
+                && matches!(
+                    tags.get("type").map(|v| v.as_str()),
+                    Some("boundary") | Some("multipolygon")
+                )
+        })?;
         (resolver, None)
     } else {
         // Use main file for both

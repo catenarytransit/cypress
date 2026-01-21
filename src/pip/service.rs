@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tracing::debug;
 
 use super::{AdminBoundary, AdminSpatialIndex};
+use geo::Area;
 use crate::models::{AdminEntry, AdminHierarchy, AdminLevel};
 
 /// Point-in-Polygon lookup service
@@ -39,10 +40,21 @@ impl PipService {
         // Group by level and take the smallest (most specific) at each level
         for level in AdminLevel::all() {
             // Find boundaries at this level
-            let at_level: Vec<&Arc<AdminBoundary>> = boundaries
+            let mut at_level: Vec<&Arc<AdminBoundary>> = boundaries
                 .iter()
                 .filter(|b| b.area.level == *level)
                 .collect();
+
+            // Sort by area (smallest first) to handle enclaves correctly
+            // e.g. Vatican City (small) vs Rome (large) both contain a point in Vatican City.
+            // We want the most specific (smallest) one.
+            at_level.sort_by(|a, b| {
+                let area_a = a.geometry.unsigned_area();
+                let area_b = b.geometry.unsigned_area();
+                area_a
+                    .partial_cmp(&area_b)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
 
             if let Some(boundary) = at_level.first() {
                 let entry = AdminEntry::from_area(&boundary.area);
