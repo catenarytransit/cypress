@@ -540,6 +540,11 @@ pub async fn run_single(args: Args, synonyms: Arc<SynonymService>) -> Result<()>
                 // Extract tags
                 extract_tags(&mut place, &merged_road.tags, &synonyms);
 
+                // Filter out items without name or address
+                if place.name.is_empty() && place.address.is_none() {
+                    continue; 
+                }
+
                 // Calculate importance
                 place.importance = Some(calculate_default_importance(&merged_road.tags));
 
@@ -742,6 +747,12 @@ fn extract_place(
                 let mut place = Place::new(OsmType::Node, node.id.0, layer, center, source_file);
                 place.importance = Some(calculate_default_importance(&node.tags));
                 extract_tags(&mut place, &node.tags, synonyms);
+
+                // Filter out items without name or address
+                if place.name.is_empty() && place.address.is_none() {
+                    return Ok(None);
+                }
+                
                 Ok(Some(place))
             } else {
                 Ok(None)
@@ -776,6 +787,11 @@ fn extract_place(
                     let mut place = Place::new(OsmType::Way, way.id.0, layer, center, source_file);
                     place.importance = Some(calculate_default_importance(&way.tags));
                     extract_tags(&mut place, &way.tags, synonyms);
+
+                    // Filter out items without name or address
+                    if place.name.is_empty() && place.address.is_none() {
+                        return Ok(None);
+                    }
 
                     // Optional: Add Bbox
                     if let Some(poly) = resolver.resolve_way(way.id) {
@@ -831,6 +847,11 @@ fn extract_place(
                             Place::new(OsmType::Relation, rel.id.0, layer, center, source_file);
                         place.importance = Some(calculate_default_importance(&rel.tags));
                         extract_tags(&mut place, &rel.tags, synonyms);
+
+                        // Filter out items without name or address
+                        if place.name.is_empty() && place.address.is_none() {
+                            return Ok(None);
+                        }
 
                         // Calculate Bbox
                         if let Some(rect) = multi_poly.bounding_rect() {
