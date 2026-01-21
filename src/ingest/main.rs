@@ -723,6 +723,11 @@ fn extract_place(
     match obj {
         OsmObj::Node(node) => {
             if let Some(layer) = determine_layer(&node.tags) {
+                // Strict Country Check: Nodes cannot be countries
+                if layer == Layer::Country {
+                    return Ok(None);
+                }
+
                 let center = GeoPoint {
                     lat: node.lat(),
                     lon: node.lon(),
@@ -737,6 +742,11 @@ fn extract_place(
         }
         OsmObj::Way(way) => {
             if let Some(layer) = determine_layer(&way.tags) {
+                // Strict Country Check: Ways cannot be countries
+                if layer == Layer::Country {
+                    return Ok(None);
+                }
+
                 // Resolve geometry
                 if let Some((lon, lat)) = resolver.resolve_centroid(way.id) {
                     // FILTER: Skip ways that are admin boundaries
@@ -784,6 +794,20 @@ fn extract_place(
         OsmObj::Relation(rel) => {
             // Check layers/relevance
             if let Some(layer) = determine_layer(&rel.tags) {
+                // Strict Country Check for Relations
+                if layer == Layer::Country {
+                    let tags = &rel.tags;
+                    let is_boundary = tags.get("type").map(|s| s.as_str()) == Some("boundary");
+                    let is_admin = tags.get("boundary").map(|s| s.as_str()) == Some("administrative");
+                    let has_iso = tags.contains_key("ISO3166-1") 
+                        || tags.contains_key("ISO3166-1:alpha2") 
+                        || tags.contains_key("ISO3166-1:alpha3");
+
+                    if !is_boundary || !is_admin || !has_iso {
+                        return Ok(None);
+                    }
+                }
+                
                 // Removed explicit skip for Layer::Admin to allow places like archipelagos to be indexed
                 // even if they are not picked up by extract_admin_boundaries.
 
