@@ -5,12 +5,15 @@
 
 mod batch;
 mod config;
+mod es_place_doc;
 mod importance;
 mod synonyms;
 mod version;
 mod way_merger;
 
 use std::fs::File;
+
+use self::es_place_doc::EsPlaceDoc;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -567,7 +570,7 @@ async fn run_processing_pipeline(
     mut rx: mpsc::Receiver<Place>,
     wikidata: Option<WikidataFetcher>,
     scylla: Arc<ScyllaClient>,
-    indexer_tx: mpsc::Sender<Place>,
+    indexer_tx: mpsc::Sender<EsPlaceDoc>,
     batch_size: usize,
 ) {
     let mut buffer = Vec::with_capacity(batch_size);
@@ -595,7 +598,7 @@ async fn process_buffer(
     places: &mut [Place],
     wikidata: &Option<WikidataFetcher>,
     scylla: &ScyllaClient,
-    indexer_tx: &mpsc::Sender<Place>,
+    indexer_tx: &mpsc::Sender<EsPlaceDoc>,
 ) -> Result<()> {
     // 1. Fetch Wikidata
     if let Some(wd) = wikidata {
@@ -644,7 +647,8 @@ async fn process_buffer(
 
     // Send to Indexer (sequential - channel ordering)
     for place in places.iter() {
-        indexer_tx.send(place.clone()).await?;
+        let doc = EsPlaceDoc::from(place);
+        indexer_tx.send(doc).await?;
     }
 
     Ok(())

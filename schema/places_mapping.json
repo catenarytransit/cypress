@@ -226,10 +226,6 @@
           }
         }
       },
-      "name": {
-        "type": "object",
-        "enabled": false
-      },
       "phrase": {
         "type": "text",
         "analyzer": "peliasIndex",

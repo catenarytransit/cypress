@@ -7,16 +7,16 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
-use super::EsClient;
-use crate::models::Place;
+use super::{EsClient, EsDocument};
+
 
 /// Bulk indexer that runs in a background task
-pub struct BulkIndexer {
-    sender: mpsc::Sender<Place>,
+pub struct BulkIndexer<T: EsDocument> {
+    sender: mpsc::Sender<T>,
     handle: JoinHandle<Result<(usize, usize)>>,
 }
 
-impl BulkIndexer {
+impl<T: EsDocument> BulkIndexer<T> {
     /// Create a new bulk indexer
     pub fn new(client: EsClient, batch_size: usize) -> Self {
         let (tx, rx) = mpsc::channel(batch_size * 2);
@@ -27,15 +27,15 @@ impl BulkIndexer {
     }
 
     /// Add a document to the indexing queue
-    pub async fn add(&self, place: Place) -> Result<()> {
+    pub async fn add(&self, doc: T) -> Result<()> {
         self.sender
-            .send(place)
+            .send(doc)
             .await
             .map_err(|_| anyhow::anyhow!("Indexer task closed unexpectedly"))
     }
 
     /// Get a clone of the sender to send from other tasks
-    pub fn sender_clone(&self) -> mpsc::Sender<Place> {
+    pub fn sender_clone(&self) -> mpsc::Sender<T> {
         self.sender.clone()
     }
 
@@ -50,9 +50,9 @@ impl BulkIndexer {
 }
 
 /// Background task loop
-async fn run_indexer(
+async fn run_indexer<T: EsDocument>(
     client: EsClient,
-    mut rx: mpsc::Receiver<Place>,
+    mut rx: mpsc::Receiver<T>,
     batch_size: usize,
 ) -> Result<(usize, usize)> {
     let mut buffer = Vec::with_capacity(batch_size);
@@ -95,7 +95,7 @@ async fn run_indexer(
 }
 
 /// Flush the buffer to Elasticsearch
-async fn flush(client: &EsClient, buffer: &mut Vec<Place>) -> Result<(usize, usize)> {
+async fn flush<T: EsDocument>(client: &EsClient, buffer: &mut Vec<T>) -> Result<(usize, usize)> {
     if buffer.is_empty() {
         return Ok((0, 0));
     }
@@ -113,7 +113,7 @@ async fn flush(client: &EsClient, buffer: &mut Vec<Place>) -> Result<(usize, usi
         body.push(
             serde_json::json!({
                 "index": {
-                    "_id": &doc.source_id
+                    "_id": doc.id()
                 }
             })
             .into(),
