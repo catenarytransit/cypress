@@ -31,7 +31,7 @@ use tracing_subscriber::FmtSubscriber;
 use cypress::discord::DiscordWebhook;
 use cypress::elasticsearch::{create_index, BulkIndexer, EsClient};
 use cypress::models::normalized::NormalizedPlace;
-use cypress::models::{Address, GeoBbox, GeoPoint, Layer, OsmType, Place};
+use cypress::models::{Address, AdminLevel, GeoBbox, GeoPoint, Layer, OsmType, Place};
 use cypress::pip::{extract_admin_boundaries, AdminSpatialIndex, GeometryResolver, PipService};
 use cypress::scylla::ScyllaClient;
 use cypress::wikidata::WikidataFetcher;
@@ -391,10 +391,13 @@ pub async fn run_single(args: Args, synonyms: Arc<SynonymService>) -> Result<()>
             .map(|(min_x, min_y, max_x, max_y)| GeoBbox::new(min_x, min_y, max_x, max_y));
 
         if let Some(center) = center {
+            // Map AdminLevel to specific Layer
+            let layer = admin_level_to_layer(boundary.area.level);
+
             let mut place = Place::new(
                 OsmType::Relation,
                 boundary.area.osm_id,
-                Layer::Admin, // Use Admin layer
+                layer,
                 center,
                 &source_file,
             );
@@ -410,10 +413,34 @@ pub async fn run_single(args: Args, synonyms: Arc<SynonymService>) -> Result<()>
             );
             place.parent = hierarchy;
 
-            // Assign importance if available
+            // Assign importance
+            // BUMP IMPORTANCE for Admin Relations
+            let default_importance = match boundary.area.level {
+                AdminLevel::Country => 1.0,
+                AdminLevel::MacroRegion => 0.95,
+                AdminLevel::Region => 0.9,
+                AdminLevel::MacroCounty => 0.85,
+                AdminLevel::County => 0.8,
+                AdminLevel::LocalAdmin => 0.75,
+                AdminLevel::Locality => 0.7,
+                AdminLevel::Borough => 0.65,
+                AdminLevel::Neighbourhood => 0.6,
+            };
+            
+            place.importance = Some(default_importance);
+
+            // Overwrite with externally provided importance if available and higher?
+            // Usually internal manual boost should win for fundamental admin types, 
+            // but let's allow external to override ONLY if it's very high? 
+            // Or just check if wiki importance exists.
             if let Some(ref map) = importance_map {
                 if let Some(ref qid) = place.wikidata_id {
-                    place.importance = map.get(qid).copied();
+                    if let Some(score) = map.get(qid) {
+                         // Keep the higher of the two
+                         if *score > default_importance {
+                             place.importance = Some(*score);
+                         }
+                    }
                 }
             }
 
@@ -712,6 +739,12 @@ fn extract_place(
             if let Some(layer) = determine_layer(&way.tags) {
                 // Resolve geometry
                 if let Some((lon, lat)) = resolver.resolve_centroid(way.id) {
+                    // FILTER: Skip ways that are admin boundaries
+                    // We only want relations for administrative areas to avoid clutter / duplicate borders
+                    if is_admin_layer(layer) {
+                        return Ok(None);
+                    }
+
                     let center = GeoPoint { lat, lon };
                     let mut place = Place::new(OsmType::Way, way.id.0, layer, center, source_file);
                     place.importance = Some(calculate_default_importance(&way.tags));
@@ -874,15 +907,25 @@ fn is_valid_lang_code(lang: &str) -> bool {
 fn determine_layer(tags: &osmpbfreader::Tags) -> Option<Layer> {
     if let Some(place) = tags.get("place") {
         match place.as_str() {
-            "country" | "state" | "region" | "province" | "district" | "county"
-            | "municipality" | "city" | "town" | "village" | "hamlet" | "borough" | "suburb"
-            | "quarter" | "neighbourhood" => Some(Layer::Admin), // Or specific layer
-            "island" | "archipelago" => Some(Layer::Admin), // Treat as admin for now
+            "country" => Some(Layer::Country),
+            "state" | "region" | "province" => Some(Layer::Region),
+            "district" | "county" => Some(Layer::County),
+            "municipality" | "city" | "town" | "village" => Some(Layer::Locality),
+            "borough" => Some(Layer::Borough),
+            "suburb" | "quarter" | "neighbourhood" => Some(Layer::Neighbourhood),
+            "hamlet" | "isolated_dwelling" | "farm" => Some(Layer::Locality),
+             
+            "island" | "archipelago" => Some(Layer::Admin), // Treat as generic admin
             _ => None,
         }
-    } else if let Some(_admin_level) = tags.get("admin_level") {
+    } else if let Some(admin_level) = tags.get("admin_level") {
         // Only if boundary=administrative
         if tags.contains("boundary", "administrative") {
+            if let Ok(level) = admin_level.parse::<u8>() {
+                if let Some(admin_level_enum) = AdminLevel::from_osm_level(level) {
+                   return Some(admin_level_to_layer(admin_level_enum));
+                }
+            }
             Some(Layer::Admin)
         } else {
             None
@@ -901,6 +944,36 @@ fn determine_layer(tags: &osmpbfreader::Tags) -> Option<Layer> {
             None
         }
     }
+}
+
+fn admin_level_to_layer(level: AdminLevel) -> Layer {
+    match level {
+        AdminLevel::Country => Layer::Country,
+        AdminLevel::MacroRegion => Layer::MacroRegion,
+        AdminLevel::Region => Layer::Region,
+        AdminLevel::MacroCounty => Layer::MacroCounty,
+        AdminLevel::County => Layer::County,
+        AdminLevel::LocalAdmin => Layer::LocalAdmin,
+        AdminLevel::Locality => Layer::Locality,
+        AdminLevel::Borough => Layer::Borough,
+        AdminLevel::Neighbourhood => Layer::Neighbourhood,
+    }
+}
+
+fn is_admin_layer(layer: Layer) -> bool {
+    matches!(
+        layer,
+        Layer::Admin
+            | Layer::Country
+            | Layer::MacroRegion
+            | Layer::Region
+            | Layer::MacroCounty
+            | Layer::County
+            | Layer::LocalAdmin
+            | Layer::Locality
+            | Layer::Borough
+            | Layer::Neighbourhood
+    )
 }
 
 async fn upsert_admin_areas(place: &Place, scylla: &ScyllaClient) -> Result<()> {

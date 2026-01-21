@@ -567,19 +567,31 @@ fn build_search_query(params: &SearchParams, autocomplete: bool) -> serde_json::
     let functions = vec![
         json!({
             "filter": { "term": { "layer": "country" } },
-            "weight": 3.0
+            "weight": 5.0
         }),
         json!({
             "filter": { "term": { "layer": "macro_region" } },
-            "weight": 2.5
+            "weight": 3.0
         }),
         json!({
             "filter": { "term": { "layer": "region" } },
+            "weight": 2.5
+        }),
+        json!({
+            "filter": { "term": { "layer": "macro_county" } },
+            "weight": 2.2
+        }),
+        json!({
+            "filter": { "term": { "layer": "county" } },
             "weight": 2.0
         }),
         json!({
             "filter": { "terms": { "layer": ["local_admin", "locality"] } },
             "weight": 1.5
+        }),
+        json!({
+            "filter": { "terms": { "layer": ["borough", "neighbourhood"] } },
+            "weight": 1.2
         }),
         // Public Transport / Station Boosts
         // Categories typically formatted as "key=value" or just "key" depending on ingest

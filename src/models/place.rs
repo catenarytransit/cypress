@@ -37,12 +37,22 @@ pub enum Layer {
     Street,
     /// Administrative boundaries
     Admin,
-    /// Neighbourhoods
-    Neighbourhood,
-    /// Localities (cities, towns, villages)
-    Locality,
+    /// Macro regions / federal districts
+    MacroRegion,
     /// Regions (states, provinces)
     Region,
+    /// Macro counties
+    MacroCounty,
+    /// Counties / districts
+    County,
+    /// Local admin / municipalities
+    LocalAdmin,
+    /// Localities (cities, towns, villages)
+    Locality,
+    /// Boroughs
+    Borough,
+    /// Neighbourhoods
+    Neighbourhood,
     /// Countries
     Country,
 }
