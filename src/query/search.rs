@@ -681,7 +681,7 @@ fn build_search_query(params: &SearchParams, autocomplete: bool) -> serde_json::
                 "match_phrase_prefix": {
                     "name_all": {
                         "query": &params.text,
-                        "boost": 10.0
+                        "boost": 20.0
                     }
                 }
             },
@@ -689,7 +689,7 @@ fn build_search_query(params: &SearchParams, autocomplete: bool) -> serde_json::
                 "match": {
                     "name_all": {
                         "query": &params.text,
-                        "boost": 5.0,
+                        "boost": 10.0,
                         "fuzziness": "AUTO"
                     }
                 }
@@ -698,7 +698,7 @@ fn build_search_query(params: &SearchParams, autocomplete: bool) -> serde_json::
                 "match_phrase_prefix": {
                     "name_all.autocomplete": {
                         "query": &params.text,
-                        "boost": 5.0
+                        "boost": 10.0
                     }
                 }
             },
@@ -709,7 +709,7 @@ fn build_search_query(params: &SearchParams, autocomplete: bool) -> serde_json::
                     "saturation": {
                         "pivot": 0.5
                     },
-                    "boost": 5.0
+                    "boost": 80.0
                 }
             }
         ],
@@ -744,7 +744,7 @@ fn build_search_query(params: &SearchParams, autocomplete: bool) -> serde_json::
                     "decay": 0.5
                 }
             },
-            "weight": 3.0
+            "weight": 0.2
         }));
     }
 
