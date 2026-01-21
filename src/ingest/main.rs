@@ -742,8 +742,12 @@ fn extract_place(
                     // FILTER: Skip ways that are admin boundaries
                     // We only want relations for administrative areas to avoid clutter / duplicate borders
                     
-                    // Explicitly check for border_type or boundary=administrative to catch any stragglers
-                    if way.tags.contains_key("border_type") || way.tags.contains("boundary", "administrative") {
+                    // Explicitly check for border_type or boundary=administrative or country adjacency tags to catch any stragglers
+                    if way.tags.contains_key("border_type") 
+                        || way.tags.contains("boundary", "administrative") 
+                        || way.tags.contains_key("left:country")
+                        || way.tags.contains_key("right:country")
+                    {
                         return Ok(None);
                     }
 
