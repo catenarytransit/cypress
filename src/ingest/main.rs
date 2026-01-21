@@ -741,6 +741,12 @@ fn extract_place(
                 if let Some((lon, lat)) = resolver.resolve_centroid(way.id) {
                     // FILTER: Skip ways that are admin boundaries
                     // We only want relations for administrative areas to avoid clutter / duplicate borders
+                    
+                    // Explicitly check for border_type or boundary=administrative to catch any stragglers
+                    if way.tags.contains_key("border_type") || way.tags.contains("boundary", "administrative") {
+                        return Ok(None);
+                    }
+
                     if is_admin_layer(layer) {
                         return Ok(None);
                     }
