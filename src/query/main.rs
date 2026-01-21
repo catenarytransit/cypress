@@ -146,7 +146,10 @@ async fn search_handler(
 
     let results = execute_search(&state.es_client, &state.scylla_client, search_params, false)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            tracing::error!("Search execution failed: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
 
     Ok(Json(SearchResponse {
         features: results.results,
@@ -176,7 +179,10 @@ async fn autocomplete_handler(
 
     let results = execute_search(&state.es_client, &state.scylla_client, search_params, true)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            tracing::error!("Autocomplete execution failed: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
 
     Ok(Json(SearchResponse {
         features: results.results,
@@ -206,7 +212,10 @@ async fn search_v2_handler(
 
     let results = execute_search_v2(&state.es_client, &state.scylla_client, search_params, false)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            tracing::error!("Search V2 execution failed: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
 
     Ok(Json(SearchResponseV2 {
         features: results.results,
@@ -231,8 +240,12 @@ async fn reverse_handler(
             .as_ref()
             .map(|l| l.split(',').map(String::from).collect()),
     )
+    )
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| {
+        tracing::error!("Reverse geocoding failed: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
 
     Ok(Json(SearchResponse {
         features: results,

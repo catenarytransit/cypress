@@ -629,6 +629,15 @@ fn build_search_query(params: &SearchParams, autocomplete: bool) -> serde_json::
                 }
             },
             {
+                "match": {
+                    "name_all": {
+                        "query": &params.text,
+                        "boost": 5.0,
+                        "fuzziness": "AUTO"
+                    }
+                }
+            },
+            {
                 "match_phrase_prefix": {
                     "name_all.autocomplete": {
                         "query": &params.text,
