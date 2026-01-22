@@ -433,12 +433,12 @@ pub async fn run_single(args: Args, synonyms: Arc<SynonymService>) -> Result<()>
                 AdminLevel::Borough => 0.65,
                 AdminLevel::Neighbourhood => 0.6,
             };
-            
+
             place.importance = Some(default_importance);
 
             // Overwrite with externally provided importance if available and higher?
-            // Usually internal manual boost should win for fundamental admin types, 
-            // but let's allow external to override ONLY if it's very high? 
+            // Usually internal manual boost should win for fundamental admin types,
+            // but let's allow external to override ONLY if it's very high?
             // Or just check if wiki importance exists.
             if let Some(ref map) = importance_map {
                 if let Some(ref qid) = place.wikidata_id {
@@ -539,7 +539,7 @@ pub async fn run_single(args: Args, synonyms: Arc<SynonymService>) -> Result<()>
 
                 // Filter out items without name or address
                 if place.name.is_empty() && place.address.is_none() {
-                    continue; 
+                    continue;
                 }
 
                 // Calculate importance
@@ -749,7 +749,7 @@ fn extract_place(
                 if place.name.is_empty() && place.address.is_none() {
                     return Ok(None);
                 }
-                
+
                 Ok(Some(place))
             } else {
                 Ok(None)
@@ -766,10 +766,10 @@ fn extract_place(
                 if let Some((lon, lat)) = resolver.resolve_centroid(way.id) {
                     // FILTER: Skip ways that are admin boundaries
                     // We only want relations for administrative areas to avoid clutter / duplicate borders
-                    
+
                     // Explicitly check for border_type or boundary=administrative or country adjacency tags to catch any stragglers
-                    if way.tags.contains_key("border_type") 
-                        || way.tags.contains("boundary", "administrative") 
+                    if way.tags.contains_key("border_type")
+                        || way.tags.contains("boundary", "administrative")
                         || way.tags.contains_key("left:country")
                         || way.tags.contains_key("right:country")
                     {
@@ -818,16 +818,17 @@ fn extract_place(
                 if layer == Layer::Country {
                     let tags = &rel.tags;
                     let is_boundary = tags.get("type").map(|s| s.as_str()) == Some("boundary");
-                    let is_admin = tags.get("boundary").map(|s| s.as_str()) == Some("administrative");
-                    let has_iso = tags.contains_key("ISO3166-1") 
-                        || tags.contains_key("ISO3166-1:alpha2") 
+                    let is_admin =
+                        tags.get("boundary").map(|s| s.as_str()) == Some("administrative");
+                    let has_iso = tags.contains_key("ISO3166-1")
+                        || tags.contains_key("ISO3166-1:alpha2")
                         || tags.contains_key("ISO3166-1:alpha3");
 
                     if !is_boundary || !is_admin || !has_iso {
                         return Ok(None);
                     }
                 }
-                
+
                 // Removed explicit skip for Layer::Admin to allow places like archipelagos to be indexed
                 // even if they are not picked up by extract_admin_boundaries.
 
@@ -973,7 +974,7 @@ fn determine_layer(tags: &osmpbfreader::Tags) -> Option<Layer> {
             "borough" => Some(Layer::Borough),
             "suburb" | "quarter" | "neighbourhood" => Some(Layer::Neighbourhood),
             "hamlet" | "isolated_dwelling" | "farm" => Some(Layer::Locality),
-             
+
             "island" | "archipelago" => Some(Layer::Admin), // Treat as generic admin
             _ => None,
         }

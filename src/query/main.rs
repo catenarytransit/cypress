@@ -240,7 +240,7 @@ async fn reverse_handler(
             .as_ref()
             .map(|l| l.split(',').map(String::from).collect()),
     )
-        .await
+    .await
     .map_err(|e| {
         tracing::error!("Reverse geocoding failed: {}", e);
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())

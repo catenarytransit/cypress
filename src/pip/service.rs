@@ -4,8 +4,8 @@ use std::sync::Arc;
 use tracing::debug;
 
 use super::{AdminBoundary, AdminSpatialIndex};
-use geo::Area;
 use crate::models::{AdminEntry, AdminHierarchy, AdminLevel};
+use geo::Area;
 
 /// Point-in-Polygon lookup service
 pub struct PipService {

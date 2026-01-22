@@ -70,11 +70,11 @@ impl WayMerger {
     fn get_merge_key(tags: &Tags) -> Option<String> {
         let name = tags.get("name")?;
         let highway = tags.get("highway")?;
-        
+
         // Only merge certain highway types (not motorways or links)
         match highway.as_str() {
-            "motorway" | "motorway_link" | "trunk_link" | "primary_link" 
-            | "secondary_link" | "tertiary_link" => return None,
+            "motorway" | "motorway_link" | "trunk_link" | "primary_link" | "secondary_link"
+            | "tertiary_link" => return None,
             _ => {}
         }
 
@@ -84,7 +84,7 @@ impl WayMerger {
     /// Merge adjacent ways and return the merged roads
     pub fn merge(mut self) -> Vec<MergedRoad> {
         info!("Merging roads with same names...");
-        
+
         let mut merged_roads = Vec::new();
         let mut total_ways = 0;
         let mut _merged_ways = 0;
@@ -112,14 +112,17 @@ impl WayMerger {
 
             // Build connectivity graph
             let groups = Self::group_connected_ways_static(&mut ways);
-            
+
             for group in groups {
                 if group.len() > 1 {
                     _merged_ways += group.len();
                 }
-                
+
                 let way_ids: Vec<_> = group.iter().map(|w| w.way_id).collect();
-                let line_strings: Vec<_> = group.iter().map(|w| Self::get_linestring_static(&resolver, w)).collect();
+                let line_strings: Vec<_> = group
+                    .iter()
+                    .map(|w| Self::get_linestring_static(&resolver, w))
+                    .collect();
                 let tags = group[0].tags.clone();
 
                 merged_roads.push(MergedRoad {
@@ -215,7 +218,7 @@ impl MergedRoad {
     pub fn to_place(&self, source_file: &str) -> Option<Place> {
         // Create MultiLineString from all segments
         let multi_line = MultiLineString::new(self.line_strings.clone());
-        
+
         // Calculate centroid
         let center = multi_line.centroid().map(|p| GeoPoint {
             lat: p.y(),
@@ -223,9 +226,9 @@ impl MergedRoad {
         })?;
 
         // Calculate bounding box
-        let bbox = multi_line.bounding_rect().map(|rect| {
-            GeoBbox::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y)
-        });
+        let bbox = multi_line
+            .bounding_rect()
+            .map(|rect| GeoBbox::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y));
 
         // Use the first way ID as the representative
         let osm_id = self.way_ids[0].0;
@@ -236,10 +239,9 @@ impl MergedRoad {
 
         // If multiple ways were merged, add a note in categories
         if self.way_ids.len() > 1 {
-            place.categories.push(format!(
-                "merged_ways:{}",
-                self.way_ids.len()
-            ));
+            place
+                .categories
+                .push(format!("merged_ways:{}", self.way_ids.len()));
         }
 
         Some(place)
@@ -286,7 +288,7 @@ mod tests {
             tags: Tags::new(),
             nodes: vec![1, 2, 3],
         };
-        
+
         let way2 = RoadWay {
             way_id: WayId(2),
             tags: Tags::new(),
@@ -303,7 +305,7 @@ mod tests {
             tags: Tags::new(),
             nodes: vec![1, 2, 3],
         };
-        
+
         let way2 = RoadWay {
             way_id: WayId(2),
             tags: Tags::new(),

@@ -9,7 +9,6 @@ use tracing::{debug, error, info, warn};
 
 use super::{EsClient, EsDocument};
 
-
 /// Bulk indexer that runs in a background task
 pub struct BulkIndexer<T: EsDocument> {
     sender: mpsc::Sender<T>,

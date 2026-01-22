@@ -19,7 +19,7 @@ pub fn load_importance(path: &Path) -> Result<HashMap<String, f64>> {
     };
 
     //schema
-    
+
     //language        type    title   importance      wikidata_id
     //en      a       !!!     0.41523351747267634     Q371
     //en      a       $4.50_Theater_Company   0.42547726432748295     Q56348256

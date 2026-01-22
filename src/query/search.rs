@@ -281,43 +281,50 @@ async fn execute_search_internal(
 
                 normalized_places.push((place, score));
             } else {
-                debug!("Failed to deserialize place from Scylla: {}", places_to_fetch[i]);
+                debug!(
+                    "Failed to deserialize place from Scylla: {}",
+                    places_to_fetch[i]
+                );
             }
         } else {
-            debug!("Place not found in Scylla or error: {} (Result: {:?})", places_to_fetch[i], fetch_result);
+            debug!(
+                "Place not found in Scylla or error: {} (Result: {:?})",
+                places_to_fetch[i], fetch_result
+            );
         }
     }
 
     // Apply focus scoring in Rust
     if let (Some(lat), Some(lon)) = (params.focus_lat, params.focus_lon) {
         let focus_point = (lat, lon);
-        
+
         for (place, score) in normalized_places.iter_mut() {
             let place_point = (place.center_point.lat, place.center_point.lon);
             let distance_km = haversine_distance_km(focus_point, place_point);
-            
+
             // Decay function: 50km scale
             // factor = 1.0 / (1.0 + (distance / 50.0)^2)
             // This gives a nice bell curve shape, or we can use exponential
             // Let's use simple exponential decay like ES gauss: exp(- (dist^2) / (2 * scale^2))
             // scale = 50km
             // But we want to dampen this effect by importance.
-            
+
             let scale = 50.0;
-            let decay = (- (distance_km * distance_km) / (2.0 * scale * scale)).exp();
-            
+            let decay = (-(distance_km * distance_km) / (2.0 * scale * scale)).exp();
+
             let importance = place.importance.unwrap_or(0.0);
-            
+
             // Interpolate between decay and 1.0 based on importance
             // If importance is 1.0, factor is 1.0 (no decay)
             // If importance is 0.0, factor is decay (full decay)
             let final_factor = decay + (1.0 - decay) * importance;
-            
+
             *score *= final_factor;
         }
-        
+
         // Re-sort results
-        normalized_places.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        normalized_places
+            .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     }
 
     // Batch fetch admin areas
@@ -608,7 +615,10 @@ fn place_to_search_result_v2(
             locality: resolve_if_larger(Layer::Locality, &place.parent.locality),
             locality_names: resolve_names_if_larger(Layer::Locality, &place.parent.locality),
             neighbourhood: resolve_if_larger(Layer::Neighbourhood, &place.parent.neighbourhood),
-            neighbourhood_names: resolve_names_if_larger(Layer::Neighbourhood, &place.parent.neighbourhood),
+            neighbourhood_names: resolve_names_if_larger(
+                Layer::Neighbourhood,
+                &place.parent.neighbourhood,
+            ),
             categories: place.categories,
             confidence: score,
         },
@@ -636,37 +646,17 @@ fn build_search_query(params: &SearchParams, autocomplete: bool) -> serde_json::
 
     // Core bool query
     let mut bool_query = json!({
-        "should": [
-            // Text Match: Phrase Prefix for Name
-            {
-                "match_phrase_prefix": {
-                    "name_all": {
-                        "query": &params.text,
-                        "boost": 5.0
-                    }
-                }
-            },
+        "must": [
             {
                 "match": {
                     "name_all": {
                         "query": &params.text,
-                        "boost": 10.0,
                         "fuzziness": "AUTO"
                     }
                 }
-            },
-            // Importance Rank Feature
-            {
-                "rank_feature": {
-                    "field": "importance",
-                    "saturation": {
-                        "pivot": 0.5
-                    },
-                    "boost": 10.0
-                }
             }
         ],
-        "minimum_should_match": 2
+        "filter": []
     });
 
     // Add layer filter
@@ -674,7 +664,7 @@ fn build_search_query(params: &SearchParams, autocomplete: bool) -> serde_json::
         let filter_clause = json!({
             "terms": { "layer": layers }
         });
-        
+
         if let Some(filter_arr) = bool_query["filter"].as_array_mut() {
             filter_arr.push(filter_clause);
         } else {
@@ -682,8 +672,32 @@ fn build_search_query(params: &SearchParams, autocomplete: bool) -> serde_json::
         }
     }
 
+    let functions = json!([
+    // Importance Score
+    // Using field_value_factor to utilize the numeric 'importance' field
+    {
+        "field_value_factor": {
+            "field": "importance",
+            "missing": 0,
+            // pivot/saturation logic from rank_feature is approximated
+            // here or can be handled via script_score if precise curve is needed.
+            // Simple modifier for now:
+            "modifier": "sqrt",
+            "factor": 1.0
+        },
+        "weight": 10.0
+    }
+    ]);
+
     json!({
-        "query": { "bool": bool_query },
+        "query": {
+            "function_score": {
+                "query": { "bool": bool_query },
+                "functions": functions,
+                "score_mode": "sum",   // Sum the weights of the functions
+                "boost_mode": "multiply" // Multiply the query score by the function score
+            }
+        },
         "size": params.size,
         "stored_fields": ["_id"]
     })
@@ -692,16 +706,16 @@ fn build_search_query(params: &SearchParams, autocomplete: bool) -> serde_json::
 fn haversine_distance_km(p1: (f64, f64), p2: (f64, f64)) -> f64 {
     let (lat1, lon1) = p1;
     let (lat2, lon2) = p2;
-    
+
     let r = 6371.0; // Earth radius in km
-    
+
     let dlat = (lat2 - lat1).to_radians();
     let dlon = (lon2 - lon1).to_radians();
-    
+
     let a = (dlat / 2.0).sin().powi(2)
         + lat1.to_radians().cos() * lat2.to_radians().cos() * (dlon / 2.0).sin().powi(2);
     let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
-    
+
     r * c
 }
 
@@ -875,11 +889,11 @@ mod tests {
         assert!(query_str.contains("weight\":3.0")); // Country boost
 
         // Verify Category Biasing
-        
+
         // Standard (1.5)
         assert!(query_str.contains("railway:station"));
         assert!(query_str.contains("weight\":1.5"));
-        
+
         // High Priority (2.0)
         assert!(query_str.contains("railway:tram_stop"));
         assert!(query_str.contains("weight\":2.0"));
@@ -936,14 +950,13 @@ mod tests {
             parent: AdminHierarchyIds::default(),
         };
         place.parent.country = Some("relation/1".to_string()); // Rank 100
-        place.parent.county = Some("relation/3".to_string());  // Rank 60
+        place.parent.county = Some("relation/3".to_string()); // Rank 60
 
-        let result =
-            place_to_search_result_v2(place, 1.0, &None, &admin_map).unwrap();
+        let result = place_to_search_result_v2(place, 1.0, &None, &admin_map).unwrap();
 
         // Country (Rank 100) > Region (Rank 80) -> Should be present
         assert_eq!(result.properties.country.as_deref(), Some("Spain"));
-        
+
         // County (Rank 60) <= Region (Rank 80) -> Should be filtered out
         assert_eq!(result.properties.county, None);
     }
