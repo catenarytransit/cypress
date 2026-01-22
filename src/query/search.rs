@@ -601,77 +601,6 @@ fn get_layer_rank(layer: Layer) -> u8 {
 
 fn build_search_query(params: &SearchParams, autocomplete: bool) -> serde_json::Value {
     // Build function score for layer biasing
-    let functions = vec![
-        json!({
-            "filter": { "term": { "layer": "country" } },
-            "weight": 5.0
-        }),
-        json!({
-            "filter": { "term": { "layer": "macro_region" } },
-            "weight": 3.0
-        }),
-        json!({
-            "filter": { "term": { "layer": "region" } },
-            "weight": 2.5
-        }),
-        json!({
-            "filter": { "term": { "layer": "macro_county" } },
-            "weight": 2.2
-        }),
-        json!({
-            "filter": { "term": { "layer": "county" } },
-            "weight": 2.0
-        }),
-        json!({
-            "filter": { "terms": { "layer": ["local_admin", "locality"] } },
-            "weight": 1.5
-        }),
-        json!({
-            "filter": { "terms": { "layer": ["borough", "neighbourhood"] } },
-            "weight": 1.2
-        }),
-        // Public Transport / Station Boosts
-        // Categories typically formatted as "key=value" or just "key" depending on ingest
-        // In ingest/main.rs: place.add_category(key_str, value) -> usually stores "key=value" string in `categories` list?
-        // Checking `Place::add_category`: it usually stores just the value? Or "key=value"?
-        // Wait, I need to check `Place::add_category` implementation or usage. 
-        // Assuming "railway=station" format or just "station" if mapped.
-        // Let's assume standard "key=value" or just "value" if the field is text.
-        // `categories` in schema is `keyword`.
-        // Let's verify `add_category` behavior effectively by being broad:
-        // We will wildcard match or term match common values.
-        
-        // Boost for railway stations (Standard)
-        json!({
-            "filter": {
-                "bool": {
-                    "should": [
-                       { "term": { "categories": "railway:station" } },
-                       { "term": { "categories": "railway:halt" } },
-                       { "term": { "categories": "public_transport:station" } },
-                       { "term": { "categories": "public_transport:stop_position" } },
-                       { "term": { "categories": "aeroway:aerodrome" } }
-                    ]
-                }
-            },
-            "weight": 1.5
-        }),
-        // Boost for Subway and Tram (High Priority)
-        json!({
-             "filter": {
-                "bool": {
-                    "should": [
-                       { "term": { "categories": "railway:tram_stop" } },
-                       { "term": { "categories": "railway:subway" } },
-                       { "term": { "categories": "railway:light_rail" } },
-                       { "term": { "categories": "station:subway" } },
-                       { "term": { "categories": "station:light_rail" } }
-                    ]
-                }
-            },
-            "weight": 2.0
-        }),
-    ];
 
     // Core bool query
     let mut bool_query = json!({
@@ -681,7 +610,7 @@ fn build_search_query(params: &SearchParams, autocomplete: bool) -> serde_json::
                 "match_phrase_prefix": {
                     "name_all": {
                         "query": &params.text,
-                        "boost": 20.0
+                        "boost": 5.0
                     }
                 }
             },
@@ -694,14 +623,6 @@ fn build_search_query(params: &SearchParams, autocomplete: bool) -> serde_json::
                     }
                 }
             },
-            {
-                "match_phrase_prefix": {
-                    "name_all.autocomplete": {
-                        "query": &params.text,
-                        "boost": 10.0
-                    }
-                }
-            },
             // Importance Rank Feature
             {
                 "rank_feature": {
@@ -709,11 +630,11 @@ fn build_search_query(params: &SearchParams, autocomplete: bool) -> serde_json::
                     "saturation": {
                         "pivot": 0.5
                     },
-                    "boost": 80.0
+                    "boost": 10.0
                 }
             }
         ],
-        "minimum_should_match": 1
+        "minimum_should_match": 2
     });
 
     // Add layer filter
