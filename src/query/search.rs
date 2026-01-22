@@ -288,6 +288,38 @@ async fn execute_search_internal(
         }
     }
 
+    // Apply focus scoring in Rust
+    if let (Some(lat), Some(lon)) = (params.focus_lat, params.focus_lon) {
+        let focus_point = (lat, lon);
+        
+        for (place, score) in normalized_places.iter_mut() {
+            let place_point = (place.center_point.lat, place.center_point.lon);
+            let distance_km = haversine_distance_km(focus_point, place_point);
+            
+            // Decay function: 50km scale
+            // factor = 1.0 / (1.0 + (distance / 50.0)^2)
+            // This gives a nice bell curve shape, or we can use exponential
+            // Let's use simple exponential decay like ES gauss: exp(- (dist^2) / (2 * scale^2))
+            // scale = 50km
+            // But we want to dampen this effect by importance.
+            
+            let scale = 50.0;
+            let decay = (- (distance_km * distance_km) / (2.0 * scale * scale)).exp();
+            
+            let importance = place.importance.unwrap_or(0.0);
+            
+            // Interpolate between decay and 1.0 based on importance
+            // If importance is 1.0, factor is 1.0 (no decay)
+            // If importance is 0.0, factor is decay (full decay)
+            let final_factor = decay + (1.0 - decay) * importance;
+            
+            *score *= final_factor;
+        }
+        
+        // Re-sort results
+        normalized_places.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    }
+
     // Batch fetch admin areas
     let admin_ids_vec: Vec<String> = admin_ids.into_iter().collect();
     let admin_map = scylla_client.get_admin_areas(&admin_ids_vec).await?;
@@ -650,19 +682,27 @@ fn build_search_query(params: &SearchParams, autocomplete: bool) -> serde_json::
         }
     }
 
-    let query = json!({
-        "function_score": {
-            "query": { "bool": bool_query },
-            "score_mode": "multiply",
-            "boost_mode": "multiply"
-        }
-    });
-
     json!({
-        "query": query,
+        "query": { "bool": bool_query },
         "size": params.size,
         "stored_fields": ["_id"]
     })
+}
+
+fn haversine_distance_km(p1: (f64, f64), p2: (f64, f64)) -> f64 {
+    let (lat1, lon1) = p1;
+    let (lat2, lon2) = p2;
+    
+    let r = 6371.0; // Earth radius in km
+    
+    let dlat = (lat2 - lat1).to_radians();
+    let dlon = (lon2 - lon1).to_radians();
+    
+    let a = (dlat / 2.0).sin().powi(2)
+        + lat1.to_radians().cos() * lat2.to_radians().cos() * (dlon / 2.0).sin().powi(2);
+    let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
+    
+    r * c
 }
 
 #[cfg(test)]

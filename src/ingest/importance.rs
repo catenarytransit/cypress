@@ -18,16 +18,22 @@ pub fn load_importance(path: &Path) -> Result<HashMap<String, f64>> {
         Box::new(file)
     };
 
-    // The file might be a raw CSV or SQL dump. The user said "Inside is a .csv file".
-    // If it's a .sql.gz, it might contain SQL commands.
-    // However, the user also said "Inside is a .csv file called wikimedia-importance.csv".
-    // If the path points to the .csv (extracted), we read it as CSV.
-    // We'll assume TAB or Comma delimiter. Screenshot looks like a table, standard CSV usually.
-    // Let's iterate and try to parse.
+    //schema
+    
+    //language        type    title   importance      wikidata_id
+    //en      a       !!!     0.41523351747267634     Q371
+    //en      a       $4.50_Theater_Company   0.42547726432748295     Q56348256
+    //en      a       ¥$      0.40816634963515963     Q124493747
+    //en      a       01099   0.2869812649426343      Q106604851
+    //en      a       013     0.3807705141182751      Q2319846
+    //en      a       015B    0.354703308323595       Q12579912
+    //en      a       01.AI   0.31461790426364866     Q130692307
+    //en      a       01_Communique   0.07194870560319186     Q4545554
+    //en      a       01_Distribution 0.45833613469028417     Q1554656
 
     let mut csv_reader = ReaderBuilder::new()
         .has_headers(true)
-        .delimiter(b',')
+        .delimiter(b'\t')
         .from_reader(reader);
 
     let mut map = HashMap::new();

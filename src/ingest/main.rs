@@ -443,10 +443,7 @@ pub async fn run_single(args: Args, synonyms: Arc<SynonymService>) -> Result<()>
             if let Some(ref map) = importance_map {
                 if let Some(ref qid) = place.wikidata_id {
                     if let Some(score) = map.get(qid) {
-                         // Keep the higher of the two
-                         if *score > default_importance {
-                             place.importance = Some(*score);
-                         }
+                        place.importance = Some(*score);
                     }
                 }
             }
