@@ -642,60 +642,27 @@ fn get_layer_rank(layer: Layer) -> u8 {
 }
 
 fn build_search_query(params: &SearchParams, autocomplete: bool) -> serde_json::Value {
-    // Build function score for layer biasing
-
-    // Core bool query
-    let mut bool_query = json!({
-        "must": [
-            {
-                "match": {
-                    "name_all": {
-                        "query": &params.text,
-                        "fuzziness": "AUTO"
-                    }
-                }
-            }
-        ],
-        "filter": []
-    });
-
-    // Add layer filter
-    if let Some(ref layers) = params.layers {
-        let filter_clause = json!({
-            "terms": { "layer": layers }
-        });
-
-        if let Some(filter_arr) = bool_query["filter"].as_array_mut() {
-            filter_arr.push(filter_clause);
-        } else {
-            bool_query["filter"] = json!([filter_clause]);
-        }
-    }
-
-    let functions = json!([
-    // Importance Score
-    // Using field_value_factor to utilize the numeric 'importance' field
-    {
-        "field_value_factor": {
-            "field": "importance",
-            "missing": 0,
-            // pivot/saturation logic from rank_feature is approximated
-            // here or can be handled via script_score if precise curve is needed.
-            // Simple modifier for now:
-            "modifier": "sqrt",
-            "factor": 1.0
-        },
-        "weight": 10.0
-    }
-    ]);
-
     json!({
         "query": {
-            "function_score": {
-                "query": { "bool": bool_query },
-                "functions": functions,
-                "score_mode": "sum",   // Sum the weights of the functions
-                "boost_mode": "multiply" // Multiply the query score by the function score
+            "bool": {
+                "must": [
+                    {
+                        "match": {
+                            "name_all": {
+                                "query": &params.text,
+                                "fuzziness": "AUTO"
+                            }
+                        }
+                    }
+                ],
+                "should": [
+                    {
+                        "rank_feature": {
+                            "field": "importance",
+                            "boost": 10.0
+                        }
+                    }
+                ]
             }
         },
         "size": params.size,
