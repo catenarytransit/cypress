@@ -650,29 +650,9 @@ fn build_search_query(params: &SearchParams, autocomplete: bool) -> serde_json::
         }
     }
 
-    // Combine with function score
-    let mut function_score_functions = functions;
-    
-    if params.focus_lat.is_some() && params.focus_lon.is_some() {
-        let focus_lat = params.focus_lat.unwrap();
-        let focus_lon = params.focus_lon.unwrap();
-        function_score_functions.push(json!({
-            "gauss": {
-                "center_point": {
-                    "origin": { "lat": focus_lat, "lon": focus_lon },
-                    "scale": "50km",
-                    "offset": "10km",
-                    "decay": 0.5
-                }
-            },
-            "weight": 0.2
-        }));
-    }
-
     let query = json!({
         "function_score": {
             "query": { "bool": bool_query },
-            "functions": function_score_functions,
             "score_mode": "multiply",
             "boost_mode": "multiply"
         }

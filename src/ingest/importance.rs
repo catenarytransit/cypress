@@ -27,7 +27,7 @@ pub fn load_importance(path: &Path) -> Result<HashMap<String, f64>> {
 
     let mut csv_reader = ReaderBuilder::new()
         .has_headers(true)
-        .delimiter(b'\t')
+        .delimiter(b',')
         .from_reader(reader);
 
     let mut map = HashMap::new();
@@ -62,47 +62,47 @@ pub fn load_importance(path: &Path) -> Result<HashMap<String, f64>> {
 pub fn calculate_default_importance(tags: &osmpbfreader::Tags) -> f64 {
     // Continent / Ocean
     if tags.contains("place", "continent") || tags.contains("place", "ocean") {
-        return 0.725;
+        return 0.5;
     }
     // Sea
     if tags.contains("place", "sea") {
-        return 0.700;
+        return 0.4;
     }
     // Country
     if tags.contains("place", "country") {
-        return 0.650;
+        return 0.4;
     }
     // State / Region
     if tags.contains("place", "state") {
-        return 0.550;
+        return 0.3;
     }
     // Region (Sub-State)
     if tags.contains("place", "region") {
-        return 0.500;
+        return 0.25;
     }
     // County
     if tags.contains("place", "county") {
-        return 0.450;
+        return 0.2;
     }
     // City
     if tags.contains("place", "city") {
-        return 0.350;
+        return 0.2;
     }
     // Town
     if tags.contains("place", "town") {
-        return 0.300;
+        return 0.15;
     }
     // Village / Suburb
     if tags.contains("place", "village") || tags.contains("place", "suburb") {
-        return 0.275;
+        return 0.1;
     }
     // Hamlet / Farm
     if tags.contains("place", "hamlet") || tags.contains("place", "farm") {
-        return 0.250;
+        return 0.05;
     }
     // Locality
     if tags.contains("place", "locality") {
-        return 0.125;
+        return 0.05;
     }
     // Street (highway=residential in table, but we apply to all roads generally if not specific)
     // The table says "Street: highway=residential -> 0.100".
