@@ -191,7 +191,7 @@ pub async fn execute_search_v2(
     })
 }
 
-}
+
 
 async fn execute_search_internal_wrapper(
     client: &EsClient,
