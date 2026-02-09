@@ -482,14 +482,25 @@ pub async fn run_single(args: Args, synonyms: Arc<SynonymService>) -> Result<()>
         if let Some(ref mut merger) = way_merger {
             if let osmpbfreader::OsmObj::Way(ref way) = obj {
                 if is_road_way(&way.tags) {
-                    // Normalize name in tags before adding to merger
-                    // This improves merger grouping
-                    let mut tags = way.tags.clone();
-                    if let Some(name) = tags.get("name") {
-                        let normalized = synonyms.normalize(name);
-                        tags.insert("name".into(), normalized.into());
-                    }
-                    merger.add_road(way.id, tags, way.nodes.iter().map(|n| n.0).collect());
+                    // Normalize name to generate merge key for grouping, but pass ORIGINAL tags
+                    // This ensures the official name in Scylla is the original one
+                    let merge_key = if let Some(name) = way.tags.get("name") {
+                        if let Some(highway) = way.tags.get("highway") {
+                            let normalized = synonyms.normalize(name);
+                            Some(format!("{}|{}", normalized, highway))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    merger.add_road(
+                        way.id,
+                        way.tags.clone(),
+                        way.nodes.iter().map(|n| n.0).collect(),
+                        merge_key,
+                    );
                     continue; // Don't process this way now
                 }
             }
@@ -884,7 +895,14 @@ fn extract_tags(place: &mut Place, tags: &osmpbfreader::Tags, synonyms: &Synonym
 
         // Names
         if key_str == "name" {
-            place.add_name("default", synonyms.normalize(value));
+            // Keep original name as default
+            place.add_name("default", value.to_string());
+
+            // Add normalized version to synonyms if different
+            let normalized = synonyms.normalize(value);
+            if normalized != *value {
+                place.synonyms.push(normalized);
+            }
         } else if let Some(lang) = key_str.strip_prefix("name:") {
             if is_valid_lang_code(lang) {
                 place.add_name(lang, value.to_string());

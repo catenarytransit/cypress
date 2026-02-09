@@ -129,6 +129,10 @@ pub struct Place {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub categories: Vec<String>,
 
+    /// Explicit synonyms for search indexing (not stored in Scylla)
+    #[serde(skip)]
+    pub synonyms: Vec<String>,
+
     /// Multilingual names: {"default": "...", "de": "...", "fr": "..."}
     pub name: HashMap<String, String>,
 
@@ -174,6 +178,7 @@ impl Place {
             importance: None,
             layer,
             categories: Vec::new(),
+            synonyms: Vec::new(),
             name: HashMap::new(),
             name_all: String::new(),
             phrase: None,
@@ -244,6 +249,10 @@ impl Place {
         }
         for name in self.name.values() {
             all_names.insert(name.clone());
+        }
+        // Add synonyms to name_all
+        for syn in &self.synonyms {
+            all_names.insert(syn.clone());
         }
         let mut sorted_names: Vec<_> = all_names.into_iter().collect();
         sorted_names.sort();
