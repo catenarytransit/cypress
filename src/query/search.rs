@@ -9,8 +9,11 @@ use cypress::models::normalized::NormalizedPlace;
 use cypress::models::place::Layer;
 use cypress::models::AdminEntry;
 use cypress::scylla::ScyllaClient;
+use regex::Regex;
+use std::sync::OnceLock;
 
 /// Search parameters
+#[derive(Clone)]
 pub struct SearchParams {
     pub text: String,
     pub lang: Option<String>,
@@ -144,7 +147,7 @@ pub async fn execute_search(
     autocomplete: bool,
 ) -> Result<TimedSearchResults> {
     let internal_results =
-        execute_search_internal(client, scylla_client, params, autocomplete).await?;
+        execute_search_internal_wrapper(client, scylla_client, params, autocomplete).await?;
     let mut search_results = Vec::new();
 
     for (place, score, preferred_lang, parsed_admin_map) in internal_results.places {
@@ -170,7 +173,7 @@ pub async fn execute_search_v2(
     autocomplete: bool,
 ) -> Result<TimedSearchResultsV2> {
     let internal_results =
-        execute_search_internal(client, scylla_client, params, autocomplete).await?;
+        execute_search_internal_wrapper(client, scylla_client, params, autocomplete).await?;
     let mut search_results = Vec::new();
 
     for (place, score, preferred_lang, parsed_admin_map) in internal_results.places {
@@ -186,6 +189,99 @@ pub async fn execute_search_v2(
         es_took_ms: internal_results.es_took_ms,
         scylla_took_ms: internal_results.scylla_took_ms,
     })
+}
+
+}
+
+async fn execute_search_internal_wrapper(
+    client: &EsClient,
+    scylla_client: &ScyllaClient,
+    params: SearchParams,
+    autocomplete: bool,
+) -> Result<InternalTimedResults> {
+    if let Some(modified_text) = remove_location_keywords(&params.text) {
+        let mut modified_params = params.clone();
+        modified_params.text = modified_text;
+
+        debug!("Detected location keywords. Running parallel search: '{}' and '{}'", params.text, modified_params.text);
+
+        let (res_orig, res_mod) = futures::future::join(
+            execute_search_internal(client, scylla_client, params, autocomplete),
+            execute_search_internal(client, scylla_client, modified_params, autocomplete),
+        )
+        .await;
+
+        match (res_orig, res_mod) {
+            (Ok(r1), Ok(r2)) => Ok(merge_internal_results(r1, r2)),
+            (Ok(r1), Err(e)) => {
+                debug!("Modified search failed: {}", e);
+                Ok(r1)
+            }
+            (Err(e), Ok(r2)) => {
+                debug!("Original search failed: {}", e);
+                Ok(r2)
+            }
+            (Err(e1), Err(_)) => Err(e1),
+        }
+    } else {
+        execute_search_internal(client, scylla_client, params, autocomplete).await
+    }
+}
+
+fn remove_location_keywords(text: &str) -> Option<String> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"(?i)\b(City|Village|ville)\b").unwrap());
+    
+    if re.is_match(text) {
+        let replaced = re.replace_all(text, "");
+        let cleaned: String = replaced.split_whitespace().collect::<Vec<&str>>().join(" ");
+        if cleaned.is_empty() || cleaned == text {
+            None
+        } else {
+            Some(cleaned)
+        }
+    } else {
+        None
+    }
+}
+
+fn merge_internal_results(
+    mut r1: InternalTimedResults,
+    r2: InternalTimedResults,
+) -> InternalTimedResults {
+    let mut map = HashMap::new();
+    
+    // Process r1
+    for item in r1.places {
+        // item.0 is NormalizedPlace, item.0.source_id is the ID
+        map.insert(item.0.source_id.clone(), item);
+    }
+    
+    // Process r2
+    for item in r2.places {
+        let id = item.0.source_id.clone();
+        match map.entry(id) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                // If new score is higher, replace
+                if item.1 > entry.get().1 {
+                    entry.insert(item);
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(item);
+            }
+        }
+    }
+    
+    let mut places: Vec<_> = map.into_values().collect();
+    // Sort by score descending
+    places.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    
+    InternalTimedResults {
+        places,
+        es_took_ms: std::cmp::max(r1.es_took_ms, r2.es_took_ms),
+        scylla_took_ms: std::cmp::max(r1.scylla_took_ms, r2.scylla_took_ms),
+    }
 }
 
 async fn execute_search_internal(
@@ -951,5 +1047,16 @@ mod tests {
 
         // County (Rank 60) <= Region (Rank 80) -> Should be filtered out
         assert_eq!(result.properties.county, None);
+    }
+    #[test]
+    fn test_remove_location_keywords() {
+        assert_eq!(remove_location_keywords("New York City"), Some("New York".to_string()));
+        assert_eq!(remove_location_keywords("Kansas City"), Some("Kansas".to_string()));
+        assert_eq!(remove_location_keywords("Greenwich Village"), Some("Greenwich".to_string()));
+        assert_eq!(remove_location_keywords("Hotel de Ville"), Some("Hotel de".to_string())); // ville is a separate word
+        assert_eq!(remove_location_keywords("Nashville"), None); // "ville" usage as suffix
+        assert_eq!(remove_location_keywords("City"), None); // Empty result
+        assert_eq!(remove_location_keywords("London"), None); // No keywords
+        assert_eq!(remove_location_keywords("The City of London"), Some("The of London".to_string()));
     }
 }
