@@ -114,6 +114,10 @@ pub struct AdminArea {
     /// Abbreviation (e.g., "CH" for Switzerland)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub abbr: Option<String>,
+
+    /// ISO Country Code (e.g., "CA" from "CA-ON")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iso_country_code: Option<String>,
 }
 
 impl AdminArea {
@@ -125,6 +129,7 @@ impl AdminArea {
             name: HashMap::new(),
             bbox: None,
             abbr: None,
+            iso_country_code: None,
         }
     }
 

@@ -191,8 +191,6 @@ pub async fn execute_search_v2(
     })
 }
 
-
-
 async fn execute_search_internal_wrapper(
     client: &EsClient,
     scylla_client: &ScyllaClient,
@@ -203,7 +201,10 @@ async fn execute_search_internal_wrapper(
         let mut modified_params = params.clone();
         modified_params.text = modified_text;
 
-        debug!("Detected location keywords. Running parallel search: '{}' and '{}'", params.text, modified_params.text);
+        debug!(
+            "Detected location keywords. Running parallel search: '{}' and '{}'",
+            params.text, modified_params.text
+        );
 
         let (res_orig, res_mod) = futures::future::join(
             execute_search_internal(client, scylla_client, params, autocomplete),
@@ -231,7 +232,7 @@ async fn execute_search_internal_wrapper(
 fn remove_location_keywords(text: &str) -> Option<String> {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| Regex::new(r"(?i)\b(City|Village|ville)\b").unwrap());
-    
+
     if re.is_match(text) {
         let replaced = re.replace_all(text, "");
         let cleaned: String = replaced.split_whitespace().collect::<Vec<&str>>().join(" ");
@@ -250,13 +251,13 @@ fn merge_internal_results(
     r2: InternalTimedResults,
 ) -> InternalTimedResults {
     let mut map = HashMap::new();
-    
+
     // Process r1
     for item in r1.places {
         // item.0 is NormalizedPlace, item.0.source_id is the ID
         map.insert(item.0.source_id.clone(), item);
     }
-    
+
     // Process r2
     for item in r2.places {
         let id = item.0.source_id.clone();
@@ -272,11 +273,11 @@ fn merge_internal_results(
             }
         }
     }
-    
+
     let mut places: Vec<_> = map.into_values().collect();
     // Sort by score descending
     places.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    
+
     InternalTimedResults {
         places,
         es_took_ms: std::cmp::max(r1.es_took_ms, r2.es_took_ms),
@@ -1050,13 +1051,28 @@ mod tests {
     }
     #[test]
     fn test_remove_location_keywords() {
-        assert_eq!(remove_location_keywords("New York City"), Some("New York".to_string()));
-        assert_eq!(remove_location_keywords("Kansas City"), Some("Kansas".to_string()));
-        assert_eq!(remove_location_keywords("Greenwich Village"), Some("Greenwich".to_string()));
-        assert_eq!(remove_location_keywords("Hotel de Ville"), Some("Hotel de".to_string())); // ville is a separate word
+        assert_eq!(
+            remove_location_keywords("New York City"),
+            Some("New York".to_string())
+        );
+        assert_eq!(
+            remove_location_keywords("Kansas City"),
+            Some("Kansas".to_string())
+        );
+        assert_eq!(
+            remove_location_keywords("Greenwich Village"),
+            Some("Greenwich".to_string())
+        );
+        assert_eq!(
+            remove_location_keywords("Hotel de Ville"),
+            Some("Hotel de".to_string())
+        ); // ville is a separate word
         assert_eq!(remove_location_keywords("Nashville"), None); // "ville" usage as suffix
         assert_eq!(remove_location_keywords("City"), None); // Empty result
         assert_eq!(remove_location_keywords("London"), None); // No keywords
-        assert_eq!(remove_location_keywords("The City of London"), Some("The of London".to_string()));
+        assert_eq!(
+            remove_location_keywords("The City of London"),
+            Some("The of London".to_string())
+        );
     }
 }

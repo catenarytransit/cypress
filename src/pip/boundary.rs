@@ -102,6 +102,20 @@ pub fn extract_admin_boundaries<R: std::io::Read + std::io::Seek>(
             } else if key == "short_name" || key == "ISO3166-1:alpha2" || key == "ISO3166-1:alpha3"
             {
                 area.abbr = Some(value.to_string());
+                // Also populate iso_country_code if it's an alpha2 tag
+                if key == "ISO3166-1:alpha2" {
+                    area.iso_country_code = Some(value.to_string());
+                }
+            } else if key == "ISO3166-1" {
+                // Often ISO3166-1 is the 2-letter code
+                if value.len() == 2 {
+                    area.iso_country_code = Some(value.to_string());
+                }
+            } else if key == "ISO3166-2" {
+                // Parse country code from "CA-ON" -> "CA"
+                if let Some((country, _)) = value.split_once('-') {
+                    area.iso_country_code = Some(country.to_string());
+                }
             } else if key == "wikidata" {
                 area.wikidata_id = Some(value.to_string());
             }
