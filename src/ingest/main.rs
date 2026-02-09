@@ -486,8 +486,7 @@ pub async fn run_single(args: Args, synonyms: Arc<SynonymService>) -> Result<()>
                     // This ensures the official name in Scylla is the original one
                     let merge_key = if let Some(name) = way.tags.get("name") {
                         if let Some(highway) = way.tags.get("highway") {
-                            let normalized = synonyms.normalize(name);
-                            Some(format!("{}|{}", normalized, highway))
+                            Some(format!("{}|{}", name, highway))
                         } else {
                             None
                         }
@@ -507,7 +506,7 @@ pub async fn run_single(args: Args, synonyms: Arc<SynonymService>) -> Result<()>
         }
 
         // Try to extract a place from this object (non-roads or when merging disabled)
-        if let Some(mut place) = extract_place(&obj, &source_file, &place_resolver, &synonyms)? {
+        if let Some(mut place) = extract_place(&obj, &source_file, &place_resolver)? {
             // PIP lookup for admin hierarchy
             let hierarchy =
                 pip_service.lookup(place.center_point.lon, place.center_point.lat, None);
@@ -546,7 +545,7 @@ pub async fn run_single(args: Args, synonyms: Arc<SynonymService>) -> Result<()>
         for merged_road in merged_roads {
             if let Some(mut place) = merged_road.to_place(&source_file) {
                 // Extract tags
-                extract_tags(&mut place, &merged_road.tags, &synonyms);
+                extract_tags(&mut place, &merged_road.tags);
 
                 // Filter out items without name or address
                 if place.name.is_empty() && place.address.is_none() {
@@ -736,7 +735,6 @@ fn extract_place(
     obj: &osmpbfreader::OsmObj,
     source_file: &str,
     resolver: &Arc<GeometryResolver>,
-    synonyms: &SynonymService,
 ) -> Result<Option<Place>> {
     use osmpbfreader::OsmObj;
 
@@ -754,7 +752,7 @@ fn extract_place(
                 };
                 let mut place = Place::new(OsmType::Node, node.id.0, layer, center, source_file);
                 place.importance = Some(calculate_default_importance(&node.tags));
-                extract_tags(&mut place, &node.tags, synonyms);
+                extract_tags(&mut place, &node.tags);
 
                 // Filter out items without name or address
                 if place.name.is_empty() && place.address.is_none() {
@@ -794,7 +792,7 @@ fn extract_place(
                     let center = GeoPoint { lat, lon };
                     let mut place = Place::new(OsmType::Way, way.id.0, layer, center, source_file);
                     place.importance = Some(calculate_default_importance(&way.tags));
-                    extract_tags(&mut place, &way.tags, synonyms);
+                    extract_tags(&mut place, &way.tags);
 
                     // Filter out items without name or address
                     if place.name.is_empty() && place.address.is_none() {
@@ -855,7 +853,7 @@ fn extract_place(
                         let mut place =
                             Place::new(OsmType::Relation, rel.id.0, layer, center, source_file);
                         place.importance = Some(calculate_default_importance(&rel.tags));
-                        extract_tags(&mut place, &rel.tags, synonyms);
+                        extract_tags(&mut place, &rel.tags);
 
                         // Filter out items without name or address
                         if place.name.is_empty() && place.address.is_none() {
@@ -889,20 +887,13 @@ fn extract_place(
 // Skipping determine_layer...
 
 /// Extract all relevant tags from OSM object
-fn extract_tags(place: &mut Place, tags: &osmpbfreader::Tags, synonyms: &SynonymService) {
+fn extract_tags(place: &mut Place, tags: &osmpbfreader::Tags) {
     for (key, value) in tags.iter() {
         let key_str = key.as_str();
 
         // Names
         if key_str == "name" {
-            // Keep original name as default
             place.add_name("default", value.to_string());
-
-            // Add normalized version to synonyms if different
-            let normalized = synonyms.normalize(value);
-            if normalized != *value {
-                place.synonyms.push(normalized);
-            }
         } else if let Some(lang) = key_str.strip_prefix("name:") {
             if is_valid_lang_code(lang) {
                 place.add_name(lang, value.to_string());
@@ -947,13 +938,11 @@ fn extract_tags(place: &mut Place, tags: &osmpbfreader::Tags, synonyms: &Synonym
                 .get_or_insert_with(Address::default)
                 .housenumber = Some(value.to_string());
         } else if key_str == "addr:street" {
-            place.address.get_or_insert_with(Address::default).street =
-                Some(synonyms.normalize(value));
+            place.address.get_or_insert_with(Address::default).street = Some(value.to_string());
         } else if key_str == "addr:postcode" {
             place.address.get_or_insert_with(Address::default).postcode = Some(value.to_string());
         } else if key_str == "addr:city" {
-            place.address.get_or_insert_with(Address::default).city =
-                Some(synonyms.normalize(value));
+            place.address.get_or_insert_with(Address::default).city = Some(value.to_string());
         }
         // Categories (POI types)
         else if [
