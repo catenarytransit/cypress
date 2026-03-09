@@ -52,7 +52,13 @@ impl WayMerger {
     }
 
     /// Add a road way to be considered for merging
-    pub fn add_road(&mut self, way_id: WayId, tags: Tags, nodes: Vec<i64>, merge_key: Option<String>) {
+    pub fn add_road(
+        &mut self,
+        way_id: WayId,
+        tags: Tags,
+        nodes: Vec<i64>,
+        merge_key: Option<String>,
+    ) {
         // Get the name for grouping
         let key = merge_key.or_else(|| Self::get_merge_key(&tags));
 

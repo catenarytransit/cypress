@@ -94,6 +94,7 @@ async fn main() -> Result<()> {
         .route("/v1/search", get(search_handler))
         .route("/v2/search", get(search_v2_handler))
         .route("/v1/reverse", get(reverse_handler))
+        .route("/v2/reverse", get(reverse_v2_handler))
         .route("/v1/autocomplete", get(autocomplete_handler))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
@@ -253,6 +254,36 @@ async fn reverse_handler(
     }))
 }
 
+/// Reverse geocoding V2
+async fn reverse_v2_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ReverseQueryParams>,
+) -> Result<Json<SearchResponseV2>, (StatusCode, String)> {
+    let results = search::execute_reverse_v2(
+        &state.es_client,
+        &state.scylla_client,
+        params.point_lon,
+        params.point_lat,
+        params.size.unwrap_or(10).min(40),
+        params
+            .layers
+            .as_ref()
+            .map(|l| l.split(',').map(String::from).collect()),
+        params.lang.clone(),
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!("Reverse geocoding V2 failed: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
+
+    Ok(Json(SearchResponseV2 {
+        features: results,
+        es_took_ms: 0,
+        scylla_took_ms: 0,
+    }))
+}
+
 #[derive(Deserialize)]
 struct SearchQueryParams {
     /// Search text
@@ -284,6 +315,8 @@ struct ReverseQueryParams {
     /// Point latitude
     #[serde(rename = "point.lat")]
     point_lat: f64,
+    /// Preferred language for results
+    lang: Option<String>,
     /// Filter by layers (comma-separated)
     layers: Option<String>,
     /// Number of results

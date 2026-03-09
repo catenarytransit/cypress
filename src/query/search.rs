@@ -547,6 +547,103 @@ pub async fn execute_reverse(
     Ok(results)
 }
 
+/// Execute a reverse geocoding search V2
+pub async fn execute_reverse_v2(
+    client: &EsClient,
+    scylla_client: &ScyllaClient,
+    lon: f64,
+    lat: f64,
+    size: usize,
+    layers: Option<Vec<String>>,
+    lang: Option<String>,
+) -> Result<Vec<SearchResultV2>> {
+    let mut bool_query = json!({
+        "must": {
+            "match_all": {}
+        }
+    });
+
+    if let Some(ref layers) = layers {
+        bool_query["filter"] = json!([{
+            "terms": { "layer": layers }
+        }]);
+    }
+
+    let body = json!({
+        "query": {
+            "bool": bool_query
+        },
+        "sort": [
+            {
+                "_geo_distance": {
+                    "center_point": { "lat": lat, "lon": lon },
+                    "order": "asc",
+                    "unit": "m"
+                }
+            }
+        ],
+        "size": size,
+        "stored_fields": ["_id"]
+    });
+
+    let response = client
+        .client()
+        .search(elasticsearch::SearchParts::Index(&[&client.index_name]))
+        .body(body)
+        .send()
+        .await?;
+
+    let response_body = response.json::<serde_json::Value>().await?;
+
+    let hits = response_body["hits"]["hits"]
+        .as_array()
+        .map(|a| a.to_vec())
+        .unwrap_or_default();
+
+    let mut places_to_fetch = Vec::new();
+
+    for hit in hits {
+        if let Some(id) = hit["_id"].as_str() {
+            places_to_fetch.push(id.to_string());
+        }
+    }
+
+    // Fetch from Scylla
+    let fetch_futures = places_to_fetch.iter().map(|id| scylla_client.get_place(id));
+    let mut normalized_places = Vec::new();
+    let mut admin_ids = std::collections::HashSet::new();
+
+    for fetch_result in futures::future::join_all(fetch_futures).await {
+        if let Ok(Some(json_data)) = fetch_result {
+            if let Ok(place) = serde_json::from_str::<NormalizedPlace>(&json_data) {
+                collect_admin_ids(&place, &mut admin_ids);
+                normalized_places.push(place);
+            }
+        }
+    }
+
+    // Batch fetch admin areas
+    let admin_ids_vec: Vec<String> = admin_ids.into_iter().collect();
+    let admin_map = scylla_client.get_admin_areas(&admin_ids_vec).await?;
+
+    let parsed_admin_map: HashMap<String, AdminEntry> = admin_map
+        .iter()
+        .filter_map(|(k, v)| {
+            serde_json::from_str::<cypress::models::admin::AdminEntryScylla>(v)
+                .ok()
+                .map(|scylla_entry| (k.clone(), AdminEntry::from_scylla(scylla_entry)))
+        })
+        .collect();
+
+    let mut results = Vec::new();
+    for place in normalized_places {
+        if let Some(result) = place_to_search_result_v2(place, 1.0, &lang, &parsed_admin_map) {
+            results.push(result);
+        }
+    }
+    Ok(results)
+}
+
 /// Parse an Elasticsearch hit into a SearchResult
 fn collect_admin_ids(place: &NormalizedPlace, ids: &mut std::collections::HashSet<String>) {
     if let Some(ref id) = place.parent.country {
