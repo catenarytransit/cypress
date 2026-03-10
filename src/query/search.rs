@@ -473,8 +473,21 @@ pub async fn execute_reverse(
     }
 
     let body = json!({
+        "track_total_hits": false,
         "query": {
-            "bool": bool_query
+            "bool": {
+                "filter": [
+                    {
+                        "geo_distance": {
+                            "distance": "1km",
+                            "center_point": { "lat": lat, "lon": lon }
+                        }
+                    },
+                    {
+                        "terms": { "layer": layers.unwrap_or(default_reverse_layers()) }
+                    }
+                ]
+            }
         },
         "sort": [
             {
