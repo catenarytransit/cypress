@@ -460,33 +460,24 @@ pub async fn execute_reverse(
     size: usize,
     layers: Option<Vec<String>>,
 ) -> Result<Vec<SearchResult>> {
-    let mut bool_query = json!({
-        "must": {
-            "match_all": {}
+    let mut filters = vec![json!({
+        "geo_distance": {
+            "distance": "1km",
+            "center_point": { "lat": lat, "lon": lon }
         }
-    });
+    })];
 
     if let Some(ref layers) = layers {
-        bool_query["filter"] = json!([{
+        filters.push(json!({
             "terms": { "layer": layers }
-        }]);
+        }));
     }
 
     let body = json!({
         "track_total_hits": false,
         "query": {
             "bool": {
-                "filter": [
-                    {
-                        "geo_distance": {
-                            "distance": "1km",
-                            "center_point": { "lat": lat, "lon": lon }
-                        }
-                    },
-                    {
-                        "terms": { "layer": layers.unwrap_or(default_reverse_layers()) }
-                    }
-                ]
+                "filter": filters
             }
         },
         "sort": [
@@ -524,7 +515,6 @@ pub async fn execute_reverse(
         }
     }
 
-    // Fetch from Scylla
     let fetch_futures = places_to_fetch.iter().map(|id| scylla_client.get_place(id));
     let mut normalized_places = Vec::new();
     let mut admin_ids = std::collections::HashSet::new();
@@ -538,7 +528,6 @@ pub async fn execute_reverse(
         }
     }
 
-    // Batch fetch admin areas
     let admin_ids_vec: Vec<String> = admin_ids.into_iter().collect();
     let admin_map = scylla_client.get_admin_areas(&admin_ids_vec).await?;
 
@@ -557,6 +546,7 @@ pub async fn execute_reverse(
             results.push(result);
         }
     }
+
     Ok(results)
 }
 
@@ -570,21 +560,25 @@ pub async fn execute_reverse_v2(
     layers: Option<Vec<String>>,
     lang: Option<String>,
 ) -> Result<Vec<SearchResultV2>> {
-    let mut bool_query = json!({
-        "must": {
-            "match_all": {}
+    let mut filters = vec![json!({
+        "geo_distance": {
+            "distance": "1km",
+            "center_point": { "lat": lat, "lon": lon }
         }
-    });
+    })];
 
     if let Some(ref layers) = layers {
-        bool_query["filter"] = json!([{
+        filters.push(json!({
             "terms": { "layer": layers }
-        }]);
+        }));
     }
 
     let body = json!({
+        "track_total_hits": false,
         "query": {
-            "bool": bool_query
+            "bool": {
+                "filter": filters
+            }
         },
         "sort": [
             {
@@ -621,7 +615,6 @@ pub async fn execute_reverse_v2(
         }
     }
 
-    // Fetch from Scylla
     let fetch_futures = places_to_fetch.iter().map(|id| scylla_client.get_place(id));
     let mut normalized_places = Vec::new();
     let mut admin_ids = std::collections::HashSet::new();
@@ -635,7 +628,6 @@ pub async fn execute_reverse_v2(
         }
     }
 
-    // Batch fetch admin areas
     let admin_ids_vec: Vec<String> = admin_ids.into_iter().collect();
     let admin_map = scylla_client.get_admin_areas(&admin_ids_vec).await?;
 
@@ -654,6 +646,7 @@ pub async fn execute_reverse_v2(
             results.push(result);
         }
     }
+
     Ok(results)
 }
 
