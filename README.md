@@ -1,6 +1,11 @@
 # Cypress
 
-A Rust-based geocoding system with Elasticsearch, inspired by [Pelias](https://pelias.io/) and [Nominatim](https://nominatim.org/).
+A Rust-based geocoding system with Scylla and in-memory graphs
+
+## Citations
+- [Pelias](https://pelias.io/)
+- [Nominatim](https://nominatim.org/).
+- [Motis](https://github.com/motis-project/motis)
 
 ![1200x680](https://github.com/user-attachments/assets/496f0dba-7e6d-4b50-90cc-744f21909ece)
 
@@ -10,7 +15,7 @@ A Rust-based geocoding system with Elasticsearch, inspired by [Pelias](https://p
 - **OSM PBF Ingestion** - Parses OpenStreetMap data with multilingual name support
 - **Road Way Merging** - Automatically merges adjacent road segments with the same name to reduce disk space usage
 - **Point-in-Polygon Admin Lookup** - Assigns administrative hierarchy to each place using R-tree spatial indexing
-- **Elasticsearch Backend** - Full-text search with edge n-gram autocomplete
+- **In Memory Type-Ahead** - Full-text search with Finite State Transducer
 - **Wikidata Integration** - Enriches place names with multilingual labels from Wikidata
 - **Location & Bounding Box Bias** - Boost results near user's location or viewport
 - **Data Refresh** - Re-import files with automatic stale document cleanup
@@ -60,10 +65,21 @@ cargo run --release --bin ingest -- single \
   --refresh
 ```
 
-### 4. Start Query Server
+### 4. Compile Data
+
+```bash
+cargo run --release --bin compile -- \
+  --scylla-url 127.0.0.1
+  --out-dir ./compiled_data
+```
+
+### 5. Start Query Server
+
+The Memdb dir must be the same as the outdir from the compiled data step!
 
 ```bash
 cargo run --release --bin query -- --listen 0.0.0.0:3000
+  --memdb-dir ./compiled_data
 ```
 
 ## Data Management
