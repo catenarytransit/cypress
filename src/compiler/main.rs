@@ -73,6 +73,7 @@ async fn main() -> Result<()> {
             name: [0; 128],
             lat: place.center_point.lat as f32,
             lon: place.center_point.lon as f32,
+            importance: place.importance.unwrap_or(0.0) as f32,
         };
 
         // Copy source ID bytes

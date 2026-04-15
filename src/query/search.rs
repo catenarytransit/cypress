@@ -881,7 +881,7 @@ fn build_search_query(params: &SearchParams, autocomplete: bool) -> serde_json::
     })
 }
 
-fn haversine_distance_km(p1: (f64, f64), p2: (f64, f64)) -> f64 {
+pub fn haversine_distance_km(p1: (f64, f64), p2: (f64, f64)) -> f64 {
     let (lat1, lon1) = p1;
     let (lat2, lon2) = p2;
 

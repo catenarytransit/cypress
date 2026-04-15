@@ -188,14 +188,31 @@ async fn autocomplete_handler(
         let prefix = fst::automaton::Str::new(&text).starts_with();
         let mut stream = memdb_data.map.search(prefix).into_stream();
 
-        // Take top N
         let size = params.size.unwrap_or(10).min(20);
 
         use fst::Streamer;
+        
+        struct ScoredFeature {
+            feature: AutocompleteFeature,
+            score: f64,
+        }
+        
+        let mut scored_features = Vec::with_capacity(size);
+        let mut count = 0;
+        
+        let focus_point = if let (Some(lat), Some(lon)) = (params.focus_point_lat, params.focus_point_lon) {
+            Some((lat, lon))
+        } else {
+            None
+        };
+        let weight = params.focus_point_weight.unwrap_or(3.0);
+
         while let Some((_key, idx)) = stream.next() {
-            if features.len() >= size {
+            if count >= 5000 {
                 break;
             }
+            count += 1;
+
             if let Some(summary) = state.memdb.get_summary(idx) {
                 // parse zero-padded strings
                 let parse_str = |b: &[u8]| {
@@ -203,19 +220,43 @@ async fn autocomplete_handler(
                     String::from_utf8_lossy(&b[..end]).into_owned()
                 };
 
-                features.push(AutocompleteFeature {
-                    result_type: "Feature".to_string(),
-                    geometry: search::Geometry {
-                        geo_type: "Point".to_string(),
-                        coordinates: [summary.lon as f64, summary.lat as f64],
+                let phrase_len = _key.iter().position(|&b| b == 0).unwrap_or(_key.len());
+                let token_completeness = if phrase_len > 0 {
+                    ((text.len() as f64) / (phrase_len as f64)).min(1.0)
+                } else {
+                    1.0
+                };
+                
+                let importance = summary.importance as f64;
+                
+                let decay = if let Some(focus) = focus_point {
+                    let distance_km = search::haversine_distance_km(focus, (summary.lat as f64, summary.lon as f64));
+                    (-(distance_km * distance_km) / (2.0 * weight * weight)).exp()
+                } else {
+                    1.0
+                };
+                
+                let final_score = token_completeness * importance * decay;
+
+                scored_features.push(ScoredFeature {
+                    feature: AutocompleteFeature {
+                        result_type: "Feature".to_string(),
+                        geometry: search::Geometry {
+                            geo_type: "Point".to_string(),
+                            coordinates: [summary.lon as f64, summary.lat as f64],
+                        },
+                        properties: AutocompleteProperties {
+                            id: parse_str(&summary.source_id),
+                            name: parse_str(&summary.name),
+                        },
                     },
-                    properties: AutocompleteProperties {
-                        id: parse_str(&summary.source_id),
-                        name: parse_str(&summary.name),
-                    },
+                    score: final_score,
                 });
             }
         }
+
+        scored_features.sort_unstable_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        features = scored_features.into_iter().take(size).map(|sf| sf.feature).collect();
     }
 
     Ok(Json(AutocompleteResponse {

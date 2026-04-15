@@ -17,6 +17,8 @@ pub struct PlaceSummary {
     pub lat: f32,
     /// Center longitude
     pub lon: f32,
+    /// Static importance score (0.0 to 1.0)
+    pub importance: f32,
 }
 
 /// Type of OSM object
