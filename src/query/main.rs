@@ -191,20 +191,21 @@ async fn autocomplete_handler(
         let size = params.size.unwrap_or(10).min(20);
 
         use fst::Streamer;
-        
+
         struct ScoredFeature {
             feature: AutocompleteFeature,
             score: f64,
         }
-        
+
         let mut scored_features = Vec::with_capacity(size);
         let mut count = 0;
-        
-        let focus_point = if let (Some(lat), Some(lon)) = (params.focus_point_lat, params.focus_point_lon) {
-            Some((lat, lon))
-        } else {
-            None
-        };
+
+        let focus_point =
+            if let (Some(lat), Some(lon)) = (params.focus_point_lat, params.focus_point_lon) {
+                Some((lat, lon))
+            } else {
+                None
+            };
         let weight = params.focus_point_weight.unwrap_or(3.0);
 
         while let Some((_key, idx)) = stream.next() {
@@ -226,16 +227,19 @@ async fn autocomplete_handler(
                 } else {
                     1.0
                 };
-                
+
                 let importance = summary.importance as f64;
-                
+
                 let decay = if let Some(focus) = focus_point {
-                    let distance_km = search::haversine_distance_km(focus, (summary.lat as f64, summary.lon as f64));
+                    let distance_km = search::haversine_distance_km(
+                        focus,
+                        (summary.lat as f64, summary.lon as f64),
+                    );
                     (-(distance_km * distance_km) / (2.0 * weight * weight)).exp()
                 } else {
                     1.0
                 };
-                
+
                 let final_score = token_completeness * importance * decay;
 
                 scored_features.push(ScoredFeature {
@@ -255,8 +259,16 @@ async fn autocomplete_handler(
             }
         }
 
-        scored_features.sort_unstable_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-        features = scored_features.into_iter().take(size).map(|sf| sf.feature).collect();
+        scored_features.sort_unstable_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        features = scored_features
+            .into_iter()
+            .take(size)
+            .map(|sf| sf.feature)
+            .collect();
     }
 
     Ok(Json(AutocompleteResponse {
