@@ -23,7 +23,9 @@ use tracing_subscriber::FmtSubscriber;
 use cypress::elasticsearch::EsClient;
 use cypress::scylla::ScyllaClient;
 
+mod memdb;
 mod search;
+use memdb::Memdb;
 use search::{execute_search, execute_search_v2, SearchParams, SearchResult, SearchResultV2};
 
 #[derive(Parser, Debug)]
@@ -45,12 +47,17 @@ struct Args {
     /// ScyllaDB URL
     #[arg(long, default_value = "127.0.0.1")]
     scylla_url: String,
+
+    /// Directory containing FST and memory-mapped files compiled by 'compiler'
+    #[arg(long, default_value = "./data/compiled")]
+    memdb_dir: String,
 }
 
 /// Application state shared across handlers
 struct AppState {
     es_client: EsClient,
     scylla_client: ScyllaClient,
+    memdb: Arc<Memdb>,
 }
 
 #[tokio::main]
@@ -83,9 +90,13 @@ async fn main() -> Result<()> {
     info!("Connecting to ScyllaDB at {}", args.scylla_url);
     let scylla_client = ScyllaClient::new(&args.scylla_url).await?;
 
+    info!("Initializing MemDB from {}", args.memdb_dir);
+    let memdb = Memdb::new(&args.memdb_dir)?;
+
     let state = Arc::new(AppState {
         es_client,
         scylla_client,
+        memdb,
     });
 
     // Build router
@@ -96,6 +107,7 @@ async fn main() -> Result<()> {
         .route("/v1/reverse", get(reverse_handler))
         .route("/v2/reverse", get(reverse_v2_handler))
         .route("/v1/autocomplete", get(autocomplete_handler))
+        .route("/v1/place/details", get(place_details_handler))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -159,37 +171,107 @@ async fn search_handler(
     }))
 }
 
-/// Autocomplete endpoint (uses edge n-grams)
+/// Autocomplete endpoint (Tier 1 Hot Path)
 async fn autocomplete_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<SearchQueryParams>,
-) -> Result<Json<SearchResponse>, (StatusCode, String)> {
-    let search_params = SearchParams {
-        text: params.text.clone(),
-        lang: params.lang.clone(),
-        bbox: parse_bbox(&params.bbox),
-        focus_lat: params.focus_point_lat,
-        focus_lon: params.focus_point_lon,
-        focus_weight: params.focus_point_weight,
-        layers: params
-            .layers
-            .as_ref()
-            .map(|l| l.split(',').map(String::from).collect()),
-        size: params.size.unwrap_or(10).min(20),
-    };
+) -> Result<Json<AutocompleteResponse>, (StatusCode, String)> {
+    let start = std::time::Instant::now();
+    let text = params.text.to_lowercase();
 
-    let results = execute_search(&state.es_client, &state.scylla_client, search_params, true)
+    let mut features = Vec::new();
+
+    if !text.is_empty() {
+        let memdb_data = state.memdb.get_data();
+
+        use fst::{Automaton, IntoStreamer};
+        let prefix = fst::automaton::Str::new(&text).starts_with();
+        let mut stream = memdb_data.map.search(prefix).into_stream();
+
+        // Take top N
+        let size = params.size.unwrap_or(10).min(20);
+
+        use fst::Streamer;
+        while let Some((_key, idx)) = stream.next() {
+            if features.len() >= size {
+                break;
+            }
+            if let Some(summary) = state.memdb.get_summary(idx) {
+                // parse zero-padded strings
+                let parse_str = |b: &[u8]| {
+                    let end = b.iter().position(|&x| x == 0).unwrap_or(b.len());
+                    String::from_utf8_lossy(&b[..end]).into_owned()
+                };
+
+                features.push(AutocompleteFeature {
+                    result_type: "Feature".to_string(),
+                    geometry: search::Geometry {
+                        geo_type: "Point".to_string(),
+                        coordinates: [summary.lon as f64, summary.lat as f64],
+                    },
+                    properties: AutocompleteProperties {
+                        id: parse_str(&summary.source_id),
+                        name: parse_str(&summary.name),
+                    },
+                });
+            }
+        }
+    }
+
+    Ok(Json(AutocompleteResponse {
+        features,
+        memdb_took_ms: start.elapsed().as_millis(),
+    }))
+}
+
+#[derive(Serialize)]
+struct AutocompleteResponse {
+    features: Vec<AutocompleteFeature>,
+    memdb_took_ms: u128,
+}
+
+#[derive(Serialize)]
+struct AutocompleteFeature {
+    #[serde(rename = "type")]
+    result_type: String,
+    geometry: search::Geometry,
+    properties: AutocompleteProperties,
+}
+
+#[derive(Serialize)]
+struct AutocompleteProperties {
+    id: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct PlaceDetailsQueryParams {
+    id: String,
+}
+
+async fn place_details_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<PlaceDetailsQueryParams>,
+) -> Result<axum::response::Response, StatusCode> {
+    let place_json = state
+        .scylla_client
+        .get_place(&params.id)
         .await
         .map_err(|e| {
-            tracing::error!("Autocomplete execution failed: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            tracing::error!("ScyllaDB query failed: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    Ok(Json(SearchResponse {
-        features: results.results,
-        es_took_ms: results.es_took_ms,
-        scylla_took_ms: results.scylla_took_ms,
-    }))
+    match place_json {
+        Some(json_data) => {
+            // Forward the raw JSON response directly from Scylla for maximum speed
+            Ok(axum::response::Response::builder()
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(json_data))
+                .unwrap())
+        }
+        None => Err(StatusCode::NOT_FOUND),
+    }
 }
 
 /// Forward geocoding search V2

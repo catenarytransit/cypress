@@ -1,14 +1,13 @@
 use anyhow::{Context, Result};
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
-// use scylla::IntoTypedRows; - Removed broken import
 use scylla::response::query_result::QueryResult;
 use std::sync::Arc;
 use tracing::info;
 
 #[derive(Clone)]
 pub struct ScyllaClient {
-    session: Arc<Session>,
+    pub session: Arc<Session>,
 }
 
 impl ScyllaClient {

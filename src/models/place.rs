@@ -6,6 +6,19 @@ use std::collections::HashMap;
 
 use super::AdminHierarchy;
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod, Debug)]
+pub struct PlaceSummary {
+    /// Source ID (max 64 bytes)
+    pub source_id: [u8; 64],
+    /// Display name (max 128 bytes)
+    pub name: [u8; 128],
+    /// Center latitude
+    pub lat: f32,
+    /// Center longitude
+    pub lon: f32,
+}
+
 /// Type of OSM object
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -254,6 +267,7 @@ impl Place {
         for syn in &self.synonyms {
             all_names.insert(syn.clone());
         }
+
         let mut sorted_names: Vec<_> = all_names.into_iter().collect();
         sorted_names.sort();
         self.name_all = sorted_names.join(" ");
