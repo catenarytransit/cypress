@@ -68,7 +68,7 @@ cargo run --release --bin ingest -- single \
 ### 4. Compile Data
 
 ```bash
-cargo run --release --bin compile -- \
+cargo run --release --bin compiler -- \
   --scylla-url 127.0.0.1
   --out-dir ./compiled_data
 ```
