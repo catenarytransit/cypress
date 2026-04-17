@@ -465,6 +465,14 @@ async fn main() -> Result<()> {
 
     info!("Processing places for spatial index");
     let mut cell_pairs = Vec::with_capacity(total_places as usize);
+    let mut place_latitudes = Vec::with_capacity(total_places as usize);
+    let mut place_longitudes = Vec::with_capacity(total_places as usize);
+    let mut place_importances = Vec::with_capacity(total_places as usize);
+    let mut place_source_id_offsets = Vec::with_capacity(total_places as usize + 1);
+    let mut place_source_id_bytes = Vec::new();
+
+    place_source_id_offsets.push(0);
+
     for (idx, chunk) in places_mmap
         .chunks_exact(PLACE_RECORD_DISK_BYTES)
         .enumerate()
@@ -473,6 +481,14 @@ async fn main() -> Result<()> {
         let place_id = idx as u32;
         let cell_id = CypressMemDb::coord_to_cell(place.lat, place.lon);
         cell_pairs.push((cell_id, place_id));
+
+        place_latitudes.push(place.lat);
+        place_longitudes.push(place.lon);
+        place_importances.push(place.importance);
+
+        let id_bytes = &place.source_id_bytes[..place.source_id_len as usize];
+        place_source_id_bytes.extend_from_slice(id_bytes);
+        place_source_id_offsets.push(place_source_id_bytes.len() as u32);
     }
 
     info!(
@@ -673,6 +689,11 @@ async fn main() -> Result<()> {
         bigram_data,
         string_to_places_offsets,
         string_to_places_data,
+        place_latitudes,
+        place_longitudes,
+        place_importances,
+        place_source_id_offsets,
+        place_source_id_bytes,
         active_cells,
         cell_offsets,
         cell_places,

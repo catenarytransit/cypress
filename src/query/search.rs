@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, warn};
 
-use cypress::models::memdb::{CypressMemDb, PLACE_RECORD_DISK_BYTES};
+use cypress::models::memdb::CypressMemDb;
 use cypress::models::normalized::NormalizedPlace;
 use cypress::models::place::Layer;
 use cypress::models::AdminEntry;
@@ -124,12 +124,11 @@ pub struct TimedSearchResultsV2 {
 
 const COS_SIM_CUTOFF: f32 = 0.17;
 const MAX_STRING_MATCHES: usize = 6000;
+const MAX_SCORED_MATCHES: usize = 10_000;
 const FOCUS_RESCORE_MULTIPLIER: usize = 20;
 const FOCUS_RESCORE_FLOOR: usize = 200;
 const SLOW_PHASE_WARN_MS: u128 = 250;
 const SLOW_SEARCH_WARN_MS: u128 = 1000;
-const MAX_IMPORTANCE_BOOST: f64 = 11.0;
-const MAX_CACHEABLE_SPARSE_COUNTS: usize = 250_000;
 
 fn log_phase_timing(op: &str, phase: &str, phase_started: Instant) {
     let elapsed_ms = phase_started.elapsed().as_millis();
@@ -202,7 +201,7 @@ pub fn search_place_ids(
     let memdb_data = memdb.get_data();
     let db = memdb_data.get_archived();
     let string_count = db.string_bigram_counts.len();
-    let place_count = memdb_data.places_mmap.len() / PLACE_RECORD_DISK_BYTES;
+    let place_count = db.place_latitudes.len();
     let safe_focus_weight = focus_weight.max(0.001);
 
     let mut results = Vec::<(u32, f64)>::new();
@@ -235,9 +234,18 @@ pub fn search_place_ids(
         let mut missing_bigrams = Vec::new();
 
         let phase_started = Instant::now();
-        let mut current_counts =
-            ctx.query_cache
-                .get_closest_dense(&query_bigrams, &mut missing_bigrams, string_count);
+        let cached_counts = ctx
+            .query_cache
+            .get_closest_dense_ref(&query_bigrams, &mut missing_bigrams);
+        if let Some(cached) = cached_counts {
+            if cached.len() == ctx.string_match_counts.len() {
+                ctx.string_match_counts.copy_from_slice(cached.as_slice());
+            } else {
+                ctx.string_match_counts.fill(0);
+            }
+        } else {
+            ctx.string_match_counts.fill(0);
+        }
         let missing_bigram_count = missing_bigrams.len();
         log_phase_timing("search_place_ids", "cache_lookup_restore", phase_started);
         debug!(
@@ -255,22 +263,22 @@ pub fn search_place_ids(
 
             for i in start..end {
                 let string_idx = db.bigram_data[i] as usize;
-                if let Some(val) = current_counts.get_mut(string_idx) {
-                    *val = val.saturating_add(1);
-                }
+                ctx.string_match_counts[string_idx] =
+                    ctx.string_match_counts[string_idx].saturating_add(1);
             }
         }
         log_phase_timing("search_place_ids", "expand_missing_bigrams", phase_started);
 
         let phase_started = Instant::now();
         if !ctx.query_cache.has_exact(&query_bigrams) {
-            ctx.query_cache
-                .put_dense(&query_bigrams, Arc::new(current_counts.clone()));
+            let dense_counts = Arc::new(ctx.string_match_counts.clone());
+            ctx.query_cache.put_dense(&query_bigrams, dense_counts);
         }
         log_phase_timing("search_place_ids", "cache_store_counts", phase_started);
 
         let phase_started = Instant::now();
-        for (string_idx, &match_count) in current_counts.iter().enumerate() {
+        for string_idx in 0..ctx.string_match_counts.len() {
+            let match_count = ctx.string_match_counts[string_idx];
             if (match_count as u16) < min_match_count {
                 continue;
             }
@@ -328,7 +336,6 @@ pub fn search_place_ids(
             let sid = string_idx as usize;
             let p_start = db.string_to_places_offsets[sid] as usize;
             let p_end = db.string_to_places_offsets[sid + 1] as usize;
-            let max_possible_score = (cos_sim as f64) * MAX_IMPORTANCE_BOOST;
 
             for i in p_start..p_end {
                 let place_id = db.string_to_places_data[i];
@@ -342,35 +349,23 @@ pub fn search_place_ids(
                 } else {
                     f32::NEG_INFINITY
                 };
-                if max_possible_score <= current_best as f64 {
+                if cos_sim <= current_best {
                     continue;
                 }
 
-                let Some((lat, lon, importance)) = memdb_data.get_place_scoring_fields(place_idx)
-                else {
-                    continue;
-                };
-
-                let lat = lat as f64;
-                let lon = lon as f64;
-
-                if let Some(bb) = bbox {
-                    if lon < bb[0] || lat < bb[1] || lon > bb[2] || lat > bb[3] {
-                        continue;
-                    }
+                if ctx.place_score_epochs[place_idx] != query_epoch {
+                    ctx.place_score_epochs[place_idx] = query_epoch;
+                    ctx.touched_place_indices.push(place_id);
                 }
 
-                let base_score = (cos_sim as f64) * (1.0 + (importance as f64) * 10.0);
-                if base_score > current_best as f64 {
-                    if ctx.place_score_epochs[place_idx] != query_epoch {
-                        ctx.place_score_epochs[place_idx] = query_epoch;
-                        ctx.touched_place_indices.push(place_id);
-                    }
-                    ctx.place_best_scores[place_idx] = base_score as f32;
-                }
+                ctx.place_best_scores[place_idx] = cos_sim;
             }
         }
-        log_phase_timing("search_place_ids", "score_places_with_bbox", phase_started);
+        log_phase_timing(
+            "search_place_ids",
+            "accumulate_base_place_scores",
+            phase_started,
+        );
 
         let phase_started = Instant::now();
         results = ctx
@@ -378,51 +373,72 @@ pub fn search_place_ids(
             .iter()
             .map(|&place_id| (place_id, ctx.place_best_scores[place_id as usize] as f64))
             .collect();
-
-        if let Some(focus_point) = focus {
-            let limit = results.len().min(
-                max_results
-                    .saturating_mul(FOCUS_RESCORE_MULTIPLIER)
-                    .max(FOCUS_RESCORE_FLOOR),
-            );
-            if results.len() > limit {
-                results.select_nth_unstable_by(limit, |a, b| {
-                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-                });
-                results.truncate(limit);
-            }
-
-            for (place_id, score) in &mut results {
-                let Some((lat, lon, _)) = memdb_data.get_place_scoring_fields(*place_id as usize)
-                else {
-                    continue;
-                };
-                let dist = haversine_distance_km(focus_point, (lat as f64, lon as f64));
-                let decay = (-(dist * dist) / (2.0 * safe_focus_weight * safe_focus_weight)).exp();
-                *score *= decay;
-            }
-
-            results.sort_unstable_by(|a, b| {
+        if results.len() > MAX_SCORED_MATCHES {
+            results.select_nth_unstable_by(MAX_SCORED_MATCHES, |a, b| {
                 b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
             });
-        } else {
-            if results.len() > max_results {
-                results.select_nth_unstable_by(max_results, |a, b| {
-                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-                });
-                results.truncate(max_results);
-            }
-            results.sort_unstable_by(|a, b| {
-                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-            });
+            results.truncate(MAX_SCORED_MATCHES);
         }
-
-        results.truncate(max_results);
         log_phase_timing(
             "search_place_ids",
-            "final_sort_focus_truncate",
+            "truncate_base_candidates",
             phase_started,
         );
+
+        let phase_started = Instant::now();
+        let mut rescored = Vec::with_capacity(results.len());
+        for (place_id, base_cos) in results.drain(..) {
+            let place_idx = place_id as usize;
+            if place_idx >= place_count {
+                continue;
+            }
+
+            let lat = db.place_latitudes[place_idx] as f64;
+            let lon = db.place_longitudes[place_idx] as f64;
+            let importance = db.place_importances[place_idx] as f64;
+
+            if let Some(bb) = bbox {
+                if lon < bb[0] || lat < bb[1] || lon > bb[2] || lat > bb[3] {
+                    continue;
+                }
+            }
+
+            let mut score = base_cos * (1.0 + importance * 10.0);
+            if let Some(focus_point) = focus {
+                let dist = haversine_distance_km(focus_point, (lat, lon));
+                let decay = (-(dist * dist) / (2.0 * safe_focus_weight * safe_focus_weight)).exp();
+                score *= decay;
+            }
+
+            rescored.push((place_id, score));
+        }
+        results = rescored;
+        log_phase_timing(
+            "search_place_ids",
+            "apply_geographic_scoring",
+            phase_started,
+        );
+
+        let phase_started = Instant::now();
+        let final_limit = if focus.is_some() {
+            max_results
+                .saturating_mul(FOCUS_RESCORE_MULTIPLIER)
+                .max(FOCUS_RESCORE_FLOOR)
+                .min(MAX_SCORED_MATCHES)
+        } else {
+            max_results
+        };
+        if results.len() > final_limit {
+            results.select_nth_unstable_by(final_limit, |a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            results.truncate(final_limit);
+        }
+
+        results.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        results.truncate(max_results);
+        log_phase_timing("search_place_ids", "final_sort_truncate", phase_started);
     });
 
     log_total_timing("search_place_ids", total_started, results.len());
@@ -459,13 +475,9 @@ fn bigram_search(
     let phase_started = Instant::now();
     let mut results = Vec::with_capacity(scored_places.len());
     for (place_id, score) in scored_places {
-        let Some(place) = memdb_data.get_place(place_id as usize) else {
+        let Some(source_id) = memdb_data.get_place_source_id(place_id as usize) else {
             continue;
         };
-
-        let source_id =
-            String::from_utf8_lossy(&place.source_id_bytes[..place.source_id_len as usize])
-                .into_owned();
         results.push((source_id, score));
     }
     log_phase_timing("bigram_search", "resolve_source_ids", phase_started);
@@ -534,14 +546,15 @@ fn spatial_search_place_ids(
 
                 for i in start..end {
                     let place_id = db.cell_places[i];
-                    let Some((place_lat, place_lon, _)) =
-                        memdb_data.get_place_scoring_fields(place_id as usize)
-                    else {
+                    let place_idx = place_id as usize;
+                    if place_idx >= db.place_latitudes.len() {
                         continue;
-                    };
+                    }
 
-                    let dist =
-                        haversine_distance_km((lat, lon), (place_lat as f64, place_lon as f64));
+                    let place_lat = db.place_latitudes[place_idx] as f64;
+                    let place_lon = db.place_longitudes[place_idx] as f64;
+
+                    let dist = haversine_distance_km((lat, lon), (place_lat, place_lon));
                     if dist <= radius_km {
                         candidates.push((place_id, dist));
                     }
@@ -582,13 +595,9 @@ fn spatial_search(
     let phase_started = Instant::now();
     let mut resolved = Vec::with_capacity(nearby.len());
     for (place_id, dist) in nearby {
-        let Some(place) = memdb_data.get_place(place_id as usize) else {
+        let Some(source_id) = memdb_data.get_place_source_id(place_id as usize) else {
             continue;
         };
-
-        let source_id =
-            String::from_utf8_lossy(&place.source_id_bytes[..place.source_id_len as usize])
-                .into_owned();
         resolved.push((source_id, dist));
     }
     log_phase_timing("spatial_search", "resolve_source_ids", phase_started);

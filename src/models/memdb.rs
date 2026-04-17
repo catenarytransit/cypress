@@ -85,6 +85,15 @@ pub struct CypressMemDb {
     pub string_to_places_offsets: Vec<u32>,
     pub string_to_places_data: Vec<u32>,
 
+    // ==== Structure of Arrays (SoA) for Places ====
+    pub place_latitudes: Vec<f32>,
+    pub place_longitudes: Vec<f32>,
+    pub place_importances: Vec<f32>,
+
+    // For string IDs, use a contiguous byte array and parallel offset array
+    pub place_source_id_offsets: Vec<u32>,
+    pub place_source_id_bytes: Vec<u8>,
+
     // ==== Sparse Spatial Grid ====
     // Sorted array of cell IDs that contain at least one place
     pub active_cells: Vec<u32>,

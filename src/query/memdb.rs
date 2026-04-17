@@ -18,9 +18,6 @@ pub struct CosSimMatch {
 }
 
 const QUERY_CACHE_MAX_ENTRIES: usize = 128;
-const PLACE_LAT_OFFSET: usize = 64 + 1 + 128 + 1;
-const PLACE_LON_OFFSET: usize = PLACE_LAT_OFFSET + 4;
-const PLACE_IMPORTANCE_OFFSET: usize = PLACE_LON_OFFSET + 4;
 
 fn is_subset(subset: &[u16], superset: &[u16]) -> bool {
     if subset.len() > superset.len() {
@@ -87,24 +84,18 @@ impl QueryNgramCache {
         }
     }
 
-    pub fn clear(&mut self) {
-        self.insert_order.clear();
-        self.entries.clear();
-    }
-
     pub fn has_exact(&self, key: &[u16]) -> bool {
         self.entries.contains_key(key)
     }
 
-    pub fn get_closest_dense(
+    pub fn get_closest_dense_ref(
         &self,
         key: &[u16],
         missing: &mut Vec<u16>,
-        string_count: usize,
-    ) -> Vec<u8> {
+    ) -> Option<Arc<Vec<u8>>> {
         if let Some(exact) = self.entries.get(key) {
             missing.clear();
-            return exact.to_vec();
+            return Some(exact.clone());
         }
 
         let mut best_subset: Option<&Vec<u16>> = None;
@@ -120,12 +111,12 @@ impl QueryNgramCache {
 
         if let Some(best_key) = best_subset {
             missing_elements(best_key, key, missing);
-            return self.entries.get(best_key).unwrap().to_vec();
+            return self.entries.get(best_key).cloned();
         }
 
         missing.clear();
         missing.extend_from_slice(key);
-        vec![0u8; string_count]
+        None
     }
 
     pub fn put_dense(&mut self, key: &[u16], counts: Arc<Vec<u8>>) {
@@ -147,6 +138,7 @@ impl QueryNgramCache {
 }
 
 pub struct GuessContext {
+    pub string_match_counts: Vec<u8>,
     pub string_matches: Vec<CosSimMatch>,
     pub query_bigrams: Vec<u16>,
     pub query_cache: QueryNgramCache,
@@ -159,6 +151,7 @@ pub struct GuessContext {
 impl GuessContext {
     pub fn new(_string_count: usize, place_count: usize) -> Self {
         Self {
+            string_match_counts: Vec::new(),
             string_matches: Vec::with_capacity(6000),
             query_bigrams: Vec::with_capacity(64),
             query_cache: QueryNgramCache::new(QUERY_CACHE_MAX_ENTRIES),
@@ -169,7 +162,11 @@ impl GuessContext {
         }
     }
 
-    pub fn clear(&mut self, _needed_string_count: usize, needed_place_count: usize) {
+    pub fn clear(&mut self, needed_string_count: usize, needed_place_count: usize) {
+        if self.string_match_counts.len() != needed_string_count {
+            self.string_match_counts.resize(needed_string_count, 0);
+        }
+
         self.string_matches.clear();
         self.query_bigrams.clear();
 
@@ -214,38 +211,16 @@ impl MemdbData {
         PlaceRecord::from_disk_bytes(&self.places_mmap[start..end])
     }
 
-    pub fn get_place_scoring_fields(&self, place_id: usize) -> Option<(f32, f32, f32)> {
-        let start = place_id.checked_mul(PLACE_RECORD_DISK_BYTES)?;
-        let importance_end = start.checked_add(PLACE_IMPORTANCE_OFFSET + 4)?;
-        if importance_end > self.places_mmap.len() {
+    pub fn get_place_source_id(&self, place_id: usize) -> Option<String> {
+        let db = self.get_archived();
+        let start = *db.place_source_id_offsets.get(place_id)? as usize;
+        let end = *db.place_source_id_offsets.get(place_id + 1)? as usize;
+
+        if start > end || end > db.place_source_id_bytes.len() {
             return None;
         }
 
-        let bytes = &self.places_mmap;
-        let lat_base = start + PLACE_LAT_OFFSET;
-        let lon_base = start + PLACE_LON_OFFSET;
-        let imp_base = start + PLACE_IMPORTANCE_OFFSET;
-
-        let lat = f32::from_le_bytes([
-            bytes[lat_base],
-            bytes[lat_base + 1],
-            bytes[lat_base + 2],
-            bytes[lat_base + 3],
-        ]);
-        let lon = f32::from_le_bytes([
-            bytes[lon_base],
-            bytes[lon_base + 1],
-            bytes[lon_base + 2],
-            bytes[lon_base + 3],
-        ]);
-        let importance = f32::from_le_bytes([
-            bytes[imp_base],
-            bytes[imp_base + 1],
-            bytes[imp_base + 2],
-            bytes[imp_base + 3],
-        ]);
-
-        Some((lat, lon, importance))
+        Some(String::from_utf8_lossy(&db.place_source_id_bytes[start..end]).into_owned())
     }
 }
 
