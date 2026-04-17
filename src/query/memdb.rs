@@ -75,7 +75,7 @@ fn missing_elements(subset: &[u16], superset: &[u16], out: &mut Vec<u16>) {
 pub struct QueryNgramCache {
     max_entries: usize,
     insert_order: VecDeque<Vec<u16>>,
-    entries: HashMap<Vec<u16>, Arc<Vec<(u32, u16)>>>,
+    entries: HashMap<Vec<u16>, Arc<Vec<u8>>>,
 }
 
 impl QueryNgramCache {
@@ -96,10 +96,15 @@ impl QueryNgramCache {
         self.entries.contains_key(key)
     }
 
-    pub fn get_closest(&self, key: &[u16], missing: &mut Vec<u16>) -> Option<Arc<Vec<(u32, u16)>>> {
+    pub fn get_closest_dense(
+        &self,
+        key: &[u16],
+        missing: &mut Vec<u16>,
+        string_count: usize,
+    ) -> Vec<u8> {
         if let Some(exact) = self.entries.get(key) {
             missing.clear();
-            return Some(Arc::clone(exact));
+            return exact.to_vec();
         }
 
         let mut best_subset: Option<&Vec<u16>> = None;
@@ -115,23 +120,22 @@ impl QueryNgramCache {
 
         if let Some(best_key) = best_subset {
             missing_elements(best_key, key, missing);
-            return self.entries.get(best_key).map(Arc::clone);
+            return self.entries.get(best_key).unwrap().to_vec();
         }
 
         missing.clear();
         missing.extend_from_slice(key);
-        None
+        vec![0u8; string_count]
     }
 
-    pub fn put(&mut self, key: &[u16], sparse_counts: &[(u32, u16)]) {
+    pub fn put_dense(&mut self, key: &[u16], counts: Arc<Vec<u8>>) {
         if self.max_entries == 0 || self.entries.contains_key(key) {
             return;
         }
 
         let owned_key = key.to_vec();
         self.insert_order.push_back(owned_key.clone());
-        self.entries
-            .insert(owned_key, Arc::new(sparse_counts.to_vec()));
+        self.entries.insert(owned_key, counts);
 
         while self.entries.len() > self.max_entries {
             let Some(oldest) = self.insert_order.pop_front() else {
@@ -143,9 +147,6 @@ impl QueryNgramCache {
 }
 
 pub struct GuessContext {
-    pub string_match_counts: Vec<u16>,
-    pub string_match_epochs: Vec<u32>,
-    pub touched_string_indices: Vec<u32>,
     pub string_matches: Vec<CosSimMatch>,
     pub query_bigrams: Vec<u16>,
     pub query_cache: QueryNgramCache,
@@ -156,11 +157,8 @@ pub struct GuessContext {
 }
 
 impl GuessContext {
-    pub fn new(string_count: usize, place_count: usize) -> Self {
+    pub fn new(_string_count: usize, place_count: usize) -> Self {
         Self {
-            string_match_counts: vec![0; string_count],
-            string_match_epochs: vec![0; string_count],
-            touched_string_indices: Vec::new(),
             string_matches: Vec::with_capacity(6000),
             query_bigrams: Vec::with_capacity(64),
             query_cache: QueryNgramCache::new(QUERY_CACHE_MAX_ENTRIES),
@@ -171,16 +169,9 @@ impl GuessContext {
         }
     }
 
-    pub fn clear(&mut self, needed_string_count: usize, needed_place_count: usize) {
-        if self.string_match_counts.len() != needed_string_count {
-            self.string_match_counts.resize(needed_string_count, 0);
-            self.string_match_epochs.resize(needed_string_count, 0);
-            self.query_cache.clear();
-        }
-
+    pub fn clear(&mut self, _needed_string_count: usize, needed_place_count: usize) {
         self.string_matches.clear();
         self.query_bigrams.clear();
-        self.touched_string_indices.clear();
 
         if self.place_best_scores.len() < needed_place_count {
             self.place_best_scores
@@ -191,7 +182,6 @@ impl GuessContext {
         self.query_epoch = self.query_epoch.wrapping_add(1);
         if self.query_epoch == 0 {
             self.query_epoch = 1;
-            self.string_match_epochs.fill(0);
             self.place_score_epochs.fill(0);
         }
 

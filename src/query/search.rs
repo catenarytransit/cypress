@@ -235,108 +235,47 @@ pub fn search_place_ids(
         let mut missing_bigrams = Vec::new();
 
         let phase_started = Instant::now();
-        let mut cache_hit = false;
-        let query_epoch = ctx.query_epoch;
-        if let Some(cached_counts) = ctx
-            .query_cache
-            .get_closest(&query_bigrams, &mut missing_bigrams)
-        {
-            cache_hit = true;
-            for &(string_idx, count) in cached_counts.iter() {
-                let idx = string_idx as usize;
-                if idx >= string_count || count == 0 {
-                    continue;
-                }
-                if ctx.string_match_epochs[idx] != query_epoch {
-                    ctx.string_match_epochs[idx] = query_epoch;
-                    ctx.string_match_counts[idx] = count;
-                    ctx.touched_string_indices.push(string_idx);
-                } else if count > ctx.string_match_counts[idx] {
-                    ctx.string_match_counts[idx] = count;
-                }
-            }
-        }
+        let mut current_counts =
+            ctx.query_cache
+                .get_closest_dense(&query_bigrams, &mut missing_bigrams, string_count);
         let missing_bigram_count = missing_bigrams.len();
         log_phase_timing("search_place_ids", "cache_lookup_restore", phase_started);
         debug!(
             target: "cypress::query::timing",
             op = "search_place_ids",
-            cache_hit,
+            cache_hit = missing_bigram_count == 0,
             missing_bigram_count,
-            restored_string_count = ctx.touched_string_indices.len(),
             "cache lookup summary"
         );
 
         let phase_started = Instant::now();
-        missing_bigrams.sort_unstable_by_key(|&bigram_key| {
-            let idx = bigram_key as usize;
-            db.bigram_offsets[idx + 1] - db.bigram_offsets[idx]
-        });
-
-        let missing_len = missing_bigrams.len();
-        for (missing_idx, bigram_key) in missing_bigrams.into_iter().enumerate() {
-            let idx = bigram_key as usize;
-            let start = db.bigram_offsets[idx] as usize;
-            let end = db.bigram_offsets[idx + 1] as usize;
-            let remaining_bigrams = (missing_len - missing_idx - 1) as u16;
+        for missing_idx in missing_bigrams.into_iter() {
+            let start = db.bigram_offsets[missing_idx as usize] as usize;
+            let end = db.bigram_offsets[(missing_idx + 1) as usize] as usize;
 
             for i in start..end {
                 let string_idx = db.bigram_data[i] as usize;
-                if string_idx >= string_count {
-                    continue;
+                if let Some(val) = current_counts.get_mut(string_idx) {
+                    *val = val.saturating_add(1);
                 }
-
-                let count = if ctx.string_match_epochs[string_idx] == query_epoch {
-                    ctx.string_match_counts[string_idx]
-                } else {
-                    0
-                };
-
-                if count.saturating_add(1).saturating_add(remaining_bigrams) < min_match_count {
-                    continue;
-                }
-
-                if ctx.string_match_epochs[string_idx] != query_epoch {
-                    ctx.string_match_epochs[string_idx] = query_epoch;
-                    ctx.string_match_counts[string_idx] = 0;
-                    ctx.touched_string_indices.push(string_idx as u32);
-                }
-                ctx.string_match_counts[string_idx] =
-                    ctx.string_match_counts[string_idx].saturating_add(1);
             }
         }
         log_phase_timing("search_place_ids", "expand_missing_bigrams", phase_started);
 
         let phase_started = Instant::now();
-        if !ctx.query_cache.has_exact(&query_bigrams)
-            && ctx.touched_string_indices.len() <= MAX_CACHEABLE_SPARSE_COUNTS
-        {
-            let mut sparse_cache_scratch = Vec::with_capacity(ctx.touched_string_indices.len());
-            for &string_idx in &ctx.touched_string_indices {
-                let count = ctx.string_match_counts[string_idx as usize];
-                if count > 0 {
-                    sparse_cache_scratch.push((string_idx, count));
-                }
-            }
-            ctx.query_cache.put(&query_bigrams, &sparse_cache_scratch);
+        if !ctx.query_cache.has_exact(&query_bigrams) {
+            ctx.query_cache
+                .put_dense(&query_bigrams, Arc::new(current_counts.clone()));
         }
-        log_phase_timing(
-            "search_place_ids",
-            "cache_store_sparse_counts",
-            phase_started,
-        );
-
-        let touched_string_indices = ctx.touched_string_indices.clone();
+        log_phase_timing("search_place_ids", "cache_store_counts", phase_started);
 
         let phase_started = Instant::now();
-        for string_idx in touched_string_indices {
-            let idx = string_idx as usize;
-            let match_count = ctx.string_match_counts[idx];
-            if match_count < min_match_count {
+        for (string_idx, &match_count) in current_counts.iter().enumerate() {
+            if (match_count as u16) < min_match_count {
                 continue;
             }
 
-            let str_bigram_count = db.string_bigram_counts[idx] as f32;
+            let str_bigram_count = db.string_bigram_counts[string_idx] as f32;
             if str_bigram_count == 0.0 {
                 continue;
             }
@@ -345,7 +284,7 @@ pub fn search_place_ids(
                 / (str_bigram_count * query_bigram_count_u32 as f32);
             if cos_sim >= COS_SIM_CUTOFF {
                 ctx.string_matches.push(CosSimMatch {
-                    string_idx,
+                    string_idx: string_idx as u32,
                     cos_sim,
                 });
             }
