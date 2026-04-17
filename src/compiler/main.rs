@@ -383,7 +383,7 @@ async fn main() -> Result<()> {
                 });
 
                 let done = processed_ranges.fetch_add(1, Ordering::Relaxed) + 1;
-                if done % 50 == 0 || done == total_ranges as u32 {
+                if done % 5 == 0 || done == total_ranges as u32 {
                     info!("Progress: {}/{} ranges processed", done, total_ranges);
                 }
 
