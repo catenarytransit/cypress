@@ -7,7 +7,9 @@ use std::sync::Arc;
 use tokio::time::{interval, Duration};
 use tracing::{info, warn};
 
-use cypress::models::memdb::{ArchivedCypressMemDb, CypressMemDb};
+use cypress::models::memdb::{
+    ArchivedCypressMemDb, CypressMemDb, PlaceRecord, PLACE_RECORD_DISK_BYTES,
+};
 
 pub struct CosSimMatch {
     pub string_idx: u32,
@@ -42,13 +44,24 @@ thread_local! {
 }
 
 pub struct MemdbData {
-    pub mmap: Mmap,
+    pub index_mmap: Mmap,
+    pub places_mmap: Mmap,
     pub version: String,
 }
 
 impl MemdbData {
     pub fn get_archived(&self) -> &ArchivedCypressMemDb {
-        unsafe { rkyv::archived_root::<CypressMemDb>(&self.mmap) }
+        unsafe { rkyv::archived_root::<CypressMemDb>(&self.index_mmap) }
+    }
+
+    pub fn get_place(&self, place_id: usize) -> Option<PlaceRecord> {
+        let start = place_id.checked_mul(PLACE_RECORD_DISK_BYTES)?;
+        let end = start.checked_add(PLACE_RECORD_DISK_BYTES)?;
+        if end > self.places_mmap.len() {
+            return None;
+        }
+
+        PlaceRecord::from_disk_bytes(&self.places_mmap[start..end])
     }
 }
 
@@ -83,11 +96,27 @@ impl Memdb {
 
     fn load_data(out_dir: &Path, version: String) -> Result<MemdbData> {
         info!("Loading memdb version: {}", version);
-        let bin_file = File::open(out_dir.join("cypress_memdb.bin"))
-            .context("Failed to open cypress_memdb.bin")?;
-        let mmap = unsafe { Mmap::map(&bin_file)? };
+        let index_file = File::open(out_dir.join("cypress_index.bin"))
+            .context("Failed to open cypress_index.bin")?;
+        let places_file = File::open(out_dir.join("cypress_places.bin"))
+            .context("Failed to open cypress_places.bin")?;
 
-        Ok(MemdbData { mmap, version })
+        let index_mmap = unsafe { Mmap::map(&index_file)? };
+        let places_mmap = unsafe { Mmap::map(&places_file)? };
+
+        if places_mmap.len() % PLACE_RECORD_DISK_BYTES != 0 {
+            return Err(anyhow::anyhow!(
+                "Invalid cypress_places.bin length: {} bytes is not divisible by {}",
+                places_mmap.len(),
+                PLACE_RECORD_DISK_BYTES
+            ));
+        }
+
+        Ok(MemdbData {
+            index_mmap,
+            places_mmap,
+            version,
+        })
     }
 
     async fn check_reload(&self) -> Result<()> {

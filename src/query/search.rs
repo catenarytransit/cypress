@@ -2,15 +2,12 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::debug;
 
-use cypress::models::memdb::{ArchivedCypressMemDb, CypressMemDb};
+use cypress::models::memdb::CypressMemDb;
 use cypress::models::normalized::NormalizedPlace;
 use cypress::models::place::Layer;
 use cypress::models::AdminEntry;
 use cypress::scylla::ScyllaClient;
-use regex::Regex;
-use std::sync::OnceLock;
 
 use super::memdb::{CosSimMatch, Memdb, GUESS_CONTEXT};
 
@@ -221,7 +218,9 @@ fn bigram_search(
 
             for i in p_start..p_end {
                 let place_id = db.string_to_places_data[i] as usize;
-                let place = &db.places[place_id];
+                let Some(place) = memdb_data.get_place(place_id) else {
+                    continue;
+                };
                 let lat = place.lat as f64;
                 let lon = place.lon as f64;
 
@@ -310,7 +309,9 @@ fn spatial_search(
 
                 for i in start..end {
                     let place_id = db.cell_places[i] as usize;
-                    let place = &db.places[place_id];
+                    let Some(place) = memdb_data.get_place(place_id) else {
+                        continue;
+                    };
 
                     let dist =
                         haversine_distance_km((lat, lon), (place.lat as f64, place.lon as f64));

@@ -1,5 +1,7 @@
 use rkyv::{Archive, Deserialize, Serialize};
 
+pub const PLACE_RECORD_DISK_BYTES: usize = 64 + 1 + 128 + 1 + 4 + 4 + 4 + 1;
+
 #[derive(Archive, Serialize, Deserialize, Debug, Clone)]
 pub struct PlaceRecord {
     pub source_id_bytes: [u8; 64],
@@ -20,6 +22,50 @@ impl PlaceRecord {
     pub fn parse_name(&self) -> String {
         String::from_utf8_lossy(&self.name_bytes[..self.name_len as usize]).into_owned()
     }
+
+    pub fn from_disk_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != PLACE_RECORD_DISK_BYTES {
+            return None;
+        }
+
+        let mut offset = 0usize;
+
+        let mut source_id_bytes = [0u8; 64];
+        source_id_bytes.copy_from_slice(&bytes[offset..offset + 64]);
+        offset += 64;
+
+        let source_id_len = bytes[offset];
+        offset += 1;
+
+        let mut name_bytes = [0u8; 128];
+        name_bytes.copy_from_slice(&bytes[offset..offset + 128]);
+        offset += 128;
+
+        let name_len = bytes[offset];
+        offset += 1;
+
+        let lat = f32::from_le_bytes(bytes[offset..offset + 4].try_into().ok()?);
+        offset += 4;
+
+        let lon = f32::from_le_bytes(bytes[offset..offset + 4].try_into().ok()?);
+        offset += 4;
+
+        let importance = f32::from_le_bytes(bytes[offset..offset + 4].try_into().ok()?);
+        offset += 4;
+
+        let layer_rank = bytes[offset];
+
+        Some(Self {
+            source_id_bytes,
+            source_id_len,
+            name_bytes,
+            name_len,
+            lat,
+            lon,
+            importance,
+            layer_rank,
+        })
+    }
 }
 
 /// A fully flattened, zero-copy architecture utilizing parallel arrays
@@ -34,9 +80,6 @@ pub struct CypressMemDb {
     // The items for bigram `k` are bigram_data[bigram_offsets[k] .. bigram_offsets[k+1]]
     pub bigram_offsets: Vec<u32>,
     pub bigram_data: Vec<u32>,
-
-    // ==== Places and Entity Resolution ====
-    pub places: Vec<PlaceRecord>,
 
     // string ID -> List of Place IDs
     pub string_to_places_offsets: Vec<u32>,

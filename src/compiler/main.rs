@@ -15,7 +15,7 @@ use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 use xxhash_rust::xxh64::xxh64;
 
-use cypress::models::memdb::{CypressMemDb, PlaceRecord};
+use cypress::models::memdb::{CypressMemDb, PlaceRecord, PLACE_RECORD_DISK_BYTES};
 use cypress::models::normalized::NormalizedPlace;
 use cypress::scylla::ScyllaClient;
 use rkyv::ser::{
@@ -23,7 +23,6 @@ use rkyv::ser::{
     Serializer,
 };
 
-const PLACE_RECORD_DISK_BYTES: usize = 64 + 1 + 128 + 1 + 4 + 4 + 4 + 1;
 const TERM_BUCKETS: usize = 128;
 const BIGRAM_SHARDS: usize = 256;
 
@@ -105,47 +104,8 @@ fn write_place_record<W: Write>(writer: &mut W, record: &PlaceRecord) -> Result<
 }
 
 fn decode_place_record(bytes: &[u8]) -> Result<PlaceRecord> {
-    if bytes.len() != PLACE_RECORD_DISK_BYTES {
-        return Err(anyhow!("Invalid place record byte width: {}", bytes.len()));
-    }
-
-    let mut offset = 0usize;
-
-    let mut source_id_bytes = [0u8; 64];
-    source_id_bytes.copy_from_slice(&bytes[offset..offset + 64]);
-    offset += 64;
-
-    let source_id_len = bytes[offset];
-    offset += 1;
-
-    let mut name_bytes = [0u8; 128];
-    name_bytes.copy_from_slice(&bytes[offset..offset + 128]);
-    offset += 128;
-
-    let name_len = bytes[offset];
-    offset += 1;
-
-    let lat = f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
-    offset += 4;
-
-    let lon = f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
-    offset += 4;
-
-    let importance = f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
-    offset += 4;
-
-    let layer_rank = bytes[offset];
-
-    Ok(PlaceRecord {
-        source_id_bytes,
-        source_id_len,
-        name_bytes,
-        name_len,
-        lat,
-        lon,
-        importance,
-        layer_rank,
-    })
+    PlaceRecord::from_disk_bytes(bytes)
+        .ok_or_else(|| anyhow!("Invalid place record byte width: {}", bytes.len()))
 }
 
 fn write_term_entry<W: Write>(writer: &mut W, place_id: u32, phrase: &str) -> Result<()> {
@@ -503,7 +463,7 @@ async fn main() -> Result<()> {
             .context("Failed to reopen merged place mmap as readonly")?
     };
 
-    let mut places = Vec::with_capacity(total_places as usize);
+    info!("Processing places for spatial index");
     let mut cell_pairs = Vec::with_capacity(total_places as usize);
     for (idx, chunk) in places_mmap
         .chunks_exact(PLACE_RECORD_DISK_BYTES)
@@ -512,7 +472,6 @@ async fn main() -> Result<()> {
         let place = decode_place_record(chunk)?;
         let place_id = idx as u32;
         let cell_id = CypressMemDb::coord_to_cell(place.lat, place.lon);
-        places.push(place);
         cell_pairs.push((cell_id, place_id));
     }
 
@@ -712,7 +671,6 @@ async fn main() -> Result<()> {
         string_bigram_counts,
         bigram_offsets,
         bigram_data,
-        places,
         string_to_places_offsets,
         string_to_places_data,
         active_cells,
@@ -720,9 +678,9 @@ async fn main() -> Result<()> {
         cell_places,
     };
 
-    info!("Serialising to rkyv binary (streaming writer)...");
+    info!("Serialising index to rkyv binary (streaming writer)...");
 
-    let db_path = out_dir.join("cypress_memdb.bin");
+    let db_path = out_dir.join("cypress_index.bin");
     let output_file = File::create(&db_path)
         .with_context(|| format!("Failed to create output file: {}", db_path.display()))?;
     let writer = BufWriter::new(output_file);
@@ -737,6 +695,18 @@ async fn main() -> Result<()> {
     let mut writer = serializer.into_serializer().into_inner();
     writer.flush()?;
 
+    drop(places_mmap);
+    drop(merged_places_file);
+
+    let final_places_path = out_dir.join("cypress_places.bin");
+    fs::rename(&merged_places_path, &final_places_path).with_context(|| {
+        format!(
+            "Failed to move merged places file {} -> {}",
+            merged_places_path.display(),
+            final_places_path.display()
+        )
+    })?;
+
     let version_path = out_dir.join("current_version.txt");
     fs::write(version_path, chrono::Utc::now().timestamp().to_string())?;
 
@@ -748,9 +718,6 @@ async fn main() -> Result<()> {
         );
     }
 
-    info!(
-        "Compilation successful. Total places: {}",
-        memdb.places.len()
-    );
+    info!("Compilation successful. Total places: {}", total_places);
     Ok(())
 }

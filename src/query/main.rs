@@ -24,7 +24,7 @@ use cypress::scylla::ScyllaClient;
 
 mod memdb;
 mod search;
-use memdb::{CosSimMatch, GuessContext, Memdb, GUESS_CONTEXT};
+use memdb::{CosSimMatch, Memdb, GUESS_CONTEXT};
 use search::{SearchParams, SearchResult, SearchResultV2};
 
 #[derive(Parser, Debug)]
@@ -212,7 +212,9 @@ async fn autocomplete_handler(
 
                 for i in p_start..p_end {
                     let place_id = db.string_to_places_data[i] as usize;
-                    let place = &db.places[place_id];
+                    let Some(place) = memdb_data.get_place(place_id) else {
+                        continue;
+                    };
 
                     let importance = place.importance as f64;
                     let text_score = text_match.cos_sim as f64;
