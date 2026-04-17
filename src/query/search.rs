@@ -1,10 +1,10 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tracing::debug;
 
-use cypress::elasticsearch::EsClient;
+use cypress::models::memdb::{ArchivedCypressMemDb, CypressMemDb};
 use cypress::models::normalized::NormalizedPlace;
 use cypress::models::place::Layer;
 use cypress::models::AdminEntry;
@@ -12,7 +12,8 @@ use cypress::scylla::ScyllaClient;
 use regex::Regex;
 use std::sync::OnceLock;
 
-/// Search parameters
+use super::memdb::{CosSimMatch, Memdb, GUESS_CONTEXT};
+
 #[derive(Clone)]
 pub struct SearchParams {
     pub text: String,
@@ -25,7 +26,6 @@ pub struct SearchParams {
     pub size: usize,
 }
 
-/// Search result in GeoJSON-like format
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SearchResult {
     #[serde(rename = "type")]
@@ -34,7 +34,6 @@ pub struct SearchResult {
     pub properties: Properties,
 }
 
-/// Search result V2 in GeoJSON-like format
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SearchResultV2 {
     #[serde(rename = "type")]
@@ -55,7 +54,6 @@ pub struct Properties {
     pub id: String,
     pub layer: String,
     pub name: String,
-    /// All available language variants
     pub names: HashMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub housenumber: Option<String>,
@@ -83,7 +81,6 @@ pub struct PropertiesV2 {
     pub id: String,
     pub layer: String,
     pub name: String,
-    /// All available language variants
     pub names: HashMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub housenumber: Option<String>,
@@ -118,318 +115,323 @@ pub struct PropertiesV2 {
 
 pub struct TimedSearchResults {
     pub results: Vec<SearchResult>,
-    pub es_took_ms: u128,
-    pub scylla_took_ms: u128,
+    pub took_ms: u128,
 }
 
 pub struct TimedSearchResultsV2 {
     pub results: Vec<SearchResultV2>,
-    pub es_took_ms: u128,
-    pub scylla_took_ms: u128,
+    pub took_ms: u128,
 }
 
-struct InternalTimedResults {
-    places: Vec<(
-        NormalizedPlace,
-        f64,
-        Option<String>,
-        HashMap<String, AdminEntry>,
-    )>,
-    es_took_ms: u128,
-    scylla_took_ms: u128,
+/// Run the bigram cosine similarity search over the rkyv database,
+/// returning scored source IDs with their final scores.
+fn bigram_search(
+    memdb: &Memdb,
+    text: &str,
+    focus: Option<(f64, f64)>,
+    focus_weight: f64,
+    bbox: Option<[f64; 4]>,
+    max_results: usize,
+) -> Vec<(String, f64)> {
+    let query = text.trim().to_lowercase();
+    if query.len() < 2 {
+        return Vec::new();
+    }
+
+    let memdb_data = memdb.get_data();
+    let db = memdb_data.get_archived();
+    let string_count = db.string_bigram_counts.len();
+
+    let mut results = Vec::new();
+
+    GUESS_CONTEXT.with(|cell| {
+        let mut ctx = cell.borrow_mut();
+        ctx.clear(string_count);
+
+        let query_bytes = query.as_bytes();
+        let mut query_bigrams: u32 = 0;
+
+        for window in query_bytes.windows(2) {
+            let bigram_key = ((window[0] as u16) << 8) | (window[1] as u16);
+            let idx = bigram_key as usize;
+            let start = db.bigram_offsets[idx] as usize;
+            let end = db.bigram_offsets[idx + 1] as usize;
+            for i in start..end {
+                let string_idx = db.bigram_data[i] as usize;
+                if string_idx < ctx.string_match_counts.len() {
+                    ctx.string_match_counts[string_idx] += 1;
+                }
+            }
+            query_bigrams += 1;
+        }
+
+        if query_bigrams == 0 {
+            return;
+        }
+
+        let min_match_count = (2 + query_bigrams / (4 + query_bigrams / 10)) as u16;
+
+        let count_len = ctx.string_match_counts.len();
+        for string_idx in 0..count_len {
+            let match_count = ctx.string_match_counts[string_idx];
+            if match_count < min_match_count {
+                continue;
+            }
+            let str_bigram_count = db.string_bigram_counts[string_idx] as f32;
+            if str_bigram_count == 0.0 {
+                continue;
+            }
+            let cos_sim = (match_count as f32 * match_count as f32)
+                / (str_bigram_count * query_bigrams as f32);
+            if cos_sim >= 0.17 {
+                ctx.string_matches.push(CosSimMatch {
+                    string_idx: string_idx as u32,
+                    cos_sim,
+                });
+            }
+        }
+
+        let max_matches = 6000.min(ctx.string_matches.len());
+        if ctx.string_matches.len() > max_matches {
+            ctx.string_matches
+                .select_nth_unstable_by(max_matches, |a, b| {
+                    b.cos_sim
+                        .partial_cmp(&a.cos_sim)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            ctx.string_matches.truncate(max_matches);
+        }
+        ctx.string_matches.sort_unstable_by(|a, b| {
+            b.cos_sim
+                .partial_cmp(&a.cos_sim)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        struct ScoredPlace {
+            source_id: String,
+            score: f64,
+        }
+
+        let mut scored = Vec::new();
+
+        for text_match in &ctx.string_matches {
+            let sid = text_match.string_idx as usize;
+            let p_start = db.string_to_places_offsets[sid] as usize;
+            let p_end = db.string_to_places_offsets[sid + 1] as usize;
+
+            for i in p_start..p_end {
+                let place_id = db.string_to_places_data[i] as usize;
+                let place = &db.places[place_id];
+                let lat = place.lat as f64;
+                let lon = place.lon as f64;
+
+                if let Some(bb) = bbox {
+                    if lon < bb[0] || lat < bb[1] || lon > bb[2] || lat > bb[3] {
+                        continue;
+                    }
+                }
+
+                let importance = place.importance as f64;
+                let text_score = text_match.cos_sim as f64;
+
+                let decay = if let Some(fp) = focus {
+                    let dist = haversine_distance_km(fp, (lat, lon));
+                    (-(dist * dist) / (2.0 * focus_weight * focus_weight)).exp()
+                } else {
+                    1.0
+                };
+
+                let final_score = text_score * (1.0 + importance * 10.0) * decay;
+
+                let source_id =
+                    String::from_utf8_lossy(&place.source_id_bytes[..place.source_id_len as usize])
+                        .into_owned();
+
+                scored.push(ScoredPlace {
+                    source_id,
+                    score: final_score,
+                });
+            }
+        }
+
+        scored.sort_unstable_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let mut seen = std::collections::HashSet::new();
+        results = scored
+            .into_iter()
+            .filter(|s| seen.insert(s.source_id.clone()))
+            .take(max_results)
+            .map(|s| (s.source_id, s.score))
+            .collect();
+    });
+
+    results
 }
 
-/// Execute a forward geocoding search
+/// Use the spatial grid for reverse geocoding — find places near a coordinate.
+fn spatial_search(
+    memdb: &Memdb,
+    lon: f64,
+    lat: f64,
+    max_results: usize,
+    radius_km: f64,
+) -> Vec<(String, f64)> {
+    let memdb_data = memdb.get_data();
+    let db = memdb_data.get_archived();
+
+    let delta_deg = (radius_km / 111.0) as f32;
+    let min_lat = (lat as f32 - delta_deg).max(-90.0);
+    let max_lat = (lat as f32 + delta_deg).min(89.999);
+    let min_lon = (lon as f32 - delta_deg).max(-180.0);
+    let max_lon = (lon as f32 + delta_deg).min(179.999);
+
+    let cell_size = CypressMemDb::GRID_CELL_SIZE;
+    let cols = CypressMemDb::GRID_COLS;
+
+    let row_start = ((min_lat + 90.0) / cell_size) as usize;
+    let row_end = ((max_lat + 90.0) / cell_size) as usize;
+    let col_start = ((min_lon + 180.0) / cell_size) as usize;
+    let col_end = ((max_lon + 180.0) / cell_size) as usize;
+
+    let mut candidates: Vec<(String, f64)> = Vec::new();
+
+    for row in row_start..=row_end {
+        for col in col_start..=col_end {
+            let cell_id = (row * cols + col) as u32;
+
+            // Binary search for this cell in the sorted active_cells array
+            if let Ok(pos) = db.active_cells.binary_search_by(|c| c.cmp(&cell_id)) {
+                let start = db.cell_offsets[pos] as usize;
+                let end = db.cell_offsets[pos + 1] as usize;
+
+                for i in start..end {
+                    let place_id = db.cell_places[i] as usize;
+                    let place = &db.places[place_id];
+
+                    let dist =
+                        haversine_distance_km((lat, lon), (place.lat as f64, place.lon as f64));
+                    if dist <= radius_km {
+                        let source_id = String::from_utf8_lossy(
+                            &place.source_id_bytes[..place.source_id_len as usize],
+                        )
+                        .into_owned();
+                        candidates.push((source_id, dist));
+                    }
+                }
+            }
+        }
+    }
+
+    candidates.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    candidates.truncate(max_results);
+    candidates
+}
+
 pub async fn execute_search(
-    client: &EsClient,
     scylla_client: &ScyllaClient,
+    memdb: &Arc<Memdb>,
     params: SearchParams,
-    autocomplete: bool,
 ) -> Result<TimedSearchResults> {
-    let internal_results =
-        execute_search_internal_wrapper(client, scylla_client, params, autocomplete).await?;
-    let mut search_results = Vec::new();
+    let start = std::time::Instant::now();
 
-    for (place, score, preferred_lang, parsed_admin_map) in internal_results.places {
-        if let Some(result) =
-            place_to_search_result(place, score, &preferred_lang, &parsed_admin_map)
+    let focus = match (params.focus_lat, params.focus_lon) {
+        (Some(lat), Some(lon)) => Some((lat, lon)),
+        _ => None,
+    };
+    let focus_weight = params.focus_weight.unwrap_or(50.0);
+
+    let scored_ids = bigram_search(
+        memdb,
+        &params.text,
+        focus,
+        focus_weight,
+        params.bbox,
+        params.size,
+    );
+
+    let mut results = Vec::new();
+    let mut admin_ids = std::collections::HashSet::new();
+
+    let fetch_futures = scored_ids.iter().map(|(id, _)| scylla_client.get_place(id));
+    let fetched = futures::future::join_all(fetch_futures).await;
+
+    let mut places_with_scores = Vec::new();
+    for (i, fetch_result) in fetched.into_iter().enumerate() {
+        if let Ok(Some(json_data)) = fetch_result {
+            if let Ok(place) = serde_json::from_str::<NormalizedPlace>(&json_data) {
+                collect_admin_ids(&place, &mut admin_ids);
+                places_with_scores.push((place, scored_ids[i].1));
+            }
+        }
+    }
+
+    let admin_ids_vec: Vec<String> = admin_ids.into_iter().collect();
+    let admin_map = scylla_client.get_admin_areas(&admin_ids_vec).await?;
+    let parsed_admin_map: HashMap<String, AdminEntry> = admin_map
+        .iter()
+        .filter_map(|(k, v)| {
+            serde_json::from_str::<cypress::models::admin::AdminEntryScylla>(v)
+                .ok()
+                .map(|scylla_entry| (k.clone(), AdminEntry::from_scylla(scylla_entry)))
+        })
+        .collect();
+
+    for (place, score) in places_with_scores {
+        if let Some(result) = place_to_search_result(place, score, &params.lang, &parsed_admin_map)
         {
-            search_results.push(result);
+            results.push(result);
         }
     }
 
     Ok(TimedSearchResults {
-        results: search_results,
-        es_took_ms: internal_results.es_took_ms,
-        scylla_took_ms: internal_results.scylla_took_ms,
+        results,
+        took_ms: start.elapsed().as_millis(),
     })
 }
 
-/// Execute a forward geocoding search V2
 pub async fn execute_search_v2(
-    client: &EsClient,
     scylla_client: &ScyllaClient,
+    memdb: &Arc<Memdb>,
     params: SearchParams,
-    autocomplete: bool,
 ) -> Result<TimedSearchResultsV2> {
-    let internal_results =
-        execute_search_internal_wrapper(client, scylla_client, params, autocomplete).await?;
-    let mut search_results = Vec::new();
+    let start = std::time::Instant::now();
 
-    for (place, score, preferred_lang, parsed_admin_map) in internal_results.places {
-        if let Some(result) =
-            place_to_search_result_v2(place, score, &preferred_lang, &parsed_admin_map)
-        {
-            search_results.push(result);
-        }
-    }
+    let focus = match (params.focus_lat, params.focus_lon) {
+        (Some(lat), Some(lon)) => Some((lat, lon)),
+        _ => None,
+    };
+    let focus_weight = params.focus_weight.unwrap_or(50.0);
 
-    Ok(TimedSearchResultsV2 {
-        results: search_results,
-        es_took_ms: internal_results.es_took_ms,
-        scylla_took_ms: internal_results.scylla_took_ms,
-    })
-}
+    let scored_ids = bigram_search(
+        memdb,
+        &params.text,
+        focus,
+        focus_weight,
+        params.bbox,
+        params.size,
+    );
 
-async fn execute_search_internal_wrapper(
-    client: &EsClient,
-    scylla_client: &ScyllaClient,
-    params: SearchParams,
-    autocomplete: bool,
-) -> Result<InternalTimedResults> {
-    if let Some(modified_text) = remove_location_keywords(&params.text) {
-        let mut modified_params = params.clone();
-        modified_params.text = modified_text;
-
-        debug!(
-            "Detected location keywords. Running parallel search: '{}' and '{}'",
-            params.text, modified_params.text
-        );
-
-        let (res_orig, res_mod) = futures::future::join(
-            execute_search_internal(client, scylla_client, params, autocomplete),
-            execute_search_internal(client, scylla_client, modified_params, autocomplete),
-        )
-        .await;
-
-        match (res_orig, res_mod) {
-            (Ok(r1), Ok(r2)) => Ok(merge_internal_results(r1, r2)),
-            (Ok(r1), Err(e)) => {
-                debug!("Modified search failed: {}", e);
-                Ok(r1)
-            }
-            (Err(e), Ok(r2)) => {
-                debug!("Original search failed: {}", e);
-                Ok(r2)
-            }
-            (Err(e1), Err(_)) => Err(e1),
-        }
-    } else {
-        execute_search_internal(client, scylla_client, params, autocomplete).await
-    }
-}
-
-fn remove_location_keywords(text: &str) -> Option<String> {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r"(?i)\b(City|Village|ville)\b").unwrap());
-
-    if re.is_match(text) {
-        let replaced = re.replace_all(text, "");
-        let cleaned: String = replaced.split_whitespace().collect::<Vec<&str>>().join(" ");
-        if cleaned.is_empty() || cleaned == text {
-            None
-        } else {
-            Some(cleaned)
-        }
-    } else {
-        None
-    }
-}
-
-fn merge_internal_results(
-    mut r1: InternalTimedResults,
-    r2: InternalTimedResults,
-) -> InternalTimedResults {
-    let mut map = HashMap::new();
-
-    // Process r1
-    for item in r1.places {
-        // item.0 is NormalizedPlace, item.0.source_id is the ID
-        map.insert(item.0.source_id.clone(), item);
-    }
-
-    // Process r2
-    for item in r2.places {
-        let id = item.0.source_id.clone();
-        match map.entry(id) {
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                // If new score is higher, replace
-                if item.1 > entry.get().1 {
-                    entry.insert(item);
-                }
-            }
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(item);
-            }
-        }
-    }
-
-    let mut places: Vec<_> = map.into_values().collect();
-    // Sort by score descending
-    places.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    InternalTimedResults {
-        places,
-        es_took_ms: std::cmp::max(r1.es_took_ms, r2.es_took_ms),
-        scylla_took_ms: std::cmp::max(r1.scylla_took_ms, r2.scylla_took_ms),
-    }
-}
-
-async fn execute_search_internal(
-    client: &EsClient,
-    scylla_client: &ScyllaClient,
-    params: SearchParams,
-    autocomplete: bool,
-) -> Result<InternalTimedResults> {
-    // Build full request body
-    let mut body = build_search_query(&params, autocomplete);
-
-    // Add bounding box filter
-    if let Some(bbox) = params.bbox {
-        let filter = json!({
-            "geo_bounding_box": {
-                "center_point": {
-                    "top_left": { "lon": bbox[0], "lat": bbox[3] },
-                    "bottom_right": { "lon": bbox[2], "lat": bbox[1] }
-                }
-            }
-        });
-
-        if let Some(existing_filter) = body["query"]["bool"]["filter"].as_array_mut() {
-            existing_filter.push(filter);
-        } else if body["query"]["bool"].is_object() {
-            body["query"]["bool"]["filter"] = json!([filter]);
-        } else if let Some(fq) =
-            body["query"]["function_score"]["query"]["bool"]["filter"].as_array_mut()
-        {
-            fq.push(filter);
-        } else if body["query"]["function_score"]["query"]["bool"].is_object() {
-            body["query"]["function_score"]["query"]["bool"]["filter"] = json!([filter]);
-        }
-    }
-
-    debug!("Search query: {}", serde_json::to_string_pretty(&body)?);
-
-    // Execute search
-    // Execute search
-    let start_es = std::time::Instant::now();
-    let response = client
-        .client()
-        .search(elasticsearch::SearchParts::Index(&[&client.index_name]))
-        .body(body)
-        .send()
-        .await?;
-    let es_took_ms = start_es.elapsed().as_millis();
-
-    let response_body = response.json::<serde_json::Value>().await?;
-
-    // Parse results and fetch from Scylla
-    let hits = response_body["hits"]["hits"]
-        .as_array()
-        .map(|a| a.to_vec())
-        .unwrap_or_default();
-
-    debug!("ES has {} took {} ms", hits.len(), es_took_ms);
-
-    if hits.is_empty() {
-        debug!("ES returned 0 hits. Raw response: {}", response_body);
-    }
-
-    let mut places_to_fetch = Vec::new();
-    let mut scores = HashMap::new();
-
-    for hit in hits {
-        if let Some(id) = hit["_id"].as_str() {
-            places_to_fetch.push(id.to_string());
-            let score = hit["_score"].as_f64().unwrap_or(0.0);
-            scores.insert(id.to_string(), score);
-        }
-        debug!("ES hit: {:?}", hit);
-    }
-
-    // Fetch from Scylla in parallel
-    let start_scylla = std::time::Instant::now();
-    let fetch_futures = places_to_fetch.iter().map(|id| scylla_client.get_place(id));
-    let mut normalized_places = Vec::new();
     let mut admin_ids = std::collections::HashSet::new();
 
-    for (i, fetch_result) in futures::future::join_all(fetch_futures)
-        .await
-        .into_iter()
-        .enumerate()
-    {
+    let fetch_futures = scored_ids.iter().map(|(id, _)| scylla_client.get_place(id));
+    let fetched = futures::future::join_all(fetch_futures).await;
+
+    let mut places_with_scores = Vec::new();
+    for (i, fetch_result) in fetched.into_iter().enumerate() {
         if let Ok(Some(json_data)) = fetch_result {
             if let Ok(place) = serde_json::from_str::<NormalizedPlace>(&json_data) {
-                let id = places_to_fetch[i].clone();
-                let score = scores.get(&id).copied().unwrap_or(0.0);
-
-                // Collect admin IDs
                 collect_admin_ids(&place, &mut admin_ids);
-
-                normalized_places.push((place, score));
-            } else {
-                debug!(
-                    "Failed to deserialize place from Scylla: {}",
-                    places_to_fetch[i]
-                );
+                places_with_scores.push((place, scored_ids[i].1));
             }
-        } else {
-            debug!(
-                "Place not found in Scylla or error: {} (Result: {:?})",
-                places_to_fetch[i], fetch_result
-            );
         }
     }
 
-    // Apply focus scoring in Rust
-    if let (Some(lat), Some(lon)) = (params.focus_lat, params.focus_lon) {
-        let focus_point = (lat, lon);
-
-        for (place, score) in normalized_places.iter_mut() {
-            let place_point = (place.center_point.lat, place.center_point.lon);
-            let distance_km = haversine_distance_km(focus_point, place_point);
-
-            // Decay function: 50km scale
-            // factor = 1.0 / (1.0 + (distance / 50.0)^2)
-            // This gives a nice bell curve shape, or we can use exponential
-            // Let's use simple exponential decay like ES gauss: exp(- (dist^2) / (2 * scale^2))
-            // scale = 50km
-            // But we want to dampen this effect by importance.
-
-            let scale = 50.0;
-            let decay = (-(distance_km * distance_km) / (2.0 * scale * scale)).exp();
-
-            let importance = place.importance.unwrap_or(0.0);
-
-            // Interpolate between decay and 1.0 based on importance
-            // If importance is 1.0, factor is 1.0 (no decay)
-            // If importance is 0.0, factor is decay (full decay)
-            let final_factor = decay + (1.0 - decay) * importance;
-
-            *score *= final_factor;
-        }
-
-        // Re-sort results
-        normalized_places
-            .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    }
-
-    // Batch fetch admin areas
     let admin_ids_vec: Vec<String> = admin_ids.into_iter().collect();
     let admin_map = scylla_client.get_admin_areas(&admin_ids_vec).await?;
-    let scylla_took_ms = start_scylla.elapsed().as_millis();
-
-    // Parse admin entries map once
     let parsed_admin_map: HashMap<String, AdminEntry> = admin_map
         .iter()
         .filter_map(|(k, v)| {
@@ -440,86 +442,37 @@ async fn execute_search_internal(
         .collect();
 
     let mut results = Vec::new();
-    for (place, score) in normalized_places {
-        results.push((place, score, params.lang.clone(), parsed_admin_map.clone()));
+    for (place, score) in places_with_scores {
+        if let Some(result) =
+            place_to_search_result_v2(place, score, &params.lang, &parsed_admin_map)
+        {
+            results.push(result);
+        }
     }
 
-    Ok(InternalTimedResults {
-        places: results,
-        es_took_ms,
-        scylla_took_ms,
+    Ok(TimedSearchResultsV2 {
+        results,
+        took_ms: start.elapsed().as_millis(),
     })
 }
 
-/// Execute a reverse geocoding search
 pub async fn execute_reverse(
-    client: &EsClient,
     scylla_client: &ScyllaClient,
+    memdb: &Arc<Memdb>,
     lon: f64,
     lat: f64,
     size: usize,
-    layers: Option<Vec<String>>,
+    _layers: Option<Vec<String>>,
 ) -> Result<Vec<SearchResult>> {
-    let mut filters = vec![json!({
-        "geo_distance": {
-            "distance": "1km",
-            "center_point": { "lat": lat, "lon": lon }
-        }
-    })];
+    let nearby = spatial_search(memdb, lon, lat, size, 1.0);
 
-    if let Some(ref layers) = layers {
-        filters.push(json!({
-            "terms": { "layer": layers }
-        }));
-    }
+    let fetch_futures = nearby.iter().map(|(id, _)| scylla_client.get_place(id));
+    let fetched = futures::future::join_all(fetch_futures).await;
 
-    let body = json!({
-        "track_total_hits": false,
-        "query": {
-            "bool": {
-                "filter": filters
-            }
-        },
-        "sort": [
-            {
-                "_geo_distance": {
-                    "center_point": { "lat": lat, "lon": lon },
-                    "order": "asc",
-                    "unit": "m"
-                }
-            }
-        ],
-        "size": size,
-        "stored_fields": ["_id"]
-    });
-
-    let response = client
-        .client()
-        .search(elasticsearch::SearchParts::Index(&[&client.index_name]))
-        .body(body)
-        .send()
-        .await?;
-
-    let response_body = response.json::<serde_json::Value>().await?;
-
-    let hits = response_body["hits"]["hits"]
-        .as_array()
-        .map(|a| a.to_vec())
-        .unwrap_or_default();
-
-    let mut places_to_fetch = Vec::new();
-
-    for hit in hits {
-        if let Some(id) = hit["_id"].as_str() {
-            places_to_fetch.push(id.to_string());
-        }
-    }
-
-    let fetch_futures = places_to_fetch.iter().map(|id| scylla_client.get_place(id));
-    let mut normalized_places = Vec::new();
     let mut admin_ids = std::collections::HashSet::new();
+    let mut normalized_places = Vec::new();
 
-    for fetch_result in futures::future::join_all(fetch_futures).await {
+    for fetch_result in fetched {
         if let Ok(Some(json_data)) = fetch_result {
             if let Ok(place) = serde_json::from_str::<NormalizedPlace>(&json_data) {
                 collect_admin_ids(&place, &mut admin_ids);
@@ -530,7 +483,6 @@ pub async fn execute_reverse(
 
     let admin_ids_vec: Vec<String> = admin_ids.into_iter().collect();
     let admin_map = scylla_client.get_admin_areas(&admin_ids_vec).await?;
-
     let parsed_admin_map: HashMap<String, AdminEntry> = admin_map
         .iter()
         .filter_map(|(k, v)| {
@@ -550,76 +502,24 @@ pub async fn execute_reverse(
     Ok(results)
 }
 
-/// Execute a reverse geocoding search V2
 pub async fn execute_reverse_v2(
-    client: &EsClient,
     scylla_client: &ScyllaClient,
+    memdb: &Arc<Memdb>,
     lon: f64,
     lat: f64,
     size: usize,
-    layers: Option<Vec<String>>,
+    _layers: Option<Vec<String>>,
     lang: Option<String>,
 ) -> Result<Vec<SearchResultV2>> {
-    let mut filters = vec![json!({
-        "geo_distance": {
-            "distance": "1km",
-            "center_point": { "lat": lat, "lon": lon }
-        }
-    })];
+    let nearby = spatial_search(memdb, lon, lat, size, 1.0);
 
-    if let Some(ref layers) = layers {
-        filters.push(json!({
-            "terms": { "layer": layers }
-        }));
-    }
+    let fetch_futures = nearby.iter().map(|(id, _)| scylla_client.get_place(id));
+    let fetched = futures::future::join_all(fetch_futures).await;
 
-    let body = json!({
-        "track_total_hits": false,
-        "query": {
-            "bool": {
-                "filter": filters
-            }
-        },
-        "sort": [
-            {
-                "_geo_distance": {
-                    "center_point": { "lat": lat, "lon": lon },
-                    "order": "asc",
-                    "unit": "m"
-                }
-            }
-        ],
-        "size": size,
-        "stored_fields": ["_id"]
-    });
-
-    let response = client
-        .client()
-        .search(elasticsearch::SearchParts::Index(&[&client.index_name]))
-        .body(body)
-        .send()
-        .await?;
-
-    let response_body = response.json::<serde_json::Value>().await?;
-
-    let hits = response_body["hits"]["hits"]
-        .as_array()
-        .map(|a| a.to_vec())
-        .unwrap_or_default();
-
-    let mut places_to_fetch = Vec::new();
-
-    for hit in hits {
-        if let Some(id) = hit["_id"].as_str() {
-            places_to_fetch.push(id.to_string());
-        }
-    }
-
-    let fetch_futures = places_to_fetch.iter().map(|id| scylla_client.get_place(id));
-    let mut normalized_places = Vec::new();
     let mut admin_ids = std::collections::HashSet::new();
+    let mut normalized_places = Vec::new();
 
-    for fetch_result in futures::future::join_all(fetch_futures).await {
+    for fetch_result in fetched {
         if let Ok(Some(json_data)) = fetch_result {
             if let Ok(place) = serde_json::from_str::<NormalizedPlace>(&json_data) {
                 collect_admin_ids(&place, &mut admin_ids);
@@ -630,7 +530,6 @@ pub async fn execute_reverse_v2(
 
     let admin_ids_vec: Vec<String> = admin_ids.into_iter().collect();
     let admin_map = scylla_client.get_admin_areas(&admin_ids_vec).await?;
-
     let parsed_admin_map: HashMap<String, AdminEntry> = admin_map
         .iter()
         .filter_map(|(k, v)| {
@@ -650,7 +549,6 @@ pub async fn execute_reverse_v2(
     Ok(results)
 }
 
-/// Parse an Elasticsearch hit into a SearchResult
 fn collect_admin_ids(place: &NormalizedPlace, ids: &mut std::collections::HashSet<String>) {
     if let Some(ref id) = place.parent.country {
         ids.insert(id.clone());
@@ -688,8 +586,6 @@ fn resolve_admin_name(
 ) -> Option<String> {
     id.as_ref().and_then(|id_str| {
         map.get(id_str).and_then(|entry| {
-            // Try language-specific name first, then fall back to default name
-            // Names HashMap uses simple language codes: "de", "fr", "id", etc.
             lang.as_ref()
                 .and_then(|l| entry.names.get(l))
                 .cloned()
@@ -707,14 +603,12 @@ fn resolve_admin_names(
         .and_then(|id_str| map.get(id_str).map(|entry| entry.names.clone()))
 }
 
-/// Convert a Place model to SearchResult
 fn place_to_search_result(
     place: NormalizedPlace,
     score: f64,
     preferred_lang: &Option<String>,
     admin_map: &HashMap<String, AdminEntry>,
 ) -> Option<SearchResult> {
-    // Pick display name based on language preference
     let display_name = preferred_lang
         .as_ref()
         .and_then(|lang| place.name.get(lang))
@@ -741,7 +635,7 @@ fn place_to_search_result(
         },
         properties: Properties {
             id: place.source_id,
-            layer: format!("{:?}", place.layer).to_lowercase(), // format! using generic debug or we can impl Display
+            layer: format!("{:?}", place.layer).to_lowercase(),
             name: display_name,
             names: place.name,
             housenumber: place.address.as_ref().and_then(|a| a.housenumber.clone()),
@@ -758,14 +652,12 @@ fn place_to_search_result(
     })
 }
 
-/// Convert a Place model to SearchResult V2
 fn place_to_search_result_v2(
     place: NormalizedPlace,
     score: f64,
     preferred_lang: &Option<String>,
     admin_map: &HashMap<String, AdminEntry>,
 ) -> Option<SearchResultV2> {
-    // Pick display name based on language preference
     let display_name = preferred_lang
         .as_ref()
         .and_then(|lang| place.name.get(lang))
@@ -837,55 +729,15 @@ fn get_layer_rank(layer: Layer) -> u8 {
         Layer::Borough => 30,
         Layer::Neighbourhood => 20,
         Layer::Street | Layer::Address | Layer::Venue => 10,
-        Layer::Admin => 50, // Generic admin, treat as mid-level
+        Layer::Admin => 50,
     }
-}
-
-fn build_search_query(params: &SearchParams, autocomplete: bool) -> serde_json::Value {
-    json!({
-        "query": {
-            "bool": {
-                "must": [
-                    {
-                        "multi_match": {
-                            "query": &params.text,
-                            "fields": [
-                                "name_all",
-                                "parent.country.name",
-                                "parent.macro_region.name",
-                                "parent.region.name",
-                                "parent.macro_county.name",
-                                "parent.county.name",
-                                "parent.local_admin.name",
-                                "parent.locality.name",
-                                "parent.borough.name",
-                                "parent.neighbourhood.name"
-                            ],
-                            "type": "cross_fields",
-                            "operator": "and"
-                        }
-                    }
-                ],
-                "should": [
-                    {
-                        "rank_feature": {
-                            "field": "importance",
-                            "boost": 10.0
-                        }
-                    }
-                ]
-            }
-        },
-        "size": params.size,
-        "stored_fields": ["_id"]
-    })
 }
 
 pub fn haversine_distance_km(p1: (f64, f64), p2: (f64, f64)) -> f64 {
     let (lat1, lon1) = p1;
     let (lat2, lon2) = p2;
 
-    let r = 6371.0; // Earth radius in km
+    let r = 6371.0;
 
     let dlat = (lat2 - lat1).to_radians();
     let dlon = (lon2 - lon1).to_radians();
@@ -954,15 +806,10 @@ mod tests {
         assert_eq!(result.properties.names.get("default").unwrap(), "London");
         assert_eq!(result.properties.names.get("fr").unwrap(), "Londres");
 
-        // Verify country names
         assert!(result.properties.country_names.is_some());
         let c_names = result.properties.country_names.unwrap();
         assert_eq!(c_names.get("default").unwrap(), "United Kingdom");
         assert_eq!(c_names.get("de").unwrap(), "Vereinigtes Königreich");
-
-        // Verify that other fields (like region) would also work if populated (mocking logic verification)
-        // Since we mocked country, we know the logic is generic.
-        // But let's add a region just to be sure.
     }
 
     #[test]
@@ -1036,60 +883,6 @@ mod tests {
             "Isle of France"
         );
     }
-    #[test]
-    fn test_build_search_query() {
-        let params = SearchParams {
-            text: "Munchen".to_string(),
-            lang: None,
-            bbox: None,
-            focus_lat: None,
-            focus_lon: None,
-            focus_weight: None,
-            layers: None,
-            size: 10,
-        };
-
-        let query_json = build_search_query(&params, false);
-        let query_str = query_json.to_string();
-
-        // Verify Rank Feature
-        assert!(query_str.contains("rank_feature"));
-        assert!(query_str.contains("importance"));
-
-        // Verify Multi Match
-        assert!(query_str.contains("multi_match"));
-        assert!(query_str.contains("Munchen"));
-        assert!(query_str.contains("parent.country.name"));
-
-        // Verify Layer Biasing
-        // Note: verify structure based on actual implementation if needed, but existing assertions below might be fragile if implementation changed.
-        // Assuming implementation keeps "should" clauses for rank_feature.
-    }
-
-    #[test]
-    fn test_build_search_query_with_admin() {
-        let params = SearchParams {
-            text: "Kings Cross London".to_string(),
-            lang: None,
-            bbox: None,
-            focus_lat: None,
-            focus_lon: None,
-            focus_weight: None,
-            layers: None,
-            size: 10,
-        };
-
-        let query = build_search_query(&params, false);
-        let query_json = serde_json::to_string_pretty(&query).unwrap();
-
-        // Verify structure
-        assert!(query_json.contains("multi_match"));
-        assert!(query_json.contains("Kings Cross London"));
-        assert!(query_json.contains("name_all"));
-        assert!(query_json.contains("parent.country.name"));
-        assert!(query_json.contains("parent.locality.name"));
-        assert!(query_json.contains("cross_fields"));
-    }
 
     #[test]
     fn test_place_to_search_result_v2_hierarchy_filtering() {
@@ -1129,7 +922,7 @@ mod tests {
             osm_id: 111,
             wikidata_id: None,
             importance: Some(1.0),
-            layer: Layer::Region, // Rank 80
+            layer: Layer::Region,
             categories: vec![],
             name: names,
             phrase: None,
@@ -1141,8 +934,8 @@ mod tests {
             bbox: None,
             parent: AdminHierarchyIds::default(),
         };
-        place.parent.country = Some("relation/1".to_string()); // Rank 100
-        place.parent.county = Some("relation/3".to_string()); // Rank 60
+        place.parent.country = Some("relation/1".to_string());
+        place.parent.county = Some("relation/3".to_string());
 
         let result = place_to_search_result_v2(place, 1.0, &None, &admin_map).unwrap();
 
@@ -1151,31 +944,5 @@ mod tests {
 
         // County (Rank 60) <= Region (Rank 80) -> Should be filtered out
         assert_eq!(result.properties.county, None);
-    }
-    #[test]
-    fn test_remove_location_keywords() {
-        assert_eq!(
-            remove_location_keywords("New York City"),
-            Some("New York".to_string())
-        );
-        assert_eq!(
-            remove_location_keywords("Kansas City"),
-            Some("Kansas".to_string())
-        );
-        assert_eq!(
-            remove_location_keywords("Greenwich Village"),
-            Some("Greenwich".to_string())
-        );
-        assert_eq!(
-            remove_location_keywords("Hotel de Ville"),
-            Some("Hotel de".to_string())
-        ); // ville is a separate word
-        assert_eq!(remove_location_keywords("Nashville"), None); // "ville" usage as suffix
-        assert_eq!(remove_location_keywords("City"), None); // Empty result
-        assert_eq!(remove_location_keywords("London"), None); // No keywords
-        assert_eq!(
-            remove_location_keywords("The City of London"),
-            Some("The of London".to_string())
-        );
     }
 }

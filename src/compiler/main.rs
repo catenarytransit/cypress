@@ -1,19 +1,19 @@
 use anyhow::{Context, Result};
-use bytemuck::{Pod, Zeroable};
 use clap::Parser;
-use cypress::models::place::PlaceSummary;
-use fst::MapBuilder;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
+use cypress::models::memdb::{CypressMemDb, PlaceRecord};
 use cypress::scylla::ScyllaClient;
+use rkyv::ser::{serializers::AllocSerializer, Serializer};
 
 #[derive(Parser, Debug)]
 #[command(name = "compiler")]
-#[command(about = "Compiles ScyllaDB places into FST and binary memory maps")]
+#[command(about = "Compiles ScyllaDB places into zero-copy rkyv memory maps")]
 struct Args {
     /// ScyllaDB URL
     #[arg(long, default_value = "127.0.0.1")]
@@ -22,6 +22,22 @@ struct Args {
     /// Output directory for compiled files
     #[arg(short, long, default_value = "./data/compiled")]
     out_dir: String,
+}
+
+fn get_layer_rank(layer: cypress::models::place::Layer) -> u8 {
+    // Basic assignment based on general importance.
+    match layer {
+        cypress::models::place::Layer::Country => 9,
+        cypress::models::place::Layer::MacroRegion => 8,
+        cypress::models::place::Layer::Region => 7,
+        cypress::models::place::Layer::MacroCounty => 6,
+        cypress::models::place::Layer::County => 5,
+        cypress::models::place::Layer::LocalAdmin => 4,
+        cypress::models::place::Layer::Locality => 3,
+        cypress::models::place::Layer::Borough => 2,
+        cypress::models::place::Layer::Neighbourhood => 1,
+        _ => 0,
+    }
 }
 
 #[tokio::main]
@@ -38,18 +54,18 @@ async fn main() -> Result<()> {
     info!("Connecting to ScyllaDB at {}", args.scylla_url);
     let scylla_client = ScyllaClient::new(&args.scylla_url).await?;
 
-    info!("Streaming all places and compiling FST...");
+    info!("Streaming all places and compiling rkyv DB...");
 
-    // We will collect keys to sort in memory
-    let mut fst_keys = Vec::new();
-    let mut index = 0u64;
+    let mut places = Vec::new();
 
-    let bin_path = out_dir.join("places_summary.bin");
-    let fst_path = out_dir.join("typeahead.fst");
+    let mut string_id_map: HashMap<String, u32> = HashMap::new();
+    let mut string_to_places_temp: Vec<Vec<u32>> = Vec::new();
+    let mut string_bigram_counts = Vec::new();
+    let mut bigrams_temp: Vec<Vec<u32>> = vec![Vec::new(); 65536];
+
+    let mut spatial_map: HashMap<u32, Vec<u32>> = HashMap::new();
+
     let version_path = out_dir.join("current_version.txt");
-
-    let bin_file = File::create(&bin_path)?;
-    let mut bin_writer = BufWriter::new(bin_file);
 
     use futures::TryStreamExt;
     let mut rows_stream = scylla_client
@@ -57,6 +73,8 @@ async fn main() -> Result<()> {
         .query_iter("SELECT data FROM cypress.places", &[])
         .await?
         .rows_stream::<(String,)>()?;
+
+    let mut place_count = 0u32;
 
     while let Some((data,)) = rows_stream.try_next().await? {
         let place: cypress::models::normalized::NormalizedPlace = match serde_json::from_str(&data)
@@ -68,20 +86,6 @@ async fn main() -> Result<()> {
             }
         };
 
-        let mut summary = PlaceSummary {
-            source_id: [0; 64],
-            name: [0; 128],
-            lat: place.center_point.lat as f32,
-            lon: place.center_point.lon as f32,
-            importance: place.importance.unwrap_or(0.0) as f32,
-        };
-
-        // Copy source ID bytes
-        let src_id_bytes = place.source_id.as_bytes();
-        let copy_len = src_id_bytes.len().min(64);
-        summary.source_id[..copy_len].copy_from_slice(&src_id_bytes[..copy_len]);
-
-        // Choose best name to display
         let display_name = place
             .phrase
             .clone()
@@ -89,47 +93,146 @@ async fn main() -> Result<()> {
             .or_else(|| place.name.values().next().cloned())
             .unwrap_or_default();
 
+        let mut record = PlaceRecord {
+            source_id_bytes: [0; 64],
+            source_id_len: 0,
+            name_bytes: [0; 128],
+            name_len: 0,
+            lat: place.center_point.lat as f32,
+            lon: place.center_point.lon as f32,
+            importance: place.importance.unwrap_or(0.0) as f32,
+            layer_rank: get_layer_rank(place.layer),
+        };
+
+        let src_id_bytes = place.source_id.as_bytes();
+        let copy_len = src_id_bytes.len().min(64);
+        record.source_id_bytes[..copy_len].copy_from_slice(&src_id_bytes[..copy_len]);
+        record.source_id_len = copy_len as u8;
+
         let name_bytes = display_name.as_bytes();
         let copy_len = name_bytes.len().min(128);
-        summary.name[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
+        record.name_bytes[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
+        record.name_len = copy_len as u8;
 
-        // Write binary struct
-        bin_writer.write_all(bytemuck::bytes_of(&summary))?;
+        places.push(record);
 
-        // Harvest keys for FST
+        let place_id = place_count;
+
+        // Populate spatial grid
+        let cell_id = CypressMemDb::coord_to_cell(
+            place.center_point.lat as f32,
+            place.center_point.lon as f32,
+        );
+        spatial_map.entry(cell_id).or_default().push(place_id);
+
+        let mut unique_phrases = HashSet::new();
         for phrase in place.name.values().chain(place.phrase.iter()) {
-            let mut key = phrase.trim().to_lowercase();
-            if key.is_empty() {
-                continue;
+            let key = phrase.trim().to_lowercase();
+            if !key.is_empty() {
+                unique_phrases.insert(key);
             }
-            key.push('\0');
-            key.push_str(&place.source_id);
-            fst_keys.push((key, index));
         }
 
-        index += 1;
-        if index % 100000 == 0 {
-            info!("Processed {} places...", index);
+        // Process bigrams
+        for phrase in unique_phrases {
+            let str_id = if let Some(&id) = string_id_map.get(&phrase) {
+                id
+            } else {
+                let new_id = string_to_places_temp.len() as u32;
+                string_id_map.insert(phrase.clone(), new_id);
+                string_to_places_temp.push(Vec::new());
+
+                let text_bytes = phrase.as_bytes();
+                let mut count = 0;
+                let mut local_bigrams = Vec::new();
+                for window in text_bytes.windows(2) {
+                    let bigram_key = ((window[0] as u16) << 8) | (window[1] as u16);
+                    local_bigrams.push(bigram_key);
+                    count += 1;
+                }
+                string_bigram_counts.push(count.min(255) as u8);
+
+                local_bigrams.dedup();
+                for bg in local_bigrams {
+                    bigrams_temp[bg as usize].push(new_id);
+                }
+
+                new_id
+            };
+
+            string_to_places_temp[str_id as usize].push(place_id);
+        }
+
+        place_count += 1;
+        if place_count % 100000 == 0 {
+            info!("Processed {} places...", place_count);
         }
     }
-    bin_writer.flush()?;
 
-    info!(
-        "Total places: {}. Sorting {} FST keys...",
-        index,
-        fst_keys.len()
-    );
-    fst_keys.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    fst_keys.dedup_by(|a, b| a.0 == b.0);
+    info!("Flattening structures...");
 
-    info!("Building FST...");
-    let fst_file = File::create(&fst_path)?;
-    let mut fst_writer = BufWriter::new(fst_file);
-    let mut build = MapBuilder::new(&mut fst_writer)?;
-    for (k, v) in fst_keys {
-        build.insert(k, v)?;
+    // Flatten bigrams
+    let mut bigram_offsets = Vec::with_capacity(65537);
+    let mut bigram_data = Vec::new();
+    let mut current_offset = 0;
+    for list in bigrams_temp.iter_mut() {
+        list.dedup();
+        bigram_offsets.push(current_offset);
+        bigram_data.extend_from_slice(list);
+        current_offset = bigram_data.len() as u32;
     }
-    build.finish()?;
+    bigram_offsets.push(current_offset);
+
+    // Flatten strings_to_places
+    let mut string_to_places_offsets = Vec::with_capacity(string_to_places_temp.len() + 1);
+    let mut string_to_places_data = Vec::new();
+    current_offset = 0;
+    for list in string_to_places_temp.iter_mut() {
+        list.dedup();
+        string_to_places_offsets.push(current_offset);
+        string_to_places_data.extend_from_slice(list);
+        current_offset = string_to_places_data.len() as u32;
+    }
+    string_to_places_offsets.push(current_offset);
+
+    // Flatten Spatial Grid
+    let mut active_cells = Vec::new();
+    let mut cell_offsets = Vec::new();
+    let mut cell_places = Vec::new();
+
+    let mut cells: Vec<_> = spatial_map.into_iter().collect();
+    cells.sort_unstable_by_key(|(k, _)| *k);
+
+    current_offset = 0;
+    for (cell_id, places_in_cell) in cells {
+        active_cells.push(cell_id);
+        cell_offsets.push(current_offset);
+        cell_places.extend(places_in_cell);
+        current_offset = cell_places.len() as u32;
+    }
+    cell_offsets.push(current_offset);
+
+    let memdb = CypressMemDb {
+        string_bigram_counts,
+        bigram_offsets,
+        bigram_data,
+        places,
+        string_to_places_offsets,
+        string_to_places_data,
+        active_cells,
+        cell_offsets,
+        cell_places,
+    };
+
+    info!("Serializing with rkyv...");
+    let mut serializer = AllocSerializer::<4096>::default();
+    serializer.serialize_value(&memdb).unwrap();
+    let bytes = serializer.into_serializer().into_inner();
+
+    let db_path = out_dir.join("cypress_memdb.bin");
+    let mut file = File::create(&db_path)?;
+    file.write_all(&bytes)?;
+    file.flush()?;
 
     // Atomically write new version file
     info!("Writing current_version.txt...");

@@ -1,6 +1,7 @@
 //! Core data models for the geocoding system.
 
 pub mod admin;
+pub mod memdb;
 pub mod normalized;
 pub mod place;
 

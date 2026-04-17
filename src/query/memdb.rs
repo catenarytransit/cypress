@@ -1,7 +1,5 @@
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
-use bytemuck::cast_slice;
-use fst::Map;
 use memmap2::Mmap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -9,12 +7,49 @@ use std::sync::Arc;
 use tokio::time::{interval, Duration};
 use tracing::{info, warn};
 
-use cypress::models::place::PlaceSummary;
+use cypress::models::memdb::{ArchivedCypressMemDb, CypressMemDb};
+
+pub struct CosSimMatch {
+    pub string_idx: u32,
+    pub cos_sim: f32,
+}
+
+pub struct GuessContext {
+    pub string_match_counts: Vec<u16>,
+    pub string_matches: Vec<CosSimMatch>,
+}
+
+impl GuessContext {
+    pub fn new(size: usize) -> Self {
+        Self {
+            string_match_counts: vec![0; size],
+            string_matches: Vec::with_capacity(6000),
+        }
+    }
+
+    pub fn clear(&mut self, needed_size: usize) {
+        if self.string_match_counts.len() < needed_size {
+            self.string_match_counts.resize(needed_size, 0);
+        } else {
+            self.string_match_counts.fill(0);
+        }
+        self.string_matches.clear();
+    }
+}
+
+thread_local! {
+    pub static GUESS_CONTEXT: std::cell::RefCell<GuessContext> = std::cell::RefCell::new(GuessContext::new(0));
+}
 
 pub struct MemdbData {
-    pub map: Map<Mmap>,
-    pub mmap_data: Mmap,
+    pub mmap: Mmap,
     pub version: String,
+}
+
+impl MemdbData {
+    pub fn get_archived(&self) -> &ArchivedCypressMemDb {
+        unsafe { rkyv::archived_root::<CypressMemDb>(&self.mmap) }
+    }
 }
 
 pub struct Memdb {
@@ -48,20 +83,11 @@ impl Memdb {
 
     fn load_data(out_dir: &Path, version: String) -> Result<MemdbData> {
         info!("Loading memdb version: {}", version);
-        let fst_file =
-            File::open(out_dir.join("typeahead.fst")).context("Failed to open typeahead.fst")?;
-        let fst_mmap = unsafe { Mmap::map(&fst_file)? };
-        let map = Map::new(fst_mmap).context("Failed to parse FST map")?;
+        let bin_file = File::open(out_dir.join("cypress_memdb.bin"))
+            .context("Failed to open cypress_memdb.bin")?;
+        let mmap = unsafe { Mmap::map(&bin_file)? };
 
-        let bin_file = File::open(out_dir.join("places_summary.bin"))
-            .context("Failed to open places_summary.bin")?;
-        let mmap_data = unsafe { Mmap::map(&bin_file)? };
-
-        Ok(MemdbData {
-            map,
-            mmap_data,
-            version,
-        })
+        Ok(MemdbData { mmap, version })
     }
 
     async fn check_reload(&self) -> Result<()> {
@@ -98,12 +124,5 @@ impl Memdb {
     /// Read the active database instance
     pub fn get_data(&self) -> arc_swap::Guard<Arc<MemdbData>> {
         self.data.load()
-    }
-
-    /// Helper to get a place by its array index
-    pub fn get_summary(&self, index: u64) -> Option<PlaceSummary> {
-        let data = self.get_data();
-        let summaries: &[PlaceSummary] = cast_slice(&data.mmap_data);
-        summaries.get(index as usize).copied()
     }
 }

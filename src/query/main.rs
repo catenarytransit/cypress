@@ -1,7 +1,7 @@
 //! Query server for geocoding searches.
 //!
-//! Provides HTTP API for forward and reverse geocoding with support for
-//! bounding box bias, location bias, and multilingual results.
+//! All search and autocomplete endpoints use the zero-copy rkyv memory-mapped
+//! bigram inverted index. Elasticsearch is not required.
 
 use std::sync::Arc;
 
@@ -20,13 +20,12 @@ use tower_http::trace::TraceLayer;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use cypress::elasticsearch::EsClient;
 use cypress::scylla::ScyllaClient;
 
 mod memdb;
 mod search;
-use memdb::Memdb;
-use search::{execute_search, execute_search_v2, SearchParams, SearchResult, SearchResultV2};
+use memdb::{CosSimMatch, GuessContext, Memdb, GUESS_CONTEXT};
+use search::{SearchParams, SearchResult, SearchResultV2};
 
 #[derive(Parser, Debug)]
 #[command(name = "query")]
@@ -36,33 +35,23 @@ struct Args {
     #[arg(short, long, default_value = "0.0.0.0:3000")]
     listen: String,
 
-    /// Elasticsearch URL
-    #[arg(long, default_value = "http://localhost:9200")]
-    es_url: String,
-
-    /// Elasticsearch index name
-    #[arg(long, default_value = "places")]
-    index: String,
-
     /// ScyllaDB URL
     #[arg(long, default_value = "127.0.0.1")]
     scylla_url: String,
 
-    /// Directory containing FST and memory-mapped files compiled by 'compiler'
+    /// Directory containing rkyv memory-mapped files compiled by 'compiler'
     #[arg(long, default_value = "./data/compiled")]
     memdb_dir: String,
 }
 
 /// Application state shared across handlers
 struct AppState {
-    es_client: EsClient,
     scylla_client: ScyllaClient,
     memdb: Arc<Memdb>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging
     let subscriber = FmtSubscriber::builder()
         .with_max_level(Level::DEBUG)
         .finish();
@@ -71,22 +60,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     info!("Cypress Query Server");
-    info!("Connecting to Elasticsearch at {}", args.es_url);
 
-    // Connect to Elasticsearch
-    let es_client = EsClient::new(&args.es_url, &args.index).await?;
-
-    if !es_client.health_check().await? {
-        anyhow::bail!("Elasticsearch cluster is not healthy");
-    }
-
-    let doc_count = es_client.doc_count().await?;
-    info!(
-        "Connected to index '{}' with {} documents",
-        args.index, doc_count
-    );
-
-    // Connect to ScyllaDB
     info!("Connecting to ScyllaDB at {}", args.scylla_url);
     let scylla_client = ScyllaClient::new(&args.scylla_url).await?;
 
@@ -94,12 +68,10 @@ async fn main() -> Result<()> {
     let memdb = Memdb::new(&args.memdb_dir)?;
 
     let state = Arc::new(AppState {
-        es_client,
         scylla_client,
         memdb,
     });
 
-    // Build router
     let app = Router::new()
         .route("/health", get(health_handler))
         .route("/v1/search", get(search_handler))
@@ -120,25 +92,192 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Health check endpoint
 async fn health_handler(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
 ) -> Result<Json<HealthResponse>, StatusCode> {
-    let healthy = state.es_client.health_check().await.unwrap_or(false);
-
-    Ok(Json(HealthResponse {
-        status: if healthy { "ok" } else { "degraded" },
-        elasticsearch: healthy,
-    }))
+    Ok(Json(HealthResponse { status: "ok" }))
 }
 
 #[derive(Serialize)]
 struct HealthResponse {
     status: &'static str,
-    elasticsearch: bool,
 }
 
-/// Forward geocoding search
+/// Autocomplete endpoint — Bigram Cosine Similarity hot path
+async fn autocomplete_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<SearchQueryParams>,
+) -> Result<Json<AutocompleteResponse>, (StatusCode, String)> {
+    let start = std::time::Instant::now();
+    let text = params.text.trim().to_lowercase();
+
+    let mut features = Vec::new();
+
+    if text.len() >= 2 {
+        let memdb_data = state.memdb.get_data();
+        let db = memdb_data.get_archived();
+
+        let size = params.size.unwrap_or(10).min(20);
+
+        let focus_point =
+            if let (Some(lat), Some(lon)) = (params.focus_point_lat, params.focus_point_lon) {
+                Some((lat, lon))
+            } else {
+                None
+            };
+        let weight = params.focus_point_weight.unwrap_or(50.0);
+
+        let string_count = db.string_bigram_counts.len();
+
+        GUESS_CONTEXT.with(|cell| {
+            let mut ctx = cell.borrow_mut();
+            ctx.clear(string_count);
+
+            let query_bytes = text.as_bytes();
+            let mut query_bigrams: u32 = 0;
+
+            // 1. Accumulate bigram match counts
+            for window in query_bytes.windows(2) {
+                let bigram_key = ((window[0] as u16) << 8) | (window[1] as u16);
+                let idx = bigram_key as usize;
+                let start = db.bigram_offsets[idx] as usize;
+                let end = db.bigram_offsets[idx + 1] as usize;
+                for i in start..end {
+                    let string_idx = db.bigram_data[i] as usize;
+                    if string_idx < ctx.string_match_counts.len() {
+                        ctx.string_match_counts[string_idx] += 1;
+                    }
+                }
+                query_bigrams += 1;
+            }
+
+            if query_bigrams == 0 {
+                return;
+            }
+
+            let min_match_count = (2 + query_bigrams / (4 + query_bigrams / 10)) as u16;
+
+            // 2. Compute Cosine Similarity
+            let count_len = ctx.string_match_counts.len();
+            for string_idx in 0..count_len {
+                let match_count = ctx.string_match_counts[string_idx];
+                if match_count < min_match_count {
+                    continue;
+                }
+
+                let str_bigram_count = db.string_bigram_counts[string_idx] as f32;
+                if str_bigram_count == 0.0 {
+                    continue;
+                }
+                let cos_sim = (match_count as f32 * match_count as f32)
+                    / (str_bigram_count * query_bigrams as f32);
+
+                if cos_sim >= 0.17 {
+                    ctx.string_matches.push(CosSimMatch {
+                        string_idx: string_idx as u32,
+                        cos_sim,
+                    });
+                }
+            }
+
+            // 3. Partial sort and truncate
+            let max_matches = 6000.min(ctx.string_matches.len());
+            if ctx.string_matches.len() > max_matches {
+                ctx.string_matches
+                    .select_nth_unstable_by(max_matches, |a, b| {
+                        b.cos_sim
+                            .partial_cmp(&a.cos_sim)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                ctx.string_matches.truncate(max_matches);
+            }
+            ctx.string_matches.sort_unstable_by(|a, b| {
+                b.cos_sim
+                    .partial_cmp(&a.cos_sim)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            // 4. Entity resolution: map string matches to places
+            struct ScoredFeature {
+                feature: AutocompleteFeature,
+                score: f64,
+            }
+
+            let mut scored_features = Vec::with_capacity(size);
+
+            for text_match in &ctx.string_matches {
+                let sid = text_match.string_idx as usize;
+                let p_start = db.string_to_places_offsets[sid] as usize;
+                let p_end = db.string_to_places_offsets[sid + 1] as usize;
+
+                for i in p_start..p_end {
+                    let place_id = db.string_to_places_data[i] as usize;
+                    let place = &db.places[place_id];
+
+                    let importance = place.importance as f64;
+                    let text_score = text_match.cos_sim as f64;
+
+                    let decay = if let Some(focus) = focus_point {
+                        let distance_km = search::haversine_distance_km(
+                            focus,
+                            (place.lat as f64, place.lon as f64),
+                        );
+                        (-(distance_km * distance_km) / (2.0 * weight * weight)).exp()
+                    } else {
+                        1.0
+                    };
+
+                    let final_score = text_score * (1.0 + importance * 10.0) * decay;
+
+                    let name =
+                        String::from_utf8_lossy(&place.name_bytes[..place.name_len as usize])
+                            .into_owned();
+                    let source_id = String::from_utf8_lossy(
+                        &place.source_id_bytes[..place.source_id_len as usize],
+                    )
+                    .into_owned();
+
+                    scored_features.push(ScoredFeature {
+                        feature: AutocompleteFeature {
+                            result_type: "Feature".to_string(),
+                            geometry: search::Geometry {
+                                geo_type: "Point".to_string(),
+                                coordinates: [place.lon as f64, place.lat as f64],
+                            },
+                            properties: AutocompleteProperties {
+                                id: source_id,
+                                name,
+                            },
+                        },
+                        score: final_score,
+                    });
+                }
+            }
+
+            scored_features.sort_unstable_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            // Deduplicate by source_id, keeping highest score
+            let mut seen = std::collections::HashSet::new();
+            features = scored_features
+                .into_iter()
+                .filter(|sf| seen.insert(sf.feature.properties.id.clone()))
+                .take(size)
+                .map(|sf| sf.feature)
+                .collect();
+        });
+    }
+
+    Ok(Json(AutocompleteResponse {
+        features,
+        memdb_took_ms: start.elapsed().as_millis(),
+    }))
+}
+
+/// Forward geocoding search — delegates to bigram engine then hydrates from Scylla
 async fn search_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<SearchQueryParams>,
@@ -157,7 +296,7 @@ async fn search_handler(
         size: params.size.unwrap_or(10).min(40),
     };
 
-    let results = execute_search(&state.es_client, &state.scylla_client, search_params, false)
+    let results = search::execute_search(&state.scylla_client, &state.memdb, search_params)
         .await
         .map_err(|e| {
             tracing::error!("Search execution failed: {}", e);
@@ -166,115 +305,119 @@ async fn search_handler(
 
     Ok(Json(SearchResponse {
         features: results.results,
-        es_took_ms: results.es_took_ms,
-        scylla_took_ms: results.scylla_took_ms,
+        took_ms: results.took_ms,
     }))
 }
 
-/// Autocomplete endpoint (Tier 1 Hot Path)
-async fn autocomplete_handler(
+/// Forward geocoding search V2
+async fn search_v2_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<SearchQueryParams>,
-) -> Result<Json<AutocompleteResponse>, (StatusCode, String)> {
-    let start = std::time::Instant::now();
-    let text = params.text.to_lowercase();
+) -> Result<Json<SearchResponseV2>, (StatusCode, String)> {
+    let search_params = SearchParams {
+        text: params.text.clone(),
+        lang: params.lang.clone(),
+        bbox: parse_bbox(&params.bbox),
+        focus_lat: params.focus_point_lat,
+        focus_lon: params.focus_point_lon,
+        focus_weight: params.focus_point_weight,
+        layers: params
+            .layers
+            .as_ref()
+            .map(|l| l.split(',').map(String::from).collect()),
+        size: params.size.unwrap_or(10).min(40),
+    };
 
-    let mut features = Vec::new();
+    let results = search::execute_search_v2(&state.scylla_client, &state.memdb, search_params)
+        .await
+        .map_err(|e| {
+            tracing::error!("Search V2 execution failed: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
 
-    if !text.is_empty() {
-        let memdb_data = state.memdb.get_data();
-
-        use fst::{Automaton, IntoStreamer};
-        let prefix = fst::automaton::Str::new(&text).starts_with();
-        let mut stream = memdb_data.map.search(prefix).into_stream();
-
-        let size = params.size.unwrap_or(10).min(20);
-
-        use fst::Streamer;
-
-        struct ScoredFeature {
-            feature: AutocompleteFeature,
-            score: f64,
-        }
-
-        let mut scored_features = Vec::with_capacity(size);
-        let mut count = 0;
-
-        let focus_point =
-            if let (Some(lat), Some(lon)) = (params.focus_point_lat, params.focus_point_lon) {
-                Some((lat, lon))
-            } else {
-                None
-            };
-        let weight = params.focus_point_weight.unwrap_or(3.0);
-
-        while let Some((_key, idx)) = stream.next() {
-            if count >= 5000 {
-                break;
-            }
-            count += 1;
-
-            if let Some(summary) = state.memdb.get_summary(idx) {
-                // parse zero-padded strings
-                let parse_str = |b: &[u8]| {
-                    let end = b.iter().position(|&x| x == 0).unwrap_or(b.len());
-                    String::from_utf8_lossy(&b[..end]).into_owned()
-                };
-
-                let phrase_len = _key.iter().position(|&b| b == 0).unwrap_or(_key.len());
-                let token_completeness = if phrase_len > 0 {
-                    ((text.len() as f64) / (phrase_len as f64)).min(1.0)
-                } else {
-                    1.0
-                };
-
-                let importance = summary.importance as f64;
-
-                let decay = if let Some(focus) = focus_point {
-                    let distance_km = search::haversine_distance_km(
-                        focus,
-                        (summary.lat as f64, summary.lon as f64),
-                    );
-                    (-(distance_km * distance_km) / (2.0 * weight * weight)).exp()
-                } else {
-                    1.0
-                };
-
-                let final_score = token_completeness * importance * decay;
-
-                scored_features.push(ScoredFeature {
-                    feature: AutocompleteFeature {
-                        result_type: "Feature".to_string(),
-                        geometry: search::Geometry {
-                            geo_type: "Point".to_string(),
-                            coordinates: [summary.lon as f64, summary.lat as f64],
-                        },
-                        properties: AutocompleteProperties {
-                            id: parse_str(&summary.source_id),
-                            name: parse_str(&summary.name),
-                        },
-                    },
-                    score: final_score,
-                });
-            }
-        }
-
-        scored_features.sort_unstable_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        features = scored_features
-            .into_iter()
-            .take(size)
-            .map(|sf| sf.feature)
-            .collect();
-    }
-
-    Ok(Json(AutocompleteResponse {
-        features,
-        memdb_took_ms: start.elapsed().as_millis(),
+    Ok(Json(SearchResponseV2 {
+        features: results.results,
+        took_ms: results.took_ms,
     }))
+}
+
+/// Reverse geocoding — uses spatial grid
+async fn reverse_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ReverseQueryParams>,
+) -> Result<Json<SearchResponse>, (StatusCode, String)> {
+    let results = search::execute_reverse(
+        &state.scylla_client,
+        &state.memdb,
+        params.point_lon,
+        params.point_lat,
+        params.size.unwrap_or(10).min(40),
+        params
+            .layers
+            .as_ref()
+            .map(|l| l.split(',').map(String::from).collect()),
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!("Reverse geocoding failed: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
+
+    Ok(Json(SearchResponse {
+        features: results,
+        took_ms: 0,
+    }))
+}
+
+/// Reverse geocoding V2
+async fn reverse_v2_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ReverseQueryParams>,
+) -> Result<Json<SearchResponseV2>, (StatusCode, String)> {
+    let results = search::execute_reverse_v2(
+        &state.scylla_client,
+        &state.memdb,
+        params.point_lon,
+        params.point_lat,
+        params.size.unwrap_or(10).min(40),
+        params
+            .layers
+            .as_ref()
+            .map(|l| l.split(',').map(String::from).collect()),
+        params.lang.clone(),
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!("Reverse geocoding V2 failed: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
+
+    Ok(Json(SearchResponseV2 {
+        features: results,
+        took_ms: 0,
+    }))
+}
+
+async fn place_details_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<PlaceDetailsQueryParams>,
+) -> Result<axum::response::Response, StatusCode> {
+    let place_json = state
+        .scylla_client
+        .get_place(&params.id)
+        .await
+        .map_err(|e| {
+            tracing::error!("ScyllaDB query failed: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    match place_json {
+        Some(json_data) => Ok(axum::response::Response::builder()
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(json_data))
+            .unwrap()),
+        None => Err(StatusCode::NOT_FOUND),
+    }
 }
 
 #[derive(Serialize)]
@@ -302,123 +445,6 @@ struct PlaceDetailsQueryParams {
     id: String,
 }
 
-async fn place_details_handler(
-    State(state): State<Arc<AppState>>,
-    Query(params): Query<PlaceDetailsQueryParams>,
-) -> Result<axum::response::Response, StatusCode> {
-    let place_json = state
-        .scylla_client
-        .get_place(&params.id)
-        .await
-        .map_err(|e| {
-            tracing::error!("ScyllaDB query failed: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    match place_json {
-        Some(json_data) => {
-            // Forward the raw JSON response directly from Scylla for maximum speed
-            Ok(axum::response::Response::builder()
-                .header(axum::http::header::CONTENT_TYPE, "application/json")
-                .body(axum::body::Body::from(json_data))
-                .unwrap())
-        }
-        None => Err(StatusCode::NOT_FOUND),
-    }
-}
-
-/// Forward geocoding search V2
-async fn search_v2_handler(
-    State(state): State<Arc<AppState>>,
-    Query(params): Query<SearchQueryParams>,
-) -> Result<Json<SearchResponseV2>, (StatusCode, String)> {
-    let search_params = SearchParams {
-        text: params.text.clone(),
-        lang: params.lang.clone(),
-        bbox: parse_bbox(&params.bbox),
-        focus_lat: params.focus_point_lat,
-        focus_lon: params.focus_point_lon,
-        focus_weight: params.focus_point_weight,
-        layers: params
-            .layers
-            .as_ref()
-            .map(|l| l.split(',').map(String::from).collect()),
-        size: params.size.unwrap_or(10).min(40),
-    };
-
-    let results = execute_search_v2(&state.es_client, &state.scylla_client, search_params, false)
-        .await
-        .map_err(|e| {
-            tracing::error!("Search V2 execution failed: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
-
-    Ok(Json(SearchResponseV2 {
-        features: results.results,
-        es_took_ms: results.es_took_ms,
-        scylla_took_ms: results.scylla_took_ms,
-    }))
-}
-
-/// Reverse geocoding
-async fn reverse_handler(
-    State(state): State<Arc<AppState>>,
-    Query(params): Query<ReverseQueryParams>,
-) -> Result<Json<SearchResponse>, (StatusCode, String)> {
-    let results = search::execute_reverse(
-        &state.es_client,
-        &state.scylla_client,
-        params.point_lon,
-        params.point_lat,
-        params.size.unwrap_or(10).min(40),
-        params
-            .layers
-            .as_ref()
-            .map(|l| l.split(',').map(String::from).collect()),
-    )
-    .await
-    .map_err(|e| {
-        tracing::error!("Reverse geocoding failed: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-    })?;
-
-    Ok(Json(SearchResponse {
-        features: results,
-        es_took_ms: 0,
-        scylla_took_ms: 0,
-    }))
-}
-
-/// Reverse geocoding V2
-async fn reverse_v2_handler(
-    State(state): State<Arc<AppState>>,
-    Query(params): Query<ReverseQueryParams>,
-) -> Result<Json<SearchResponseV2>, (StatusCode, String)> {
-    let results = search::execute_reverse_v2(
-        &state.es_client,
-        &state.scylla_client,
-        params.point_lon,
-        params.point_lat,
-        params.size.unwrap_or(10).min(40),
-        params
-            .layers
-            .as_ref()
-            .map(|l| l.split(',').map(String::from).collect()),
-        params.lang.clone(),
-    )
-    .await
-    .map_err(|e| {
-        tracing::error!("Reverse geocoding V2 failed: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-    })?;
-
-    Ok(Json(SearchResponseV2 {
-        features: results,
-        es_took_ms: 0,
-        scylla_took_ms: 0,
-    }))
-}
-
 #[derive(Deserialize)]
 struct SearchQueryParams {
     /// Search text
@@ -433,7 +459,7 @@ struct SearchQueryParams {
     /// Focus point longitude
     #[serde(rename = "focus.point.lon")]
     focus_point_lon: Option<f64>,
-    /// Focus point weight (defaults to 3.0)
+    /// Focus point weight (defaults to 50.0)
     #[serde(rename = "focus.point.weight")]
     focus_point_weight: Option<f64>,
     /// Filter by layers (comma-separated)
@@ -461,15 +487,13 @@ struct ReverseQueryParams {
 #[derive(Serialize)]
 struct SearchResponse {
     features: Vec<SearchResult>,
-    es_took_ms: u128,
-    scylla_took_ms: u128,
+    took_ms: u128,
 }
 
 #[derive(Serialize)]
 struct SearchResponseV2 {
     features: Vec<SearchResultV2>,
-    es_took_ms: u128,
-    scylla_took_ms: u128,
+    took_ms: u128,
 }
 
 /// Parse bbox string "minLon,minLat,maxLon,maxLat"
