@@ -2,6 +2,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
+use tracing::{debug, warn};
 
 use cypress::models::memdb::CypressMemDb;
 use cypress::models::normalized::NormalizedPlace;
@@ -124,6 +126,24 @@ const COS_SIM_CUTOFF: f32 = 0.17;
 const MAX_STRING_MATCHES: usize = 6000;
 const FOCUS_RESCORE_MULTIPLIER: usize = 20;
 const FOCUS_RESCORE_FLOOR: usize = 200;
+const SLOW_PHASE_WARN_MS: u128 = 250;
+const SLOW_SEARCH_WARN_MS: u128 = 1000;
+
+fn log_phase_timing(op: &str, phase: &str, phase_started: Instant) {
+    let elapsed_ms = phase_started.elapsed().as_millis();
+    debug!(target: "cypress::query::timing", op, phase, elapsed_ms, "phase complete");
+    if elapsed_ms >= SLOW_PHASE_WARN_MS {
+        warn!(target: "cypress::query::timing", op, phase, elapsed_ms, "slow phase");
+    }
+}
+
+fn log_total_timing(op: &str, total_started: Instant, result_count: usize) {
+    let elapsed_ms = total_started.elapsed().as_millis();
+    debug!(target: "cypress::query::timing", op, elapsed_ms, result_count, "operation complete");
+    if elapsed_ms >= SLOW_SEARCH_WARN_MS {
+        warn!(target: "cypress::query::timing", op, elapsed_ms, result_count, "slow operation");
+    }
+}
 
 fn collect_query_bigrams(query: &str, out: &mut Vec<u16>) {
     out.clear();
@@ -145,14 +165,37 @@ pub fn search_place_ids(
     bbox: Option<[f64; 4]>,
     max_results: usize,
 ) -> Vec<(u32, f64)> {
+    let total_started = Instant::now();
+
     if max_results == 0 {
+        debug!(
+            target: "cypress::query::timing",
+            op = "search_place_ids",
+            "skipping search because max_results is zero"
+        );
         return Vec::new();
     }
 
     let query = text.trim().to_lowercase();
     if query.len() < 2 {
+        debug!(
+            target: "cypress::query::timing",
+            op = "search_place_ids",
+            query_len = query.len(),
+            "skipping search because query is too short"
+        );
         return Vec::new();
     }
+
+    debug!(
+        target: "cypress::query::timing",
+        op = "search_place_ids",
+        query_len = query.len(),
+        max_results,
+        has_focus = focus.is_some(),
+        has_bbox = bbox.is_some(),
+        "search start"
+    );
 
     let memdb_data = memdb.get_data();
     let db = memdb_data.get_archived();
@@ -162,21 +205,35 @@ pub fn search_place_ids(
     let mut results = Vec::<(u32, f64)>::new();
 
     GUESS_CONTEXT.with(|cell| {
+        let phase_started = Instant::now();
         let mut ctx = cell.borrow_mut();
         ctx.clear(string_count);
+        log_phase_timing("search_place_ids", "clear_context", phase_started);
 
+        let phase_started = Instant::now();
         collect_query_bigrams(&query, &mut ctx.query_bigrams);
+        let query_bigram_count = ctx.query_bigrams.len();
+        log_phase_timing("search_place_ids", "collect_query_bigrams", phase_started);
+
         if ctx.query_bigrams.is_empty() {
+            debug!(
+                target: "cypress::query::timing",
+                op = "search_place_ids",
+                "query has no bigrams after normalization"
+            );
             return;
         }
 
         let query_bigrams = ctx.query_bigrams.clone();
         let mut missing_bigrams = Vec::new();
 
+        let phase_started = Instant::now();
+        let mut cache_hit = false;
         if let Some(cached_counts) = ctx
             .query_cache
             .get_closest(&query_bigrams, &mut missing_bigrams)
         {
+            cache_hit = true;
             for &(string_idx, count) in cached_counts.iter() {
                 let idx = string_idx as usize;
                 if idx >= string_count || count == 0 {
@@ -186,7 +243,18 @@ pub fn search_place_ids(
                 ctx.touched_string_indices.push(string_idx);
             }
         }
+        let missing_bigram_count = missing_bigrams.len();
+        log_phase_timing("search_place_ids", "cache_lookup_restore", phase_started);
+        debug!(
+            target: "cypress::query::timing",
+            op = "search_place_ids",
+            cache_hit,
+            missing_bigram_count,
+            restored_string_count = ctx.touched_string_indices.len(),
+            "cache lookup summary"
+        );
 
+        let phase_started = Instant::now();
         for bigram_key in missing_bigrams {
             let idx = bigram_key as usize;
             let start = db.bigram_offsets[idx] as usize;
@@ -206,7 +274,9 @@ pub fn search_place_ids(
                     ctx.string_match_counts[string_idx].saturating_add(1);
             }
         }
+        log_phase_timing("search_place_ids", "expand_missing_bigrams", phase_started);
 
+        let phase_started = Instant::now();
         if !ctx.query_cache.has_exact(&query_bigrams) {
             let mut sparse_cache_scratch = Vec::with_capacity(ctx.touched_string_indices.len());
             for &string_idx in &ctx.touched_string_indices {
@@ -217,12 +287,18 @@ pub fn search_place_ids(
             }
             ctx.query_cache.put(&query_bigrams, &sparse_cache_scratch);
         }
+        log_phase_timing(
+            "search_place_ids",
+            "cache_store_sparse_counts",
+            phase_started,
+        );
 
-        let query_bigram_count = query_bigrams.len() as u32;
+        let query_bigram_count = query_bigram_count as u32;
         let min_match_count = (2 + query_bigram_count / (4 + query_bigram_count / 10)) as u16;
 
         let touched_string_indices = ctx.touched_string_indices.clone();
 
+        let phase_started = Instant::now();
         for string_idx in touched_string_indices {
             let idx = string_idx as usize;
             let match_count = ctx.string_match_counts[idx];
@@ -244,7 +320,13 @@ pub fn search_place_ids(
                 });
             }
         }
+        log_phase_timing(
+            "search_place_ids",
+            "compute_cosine_candidates",
+            phase_started,
+        );
 
+        let phase_started = Instant::now();
         let max_matches = MAX_STRING_MATCHES.min(ctx.string_matches.len());
         if ctx.string_matches.len() > max_matches {
             ctx.string_matches
@@ -260,7 +342,13 @@ pub fn search_place_ids(
                 .partial_cmp(&a.cos_sim)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+        log_phase_timing(
+            "search_place_ids",
+            "restrict_sort_string_matches",
+            phase_started,
+        );
 
+        let phase_started = Instant::now();
         let mut best_place_scores = HashMap::<u32, f64>::new();
 
         for text_match in &ctx.string_matches {
@@ -291,7 +379,9 @@ pub fn search_place_ids(
                 }
             }
         }
+        log_phase_timing("search_place_ids", "score_places_with_bbox", phase_started);
 
+        let phase_started = Instant::now();
         results = best_place_scores.into_iter().collect();
         results.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -318,8 +408,14 @@ pub fn search_place_ids(
         }
 
         results.truncate(max_results);
+        log_phase_timing(
+            "search_place_ids",
+            "final_sort_focus_truncate",
+            phase_started,
+        );
     });
 
+    log_total_timing("search_place_ids", total_started, results.len());
     results
 }
 
@@ -333,9 +429,24 @@ fn bigram_search(
     bbox: Option<[f64; 4]>,
     max_results: usize,
 ) -> Vec<(String, f64)> {
+    let total_started = Instant::now();
+    debug!(
+        target: "cypress::query::timing",
+        op = "bigram_search",
+        query_len = text.len(),
+        max_results,
+        has_focus = focus.is_some(),
+        has_bbox = bbox.is_some(),
+        "search start"
+    );
+
+    let phase_started = Instant::now();
     let scored_places = search_place_ids(memdb, text, focus, focus_weight, bbox, max_results);
+    log_phase_timing("bigram_search", "search_place_ids", phase_started);
+
     let memdb_data = memdb.get_data();
 
+    let phase_started = Instant::now();
     let mut results = Vec::with_capacity(scored_places.len());
     for (place_id, score) in scored_places {
         let Some(place) = memdb_data.get_place(place_id as usize) else {
@@ -347,7 +458,9 @@ fn bigram_search(
                 .into_owned();
         results.push((source_id, score));
     }
+    log_phase_timing("bigram_search", "resolve_source_ids", phase_started);
 
+    log_total_timing("bigram_search", total_started, results.len());
     results
 }
 
@@ -359,6 +472,17 @@ fn spatial_search_place_ids(
     max_results: usize,
     radius_km: f64,
 ) -> Vec<(u32, f64)> {
+    let total_started = Instant::now();
+    debug!(
+        target: "cypress::query::timing",
+        op = "spatial_search_place_ids",
+        lon,
+        lat,
+        max_results,
+        radius_km,
+        "reverse search start"
+    );
+
     let memdb_data = memdb.get_data();
     let db = memdb_data.get_archived();
 
@@ -376,6 +500,17 @@ fn spatial_search_place_ids(
     let col_start = ((min_lon + 180.0) / cell_size) as usize;
     let col_end = ((max_lon + 180.0) / cell_size) as usize;
 
+    debug!(
+        target: "cypress::query::timing",
+        op = "spatial_search_place_ids",
+        row_start,
+        row_end,
+        col_start,
+        col_end,
+        "grid bounds"
+    );
+
+    let phase_started = Instant::now();
     let mut candidates: Vec<(u32, f64)> = Vec::new();
 
     for row in row_start..=row_end {
@@ -402,9 +537,17 @@ fn spatial_search_place_ids(
             }
         }
     }
+    log_phase_timing("spatial_search_place_ids", "scan_grid_cells", phase_started);
 
+    let phase_started = Instant::now();
     candidates.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     candidates.truncate(max_results);
+    log_phase_timing(
+        "spatial_search_place_ids",
+        "sort_and_truncate",
+        phase_started,
+    );
+    log_total_timing("spatial_search_place_ids", total_started, candidates.len());
     candidates
 }
 
@@ -416,9 +559,15 @@ fn spatial_search(
     max_results: usize,
     radius_km: f64,
 ) -> Vec<(String, f64)> {
+    let total_started = Instant::now();
+
+    let phase_started = Instant::now();
     let nearby = spatial_search_place_ids(memdb, lon, lat, max_results, radius_km);
+    log_phase_timing("spatial_search", "spatial_search_place_ids", phase_started);
+
     let memdb_data = memdb.get_data();
 
+    let phase_started = Instant::now();
     let mut resolved = Vec::with_capacity(nearby.len());
     for (place_id, dist) in nearby {
         let Some(place) = memdb_data.get_place(place_id as usize) else {
@@ -430,6 +579,8 @@ fn spatial_search(
                 .into_owned();
         resolved.push((source_id, dist));
     }
+    log_phase_timing("spatial_search", "resolve_source_ids", phase_started);
+    log_total_timing("spatial_search", total_started, resolved.len());
 
     resolved
 }
@@ -439,7 +590,17 @@ pub async fn execute_search(
     memdb: &Arc<Memdb>,
     params: SearchParams,
 ) -> Result<TimedSearchResults> {
-    let start = std::time::Instant::now();
+    let total_started = Instant::now();
+    debug!(
+        target: "cypress::query::timing",
+        op = "execute_search",
+        query_len = params.text.len(),
+        size = params.size,
+        has_focus = params.focus_lat.is_some() && params.focus_lon.is_some(),
+        has_bbox = params.bbox.is_some(),
+        layers_count = params.layers.as_ref().map_or(0, Vec::len),
+        "request start"
+    );
 
     let focus = match (params.focus_lat, params.focus_lon) {
         (Some(lat), Some(lon)) => Some((lat, lon)),
@@ -447,6 +608,7 @@ pub async fn execute_search(
     };
     let focus_weight = params.focus_weight.unwrap_or(50.0);
 
+    let phase_started = Instant::now();
     let scored_ids = bigram_search(
         memdb,
         &params.text,
@@ -455,13 +617,23 @@ pub async fn execute_search(
         params.bbox,
         params.size,
     );
+    log_phase_timing("execute_search", "bigram_search", phase_started);
+    debug!(
+        target: "cypress::query::timing",
+        op = "execute_search",
+        scored_ids = scored_ids.len(),
+        "search candidates ready"
+    );
 
     let mut results = Vec::new();
     let mut admin_ids = std::collections::HashSet::new();
 
+    let phase_started = Instant::now();
     let fetch_futures = scored_ids.iter().map(|(id, _)| scylla_client.get_place(id));
     let fetched = futures::future::join_all(fetch_futures).await;
+    log_phase_timing("execute_search", "fetch_places", phase_started);
 
+    let phase_started = Instant::now();
     let mut places_with_scores = Vec::new();
     for (i, fetch_result) in fetched.into_iter().enumerate() {
         if let Ok(Some(json_data)) = fetch_result {
@@ -471,9 +643,15 @@ pub async fn execute_search(
             }
         }
     }
+    log_phase_timing("execute_search", "decode_places", phase_started);
 
     let admin_ids_vec: Vec<String> = admin_ids.into_iter().collect();
+
+    let phase_started = Instant::now();
     let admin_map = scylla_client.get_admin_areas(&admin_ids_vec).await?;
+    log_phase_timing("execute_search", "fetch_admin_areas", phase_started);
+
+    let phase_started = Instant::now();
     let parsed_admin_map: HashMap<String, AdminEntry> = admin_map
         .iter()
         .filter_map(|(k, v)| {
@@ -482,18 +660,21 @@ pub async fn execute_search(
                 .map(|scylla_entry| (k.clone(), AdminEntry::from_scylla(scylla_entry)))
         })
         .collect();
+    log_phase_timing("execute_search", "decode_admin_areas", phase_started);
 
+    let phase_started = Instant::now();
     for (place, score) in places_with_scores {
         if let Some(result) = place_to_search_result(place, score, &params.lang, &parsed_admin_map)
         {
             results.push(result);
         }
     }
+    log_phase_timing("execute_search", "build_response", phase_started);
+    log_total_timing("execute_search", total_started, results.len());
 
-    Ok(TimedSearchResults {
-        results,
-        took_ms: start.elapsed().as_millis(),
-    })
+    let took_ms = total_started.elapsed().as_millis();
+
+    Ok(TimedSearchResults { results, took_ms })
 }
 
 pub async fn execute_search_v2(
@@ -501,7 +682,17 @@ pub async fn execute_search_v2(
     memdb: &Arc<Memdb>,
     params: SearchParams,
 ) -> Result<TimedSearchResultsV2> {
-    let start = std::time::Instant::now();
+    let total_started = Instant::now();
+    debug!(
+        target: "cypress::query::timing",
+        op = "execute_search_v2",
+        query_len = params.text.len(),
+        size = params.size,
+        has_focus = params.focus_lat.is_some() && params.focus_lon.is_some(),
+        has_bbox = params.bbox.is_some(),
+        layers_count = params.layers.as_ref().map_or(0, Vec::len),
+        "request start"
+    );
 
     let focus = match (params.focus_lat, params.focus_lon) {
         (Some(lat), Some(lon)) => Some((lat, lon)),
@@ -509,6 +700,7 @@ pub async fn execute_search_v2(
     };
     let focus_weight = params.focus_weight.unwrap_or(50.0);
 
+    let phase_started = Instant::now();
     let scored_ids = bigram_search(
         memdb,
         &params.text,
@@ -517,12 +709,22 @@ pub async fn execute_search_v2(
         params.bbox,
         params.size,
     );
+    log_phase_timing("execute_search_v2", "bigram_search", phase_started);
+    debug!(
+        target: "cypress::query::timing",
+        op = "execute_search_v2",
+        scored_ids = scored_ids.len(),
+        "search candidates ready"
+    );
 
     let mut admin_ids = std::collections::HashSet::new();
 
+    let phase_started = Instant::now();
     let fetch_futures = scored_ids.iter().map(|(id, _)| scylla_client.get_place(id));
     let fetched = futures::future::join_all(fetch_futures).await;
+    log_phase_timing("execute_search_v2", "fetch_places", phase_started);
 
+    let phase_started = Instant::now();
     let mut places_with_scores = Vec::new();
     for (i, fetch_result) in fetched.into_iter().enumerate() {
         if let Ok(Some(json_data)) = fetch_result {
@@ -532,9 +734,15 @@ pub async fn execute_search_v2(
             }
         }
     }
+    log_phase_timing("execute_search_v2", "decode_places", phase_started);
 
     let admin_ids_vec: Vec<String> = admin_ids.into_iter().collect();
+
+    let phase_started = Instant::now();
     let admin_map = scylla_client.get_admin_areas(&admin_ids_vec).await?;
+    log_phase_timing("execute_search_v2", "fetch_admin_areas", phase_started);
+
+    let phase_started = Instant::now();
     let parsed_admin_map: HashMap<String, AdminEntry> = admin_map
         .iter()
         .filter_map(|(k, v)| {
@@ -543,7 +751,9 @@ pub async fn execute_search_v2(
                 .map(|scylla_entry| (k.clone(), AdminEntry::from_scylla(scylla_entry)))
         })
         .collect();
+    log_phase_timing("execute_search_v2", "decode_admin_areas", phase_started);
 
+    let phase_started = Instant::now();
     let mut results = Vec::new();
     for (place, score) in places_with_scores {
         if let Some(result) =
@@ -552,11 +762,12 @@ pub async fn execute_search_v2(
             results.push(result);
         }
     }
+    log_phase_timing("execute_search_v2", "build_response", phase_started);
+    log_total_timing("execute_search_v2", total_started, results.len());
 
-    Ok(TimedSearchResultsV2 {
-        results,
-        took_ms: start.elapsed().as_millis(),
-    })
+    let took_ms = total_started.elapsed().as_millis();
+
+    Ok(TimedSearchResultsV2 { results, took_ms })
 }
 
 pub async fn execute_reverse(
@@ -567,14 +778,29 @@ pub async fn execute_reverse(
     size: usize,
     _layers: Option<Vec<String>>,
 ) -> Result<Vec<SearchResult>> {
-    let nearby = spatial_search(memdb, lon, lat, size, 1.0);
+    let total_started = Instant::now();
+    debug!(
+        target: "cypress::query::timing",
+        op = "execute_reverse",
+        lon,
+        lat,
+        size,
+        "request start"
+    );
 
+    let phase_started = Instant::now();
+    let nearby = spatial_search(memdb, lon, lat, size, 1.0);
+    log_phase_timing("execute_reverse", "spatial_search", phase_started);
+
+    let phase_started = Instant::now();
     let fetch_futures = nearby.iter().map(|(id, _)| scylla_client.get_place(id));
     let fetched = futures::future::join_all(fetch_futures).await;
+    log_phase_timing("execute_reverse", "fetch_places", phase_started);
 
     let mut admin_ids = std::collections::HashSet::new();
     let mut normalized_places = Vec::new();
 
+    let phase_started = Instant::now();
     for fetch_result in fetched {
         if let Ok(Some(json_data)) = fetch_result {
             if let Ok(place) = serde_json::from_str::<NormalizedPlace>(&json_data) {
@@ -583,9 +809,15 @@ pub async fn execute_reverse(
             }
         }
     }
+    log_phase_timing("execute_reverse", "decode_places", phase_started);
 
     let admin_ids_vec: Vec<String> = admin_ids.into_iter().collect();
+
+    let phase_started = Instant::now();
     let admin_map = scylla_client.get_admin_areas(&admin_ids_vec).await?;
+    log_phase_timing("execute_reverse", "fetch_admin_areas", phase_started);
+
+    let phase_started = Instant::now();
     let parsed_admin_map: HashMap<String, AdminEntry> = admin_map
         .iter()
         .filter_map(|(k, v)| {
@@ -594,13 +826,17 @@ pub async fn execute_reverse(
                 .map(|scylla_entry| (k.clone(), AdminEntry::from_scylla(scylla_entry)))
         })
         .collect();
+    log_phase_timing("execute_reverse", "decode_admin_areas", phase_started);
 
+    let phase_started = Instant::now();
     let mut results = Vec::new();
     for place in normalized_places {
         if let Some(result) = place_to_search_result(place, 1.0, &None, &parsed_admin_map) {
             results.push(result);
         }
     }
+    log_phase_timing("execute_reverse", "build_response", phase_started);
+    log_total_timing("execute_reverse", total_started, results.len());
 
     Ok(results)
 }
@@ -614,14 +850,30 @@ pub async fn execute_reverse_v2(
     _layers: Option<Vec<String>>,
     lang: Option<String>,
 ) -> Result<Vec<SearchResultV2>> {
-    let nearby = spatial_search(memdb, lon, lat, size, 1.0);
+    let total_started = Instant::now();
+    debug!(
+        target: "cypress::query::timing",
+        op = "execute_reverse_v2",
+        lon,
+        lat,
+        size,
+        has_lang = lang.is_some(),
+        "request start"
+    );
 
+    let phase_started = Instant::now();
+    let nearby = spatial_search(memdb, lon, lat, size, 1.0);
+    log_phase_timing("execute_reverse_v2", "spatial_search", phase_started);
+
+    let phase_started = Instant::now();
     let fetch_futures = nearby.iter().map(|(id, _)| scylla_client.get_place(id));
     let fetched = futures::future::join_all(fetch_futures).await;
+    log_phase_timing("execute_reverse_v2", "fetch_places", phase_started);
 
     let mut admin_ids = std::collections::HashSet::new();
     let mut normalized_places = Vec::new();
 
+    let phase_started = Instant::now();
     for fetch_result in fetched {
         if let Ok(Some(json_data)) = fetch_result {
             if let Ok(place) = serde_json::from_str::<NormalizedPlace>(&json_data) {
@@ -630,9 +882,15 @@ pub async fn execute_reverse_v2(
             }
         }
     }
+    log_phase_timing("execute_reverse_v2", "decode_places", phase_started);
 
     let admin_ids_vec: Vec<String> = admin_ids.into_iter().collect();
+
+    let phase_started = Instant::now();
     let admin_map = scylla_client.get_admin_areas(&admin_ids_vec).await?;
+    log_phase_timing("execute_reverse_v2", "fetch_admin_areas", phase_started);
+
+    let phase_started = Instant::now();
     let parsed_admin_map: HashMap<String, AdminEntry> = admin_map
         .iter()
         .filter_map(|(k, v)| {
@@ -641,13 +899,17 @@ pub async fn execute_reverse_v2(
                 .map(|scylla_entry| (k.clone(), AdminEntry::from_scylla(scylla_entry)))
         })
         .collect();
+    log_phase_timing("execute_reverse_v2", "decode_admin_areas", phase_started);
 
+    let phase_started = Instant::now();
     let mut results = Vec::new();
     for place in normalized_places {
         if let Some(result) = place_to_search_result_v2(place, 1.0, &lang, &parsed_admin_map) {
             results.push(result);
         }
     }
+    log_phase_timing("execute_reverse_v2", "build_response", phase_started);
+    log_total_timing("execute_reverse_v2", total_started, results.len());
 
     Ok(results)
 }
