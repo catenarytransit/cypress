@@ -24,7 +24,7 @@ use cypress::scylla::ScyllaClient;
 
 mod memdb;
 mod search;
-use memdb::{CosSimMatch, Memdb, GUESS_CONTEXT};
+use memdb::Memdb;
 use search::{SearchParams, SearchResult, SearchResultV2};
 
 #[derive(Parser, Debug)]
@@ -115,8 +115,6 @@ async fn autocomplete_handler(
 
     if text.len() >= 2 {
         let memdb_data = state.memdb.get_data();
-        let db = memdb_data.get_archived();
-
         let size = params.size.unwrap_or(10).min(20);
 
         let focus_point =
@@ -127,150 +125,28 @@ async fn autocomplete_handler(
             };
         let weight = params.focus_point_weight.unwrap_or(50.0);
 
-        let string_count = db.string_bigram_counts.len();
+        let scored_places =
+            search::search_place_ids(&state.memdb, &text, focus_point, weight, None, size);
 
-        GUESS_CONTEXT.with(|cell| {
-            let mut ctx = cell.borrow_mut();
-            ctx.clear(string_count);
-
-            let query_bytes = text.as_bytes();
-            let mut query_bigrams: u32 = 0;
-
-            // 1. Accumulate bigram match counts
-            for window in query_bytes.windows(2) {
-                let bigram_key = ((window[0] as u16) << 8) | (window[1] as u16);
-                let idx = bigram_key as usize;
-                let start = db.bigram_offsets[idx] as usize;
-                let end = db.bigram_offsets[idx + 1] as usize;
-                for i in start..end {
-                    let string_idx = db.bigram_data[i] as usize;
-                    if string_idx < ctx.string_match_counts.len() {
-                        ctx.string_match_counts[string_idx] += 1;
-                    }
-                }
-                query_bigrams += 1;
-            }
-
-            if query_bigrams == 0 {
-                return;
-            }
-
-            let min_match_count = (2 + query_bigrams / (4 + query_bigrams / 10)) as u16;
-
-            // 2. Compute Cosine Similarity
-            let count_len = ctx.string_match_counts.len();
-            for string_idx in 0..count_len {
-                let match_count = ctx.string_match_counts[string_idx];
-                if match_count < min_match_count {
-                    continue;
-                }
-
-                let str_bigram_count = db.string_bigram_counts[string_idx] as f32;
-                if str_bigram_count == 0.0 {
-                    continue;
-                }
-                let cos_sim = (match_count as f32 * match_count as f32)
-                    / (str_bigram_count * query_bigrams as f32);
-
-                if cos_sim >= 0.17 {
-                    ctx.string_matches.push(CosSimMatch {
-                        string_idx: string_idx as u32,
-                        cos_sim,
-                    });
-                }
-            }
-
-            // 3. Partial sort and truncate
-            let max_matches = 6000.min(ctx.string_matches.len());
-            if ctx.string_matches.len() > max_matches {
-                ctx.string_matches
-                    .select_nth_unstable_by(max_matches, |a, b| {
-                        b.cos_sim
-                            .partial_cmp(&a.cos_sim)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                ctx.string_matches.truncate(max_matches);
-            }
-            ctx.string_matches.sort_unstable_by(|a, b| {
-                b.cos_sim
-                    .partial_cmp(&a.cos_sim)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-
-            // 4. Entity resolution: map string matches to places
-            struct ScoredFeature {
-                feature: AutocompleteFeature,
-                score: f64,
-            }
-
-            let mut scored_features = Vec::with_capacity(size);
-
-            for text_match in &ctx.string_matches {
-                let sid = text_match.string_idx as usize;
-                let p_start = db.string_to_places_offsets[sid] as usize;
-                let p_end = db.string_to_places_offsets[sid + 1] as usize;
-
-                for i in p_start..p_end {
-                    let place_id = db.string_to_places_data[i] as usize;
-                    let Some(place) = memdb_data.get_place(place_id) else {
-                        continue;
-                    };
-
-                    let importance = place.importance as f64;
-                    let text_score = text_match.cos_sim as f64;
-
-                    let decay = if let Some(focus) = focus_point {
-                        let distance_km = search::haversine_distance_km(
-                            focus,
-                            (place.lat as f64, place.lon as f64),
-                        );
-                        (-(distance_km * distance_km) / (2.0 * weight * weight)).exp()
-                    } else {
-                        1.0
-                    };
-
-                    let final_score = text_score * (1.0 + importance * 10.0) * decay;
-
-                    let name =
-                        String::from_utf8_lossy(&place.name_bytes[..place.name_len as usize])
-                            .into_owned();
-                    let source_id = String::from_utf8_lossy(
+        features = scored_places
+            .into_iter()
+            .filter_map(|(place_id, _)| memdb_data.get_place(place_id as usize))
+            .map(|place| AutocompleteFeature {
+                result_type: "Feature".to_string(),
+                geometry: search::Geometry {
+                    geo_type: "Point".to_string(),
+                    coordinates: [place.lon as f64, place.lat as f64],
+                },
+                properties: AutocompleteProperties {
+                    id: String::from_utf8_lossy(
                         &place.source_id_bytes[..place.source_id_len as usize],
                     )
-                    .into_owned();
-
-                    scored_features.push(ScoredFeature {
-                        feature: AutocompleteFeature {
-                            result_type: "Feature".to_string(),
-                            geometry: search::Geometry {
-                                geo_type: "Point".to_string(),
-                                coordinates: [place.lon as f64, place.lat as f64],
-                            },
-                            properties: AutocompleteProperties {
-                                id: source_id,
-                                name,
-                            },
-                        },
-                        score: final_score,
-                    });
-                }
-            }
-
-            scored_features.sort_unstable_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-
-            // Deduplicate by source_id, keeping highest score
-            let mut seen = std::collections::HashSet::new();
-            features = scored_features
-                .into_iter()
-                .filter(|sf| seen.insert(sf.feature.properties.id.clone()))
-                .take(size)
-                .map(|sf| sf.feature)
-                .collect();
-        });
+                    .into_owned(),
+                    name: String::from_utf8_lossy(&place.name_bytes[..place.name_len as usize])
+                        .into_owned(),
+                },
+            })
+            .collect();
     }
 
     Ok(Json(AutocompleteResponse {

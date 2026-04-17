@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use memmap2::Mmap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -16,26 +17,161 @@ pub struct CosSimMatch {
     pub cos_sim: f32,
 }
 
+const QUERY_CACHE_MAX_ENTRIES: usize = 128;
+
+fn is_subset(subset: &[u16], superset: &[u16]) -> bool {
+    if subset.len() > superset.len() {
+        return false;
+    }
+
+    let mut i = 0usize;
+    let mut j = 0usize;
+    while i < subset.len() && j < superset.len() {
+        match subset[i].cmp(&superset[j]) {
+            std::cmp::Ordering::Less => return false,
+            std::cmp::Ordering::Equal => {
+                i += 1;
+                j += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                j += 1;
+            }
+        }
+    }
+
+    i == subset.len()
+}
+
+fn missing_elements(subset: &[u16], superset: &[u16], out: &mut Vec<u16>) {
+    out.clear();
+
+    let mut i = 0usize;
+    let mut j = 0usize;
+    while j < superset.len() {
+        if i >= subset.len() {
+            out.extend_from_slice(&superset[j..]);
+            break;
+        }
+
+        match subset[i].cmp(&superset[j]) {
+            std::cmp::Ordering::Equal => {
+                i += 1;
+                j += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                out.push(superset[j]);
+                j += 1;
+            }
+            std::cmp::Ordering::Less => {
+                i += 1;
+            }
+        }
+    }
+}
+
+pub struct QueryNgramCache {
+    max_entries: usize,
+    insert_order: VecDeque<Vec<u16>>,
+    entries: HashMap<Vec<u16>, Arc<Vec<(u32, u16)>>>,
+}
+
+impl QueryNgramCache {
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            max_entries,
+            insert_order: VecDeque::new(),
+            entries: HashMap::new(),
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.insert_order.clear();
+        self.entries.clear();
+    }
+
+    pub fn has_exact(&self, key: &[u16]) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    pub fn get_closest(&self, key: &[u16], missing: &mut Vec<u16>) -> Option<Arc<Vec<(u32, u16)>>> {
+        if let Some(exact) = self.entries.get(key) {
+            missing.clear();
+            return Some(Arc::clone(exact));
+        }
+
+        let mut best_subset: Option<&Vec<u16>> = None;
+        for cached_key in self.entries.keys() {
+            if is_subset(cached_key, key)
+                && best_subset
+                    .map(|existing| cached_key.len() > existing.len())
+                    .unwrap_or(true)
+            {
+                best_subset = Some(cached_key);
+            }
+        }
+
+        if let Some(best_key) = best_subset {
+            missing_elements(best_key, key, missing);
+            return self.entries.get(best_key).map(Arc::clone);
+        }
+
+        missing.clear();
+        missing.extend_from_slice(key);
+        None
+    }
+
+    pub fn put(&mut self, key: &[u16], sparse_counts: &[(u32, u16)]) {
+        if self.max_entries == 0 || self.entries.contains_key(key) {
+            return;
+        }
+
+        let owned_key = key.to_vec();
+        self.insert_order.push_back(owned_key.clone());
+        self.entries
+            .insert(owned_key, Arc::new(sparse_counts.to_vec()));
+
+        while self.entries.len() > self.max_entries {
+            let Some(oldest) = self.insert_order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+    }
+}
+
 pub struct GuessContext {
     pub string_match_counts: Vec<u16>,
+    pub touched_string_indices: Vec<u32>,
     pub string_matches: Vec<CosSimMatch>,
+    pub query_bigrams: Vec<u16>,
+    pub query_cache: QueryNgramCache,
 }
 
 impl GuessContext {
     pub fn new(size: usize) -> Self {
         Self {
             string_match_counts: vec![0; size],
+            touched_string_indices: Vec::new(),
             string_matches: Vec::with_capacity(6000),
+            query_bigrams: Vec::with_capacity(64),
+            query_cache: QueryNgramCache::new(QUERY_CACHE_MAX_ENTRIES),
         }
     }
 
     pub fn clear(&mut self, needed_size: usize) {
-        if self.string_match_counts.len() < needed_size {
+        if self.string_match_counts.len() != needed_size {
             self.string_match_counts.resize(needed_size, 0);
+            self.query_cache.clear();
+            self.touched_string_indices.clear();
         } else {
-            self.string_match_counts.fill(0);
+            for &idx in &self.touched_string_indices {
+                self.string_match_counts[idx as usize] = 0;
+            }
+            self.touched_string_indices.clear();
         }
+
         self.string_matches.clear();
+        self.query_bigrams.clear();
     }
 }
 

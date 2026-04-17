@@ -120,16 +120,35 @@ pub struct TimedSearchResultsV2 {
     pub took_ms: u128,
 }
 
-/// Run the bigram cosine similarity search over the rkyv database,
-/// returning scored source IDs with their final scores.
-fn bigram_search(
+const COS_SIM_CUTOFF: f32 = 0.17;
+const MAX_STRING_MATCHES: usize = 6000;
+const FOCUS_RESCORE_MULTIPLIER: usize = 20;
+const FOCUS_RESCORE_FLOOR: usize = 200;
+
+fn collect_query_bigrams(query: &str, out: &mut Vec<u16>) {
+    out.clear();
+    out.extend(
+        query
+            .as_bytes()
+            .windows(2)
+            .map(|w| ((w[0] as u16) << 8) | (w[1] as u16)),
+    );
+    out.sort_unstable();
+    out.dedup();
+}
+
+pub fn search_place_ids(
     memdb: &Memdb,
     text: &str,
     focus: Option<(f64, f64)>,
     focus_weight: f64,
     bbox: Option<[f64; 4]>,
     max_results: usize,
-) -> Vec<(String, f64)> {
+) -> Vec<(u32, f64)> {
+    if max_results == 0 {
+        return Vec::new();
+    }
+
     let query = text.trim().to_lowercase();
     if query.len() < 2 {
         return Vec::new();
@@ -138,57 +157,95 @@ fn bigram_search(
     let memdb_data = memdb.get_data();
     let db = memdb_data.get_archived();
     let string_count = db.string_bigram_counts.len();
+    let safe_focus_weight = focus_weight.max(0.001);
 
-    let mut results = Vec::new();
+    let mut results = Vec::<(u32, f64)>::new();
 
     GUESS_CONTEXT.with(|cell| {
         let mut ctx = cell.borrow_mut();
         ctx.clear(string_count);
 
-        let query_bytes = query.as_bytes();
-        let mut query_bigrams: u32 = 0;
-
-        for window in query_bytes.windows(2) {
-            let bigram_key = ((window[0] as u16) << 8) | (window[1] as u16);
-            let idx = bigram_key as usize;
-            let start = db.bigram_offsets[idx] as usize;
-            let end = db.bigram_offsets[idx + 1] as usize;
-            for i in start..end {
-                let string_idx = db.bigram_data[i] as usize;
-                if string_idx < ctx.string_match_counts.len() {
-                    ctx.string_match_counts[string_idx] += 1;
-                }
-            }
-            query_bigrams += 1;
-        }
-
-        if query_bigrams == 0 {
+        collect_query_bigrams(&query, &mut ctx.query_bigrams);
+        if ctx.query_bigrams.is_empty() {
             return;
         }
 
-        let min_match_count = (2 + query_bigrams / (4 + query_bigrams / 10)) as u16;
+        let query_bigrams = ctx.query_bigrams.clone();
+        let mut missing_bigrams = Vec::new();
 
-        let count_len = ctx.string_match_counts.len();
-        for string_idx in 0..count_len {
-            let match_count = ctx.string_match_counts[string_idx];
+        if let Some(cached_counts) = ctx
+            .query_cache
+            .get_closest(&query_bigrams, &mut missing_bigrams)
+        {
+            for &(string_idx, count) in cached_counts.iter() {
+                let idx = string_idx as usize;
+                if idx >= string_count || count == 0 {
+                    continue;
+                }
+                ctx.string_match_counts[idx] = count;
+                ctx.touched_string_indices.push(string_idx);
+            }
+        }
+
+        for bigram_key in missing_bigrams {
+            let idx = bigram_key as usize;
+            let start = db.bigram_offsets[idx] as usize;
+            let end = db.bigram_offsets[idx + 1] as usize;
+
+            for i in start..end {
+                let string_idx = db.bigram_data[i] as usize;
+                if string_idx >= string_count {
+                    continue;
+                }
+
+                let was_zero = ctx.string_match_counts[string_idx] == 0;
+                if was_zero {
+                    ctx.touched_string_indices.push(string_idx as u32);
+                }
+                ctx.string_match_counts[string_idx] =
+                    ctx.string_match_counts[string_idx].saturating_add(1);
+            }
+        }
+
+        if !ctx.query_cache.has_exact(&query_bigrams) {
+            let mut sparse_cache_scratch = Vec::with_capacity(ctx.touched_string_indices.len());
+            for &string_idx in &ctx.touched_string_indices {
+                let count = ctx.string_match_counts[string_idx as usize];
+                if count > 0 {
+                    sparse_cache_scratch.push((string_idx, count));
+                }
+            }
+            ctx.query_cache.put(&query_bigrams, &sparse_cache_scratch);
+        }
+
+        let query_bigram_count = query_bigrams.len() as u32;
+        let min_match_count = (2 + query_bigram_count / (4 + query_bigram_count / 10)) as u16;
+
+        let touched_string_indices = ctx.touched_string_indices.clone();
+
+        for string_idx in touched_string_indices {
+            let idx = string_idx as usize;
+            let match_count = ctx.string_match_counts[idx];
             if match_count < min_match_count {
                 continue;
             }
-            let str_bigram_count = db.string_bigram_counts[string_idx] as f32;
+
+            let str_bigram_count = db.string_bigram_counts[idx] as f32;
             if str_bigram_count == 0.0 {
                 continue;
             }
+
             let cos_sim = (match_count as f32 * match_count as f32)
-                / (str_bigram_count * query_bigrams as f32);
-            if cos_sim >= 0.17 {
+                / (str_bigram_count * query_bigram_count as f32);
+            if cos_sim >= COS_SIM_CUTOFF {
                 ctx.string_matches.push(CosSimMatch {
-                    string_idx: string_idx as u32,
+                    string_idx,
                     cos_sim,
                 });
             }
         }
 
-        let max_matches = 6000.min(ctx.string_matches.len());
+        let max_matches = MAX_STRING_MATCHES.min(ctx.string_matches.len());
         if ctx.string_matches.len() > max_matches {
             ctx.string_matches
                 .select_nth_unstable_by(max_matches, |a, b| {
@@ -204,12 +261,7 @@ fn bigram_search(
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        struct ScoredPlace {
-            source_id: String,
-            score: f64,
-        }
-
-        let mut scored = Vec::new();
+        let mut best_place_scores = HashMap::<u32, f64>::new();
 
         for text_match in &ctx.string_matches {
             let sid = text_match.string_idx as usize;
@@ -217,10 +269,11 @@ fn bigram_search(
             let p_end = db.string_to_places_offsets[sid + 1] as usize;
 
             for i in p_start..p_end {
-                let place_id = db.string_to_places_data[i] as usize;
-                let Some(place) = memdb_data.get_place(place_id) else {
+                let place_id = db.string_to_places_data[i];
+                let Some(place) = memdb_data.get_place(place_id as usize) else {
                     continue;
                 };
+
                 let lat = place.lat as f64;
                 let lon = place.lon as f64;
 
@@ -230,55 +283,82 @@ fn bigram_search(
                     }
                 }
 
-                let importance = place.importance as f64;
-                let text_score = text_match.cos_sim as f64;
-
-                let decay = if let Some(fp) = focus {
-                    let dist = haversine_distance_km(fp, (lat, lon));
-                    (-(dist * dist) / (2.0 * focus_weight * focus_weight)).exp()
-                } else {
-                    1.0
-                };
-
-                let final_score = text_score * (1.0 + importance * 10.0) * decay;
-
-                let source_id =
-                    String::from_utf8_lossy(&place.source_id_bytes[..place.source_id_len as usize])
-                        .into_owned();
-
-                scored.push(ScoredPlace {
-                    source_id,
-                    score: final_score,
-                });
+                let base_score =
+                    (text_match.cos_sim as f64) * (1.0 + (place.importance as f64) * 10.0);
+                let entry = best_place_scores.entry(place_id).or_insert(base_score);
+                if base_score > *entry {
+                    *entry = base_score;
+                }
             }
         }
 
-        scored.sort_unstable_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        results = best_place_scores.into_iter().collect();
+        results.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        let mut seen = std::collections::HashSet::new();
-        results = scored
-            .into_iter()
-            .filter(|s| seen.insert(s.source_id.clone()))
-            .take(max_results)
-            .map(|s| (s.source_id, s.score))
-            .collect();
+        if let Some(focus_point) = focus {
+            let limit = results.len().min(
+                max_results
+                    .saturating_mul(FOCUS_RESCORE_MULTIPLIER)
+                    .max(FOCUS_RESCORE_FLOOR),
+            );
+            results.truncate(limit);
+
+            for (place_id, score) in &mut results {
+                let Some(place) = memdb_data.get_place(*place_id as usize) else {
+                    continue;
+                };
+                let dist = haversine_distance_km(focus_point, (place.lat as f64, place.lon as f64));
+                let decay = (-(dist * dist) / (2.0 * safe_focus_weight * safe_focus_weight)).exp();
+                *score *= decay;
+            }
+
+            results.sort_unstable_by(|a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+
+        results.truncate(max_results);
     });
 
     results
 }
 
+/// Run the bigram cosine similarity search over the rkyv database,
+/// returning scored source IDs with their final scores.
+fn bigram_search(
+    memdb: &Memdb,
+    text: &str,
+    focus: Option<(f64, f64)>,
+    focus_weight: f64,
+    bbox: Option<[f64; 4]>,
+    max_results: usize,
+) -> Vec<(String, f64)> {
+    let scored_places = search_place_ids(memdb, text, focus, focus_weight, bbox, max_results);
+    let memdb_data = memdb.get_data();
+
+    let mut results = Vec::with_capacity(scored_places.len());
+    for (place_id, score) in scored_places {
+        let Some(place) = memdb_data.get_place(place_id as usize) else {
+            continue;
+        };
+
+        let source_id =
+            String::from_utf8_lossy(&place.source_id_bytes[..place.source_id_len as usize])
+                .into_owned();
+        results.push((source_id, score));
+    }
+
+    results
+}
+
 /// Use the spatial grid for reverse geocoding — find places near a coordinate.
-fn spatial_search(
+fn spatial_search_place_ids(
     memdb: &Memdb,
     lon: f64,
     lat: f64,
     max_results: usize,
     radius_km: f64,
-) -> Vec<(String, f64)> {
+) -> Vec<(u32, f64)> {
     let memdb_data = memdb.get_data();
     let db = memdb_data.get_archived();
 
@@ -296,31 +376,27 @@ fn spatial_search(
     let col_start = ((min_lon + 180.0) / cell_size) as usize;
     let col_end = ((max_lon + 180.0) / cell_size) as usize;
 
-    let mut candidates: Vec<(String, f64)> = Vec::new();
+    let mut candidates: Vec<(u32, f64)> = Vec::new();
 
     for row in row_start..=row_end {
         for col in col_start..=col_end {
             let cell_id = (row * cols + col) as u32;
 
-            // Binary search for this cell in the sorted active_cells array
+            // Binary search for this cell in the sorted active_cells array.
             if let Ok(pos) = db.active_cells.binary_search_by(|c| c.cmp(&cell_id)) {
                 let start = db.cell_offsets[pos] as usize;
                 let end = db.cell_offsets[pos + 1] as usize;
 
                 for i in start..end {
-                    let place_id = db.cell_places[i] as usize;
-                    let Some(place) = memdb_data.get_place(place_id) else {
+                    let place_id = db.cell_places[i];
+                    let Some(place) = memdb_data.get_place(place_id as usize) else {
                         continue;
                     };
 
                     let dist =
                         haversine_distance_km((lat, lon), (place.lat as f64, place.lon as f64));
                     if dist <= radius_km {
-                        let source_id = String::from_utf8_lossy(
-                            &place.source_id_bytes[..place.source_id_len as usize],
-                        )
-                        .into_owned();
-                        candidates.push((source_id, dist));
+                        candidates.push((place_id, dist));
                     }
                 }
             }
@@ -330,6 +406,32 @@ fn spatial_search(
     candidates.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     candidates.truncate(max_results);
     candidates
+}
+
+/// Use the spatial grid for reverse geocoding — find places near a coordinate.
+fn spatial_search(
+    memdb: &Memdb,
+    lon: f64,
+    lat: f64,
+    max_results: usize,
+    radius_km: f64,
+) -> Vec<(String, f64)> {
+    let nearby = spatial_search_place_ids(memdb, lon, lat, max_results, radius_km);
+    let memdb_data = memdb.get_data();
+
+    let mut resolved = Vec::with_capacity(nearby.len());
+    for (place_id, dist) in nearby {
+        let Some(place) = memdb_data.get_place(place_id as usize) else {
+            continue;
+        };
+
+        let source_id =
+            String::from_utf8_lossy(&place.source_id_bytes[..place.source_id_len as usize])
+                .into_owned();
+        resolved.push((source_id, dist));
+    }
+
+    resolved
 }
 
 pub async fn execute_search(
