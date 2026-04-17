@@ -18,6 +18,9 @@ pub struct CosSimMatch {
 }
 
 const QUERY_CACHE_MAX_ENTRIES: usize = 128;
+const PLACE_LAT_OFFSET: usize = 64 + 1 + 128 + 1;
+const PLACE_LON_OFFSET: usize = PLACE_LAT_OFFSET + 4;
+const PLACE_IMPORTANCE_OFFSET: usize = PLACE_LON_OFFSET + 4;
 
 fn is_subset(subset: &[u16], superset: &[u16]) -> bool {
     if subset.len() > superset.len() {
@@ -141,49 +144,57 @@ impl QueryNgramCache {
 
 pub struct GuessContext {
     pub string_match_counts: Vec<u16>,
+    pub string_match_epochs: Vec<u32>,
     pub touched_string_indices: Vec<u32>,
     pub string_matches: Vec<CosSimMatch>,
     pub query_bigrams: Vec<u16>,
     pub query_cache: QueryNgramCache,
     pub place_best_scores: Vec<f32>,
+    pub place_score_epochs: Vec<u32>,
     pub touched_place_indices: Vec<u32>,
+    pub query_epoch: u32,
 }
 
 impl GuessContext {
     pub fn new(string_count: usize, place_count: usize) -> Self {
         Self {
             string_match_counts: vec![0; string_count],
+            string_match_epochs: vec![0; string_count],
             touched_string_indices: Vec::new(),
             string_matches: Vec::with_capacity(6000),
             query_bigrams: Vec::with_capacity(64),
             query_cache: QueryNgramCache::new(QUERY_CACHE_MAX_ENTRIES),
             place_best_scores: vec![f32::NEG_INFINITY; place_count],
+            place_score_epochs: vec![0; place_count],
             touched_place_indices: Vec::new(),
+            query_epoch: 1,
         }
     }
 
     pub fn clear(&mut self, needed_string_count: usize, needed_place_count: usize) {
         if self.string_match_counts.len() != needed_string_count {
             self.string_match_counts.resize(needed_string_count, 0);
+            self.string_match_epochs.resize(needed_string_count, 0);
             self.query_cache.clear();
-            self.touched_string_indices.clear();
-        } else {
-            for &idx in &self.touched_string_indices {
-                self.string_match_counts[idx as usize] = 0;
-            }
-            self.touched_string_indices.clear();
         }
 
         self.string_matches.clear();
         self.query_bigrams.clear();
+        self.touched_string_indices.clear();
 
         if self.place_best_scores.len() < needed_place_count {
             self.place_best_scores
                 .resize(needed_place_count, f32::NEG_INFINITY);
+            self.place_score_epochs.resize(needed_place_count, 0);
         }
-        for &idx in &self.touched_place_indices {
-            self.place_best_scores[idx as usize] = f32::NEG_INFINITY;
+
+        self.query_epoch = self.query_epoch.wrapping_add(1);
+        if self.query_epoch == 0 {
+            self.query_epoch = 1;
+            self.string_match_epochs.fill(0);
+            self.place_score_epochs.fill(0);
         }
+
         self.touched_place_indices.clear();
     }
 }
@@ -211,6 +222,40 @@ impl MemdbData {
         }
 
         PlaceRecord::from_disk_bytes(&self.places_mmap[start..end])
+    }
+
+    pub fn get_place_scoring_fields(&self, place_id: usize) -> Option<(f32, f32, f32)> {
+        let start = place_id.checked_mul(PLACE_RECORD_DISK_BYTES)?;
+        let importance_end = start.checked_add(PLACE_IMPORTANCE_OFFSET + 4)?;
+        if importance_end > self.places_mmap.len() {
+            return None;
+        }
+
+        let bytes = &self.places_mmap;
+        let lat_base = start + PLACE_LAT_OFFSET;
+        let lon_base = start + PLACE_LON_OFFSET;
+        let imp_base = start + PLACE_IMPORTANCE_OFFSET;
+
+        let lat = f32::from_le_bytes([
+            bytes[lat_base],
+            bytes[lat_base + 1],
+            bytes[lat_base + 2],
+            bytes[lat_base + 3],
+        ]);
+        let lon = f32::from_le_bytes([
+            bytes[lon_base],
+            bytes[lon_base + 1],
+            bytes[lon_base + 2],
+            bytes[lon_base + 3],
+        ]);
+        let importance = f32::from_le_bytes([
+            bytes[imp_base],
+            bytes[imp_base + 1],
+            bytes[imp_base + 2],
+            bytes[imp_base + 3],
+        ]);
+
+        Some((lat, lon, importance))
     }
 }
 

@@ -129,6 +129,7 @@ const FOCUS_RESCORE_FLOOR: usize = 200;
 const SLOW_PHASE_WARN_MS: u128 = 250;
 const SLOW_SEARCH_WARN_MS: u128 = 1000;
 const MAX_IMPORTANCE_BOOST: f64 = 11.0;
+const MAX_CACHEABLE_SPARSE_COUNTS: usize = 250_000;
 
 fn log_phase_timing(op: &str, phase: &str, phase_started: Instant) {
     let elapsed_ms = phase_started.elapsed().as_millis();
@@ -226,11 +227,16 @@ pub fn search_place_ids(
             return;
         }
 
+        let query_bigram_count_u32 = query_bigram_count as u32;
+        let min_match_count =
+            (2 + query_bigram_count_u32 / (4 + query_bigram_count_u32 / 10)) as u16;
+
         let query_bigrams = ctx.query_bigrams.clone();
         let mut missing_bigrams = Vec::new();
 
         let phase_started = Instant::now();
         let mut cache_hit = false;
+        let query_epoch = ctx.query_epoch;
         if let Some(cached_counts) = ctx
             .query_cache
             .get_closest(&query_bigrams, &mut missing_bigrams)
@@ -241,8 +247,13 @@ pub fn search_place_ids(
                 if idx >= string_count || count == 0 {
                     continue;
                 }
-                ctx.string_match_counts[idx] = count;
-                ctx.touched_string_indices.push(string_idx);
+                if ctx.string_match_epochs[idx] != query_epoch {
+                    ctx.string_match_epochs[idx] = query_epoch;
+                    ctx.string_match_counts[idx] = count;
+                    ctx.touched_string_indices.push(string_idx);
+                } else if count > ctx.string_match_counts[idx] {
+                    ctx.string_match_counts[idx] = count;
+                }
             }
         }
         let missing_bigram_count = missing_bigrams.len();
@@ -257,10 +268,17 @@ pub fn search_place_ids(
         );
 
         let phase_started = Instant::now();
-        for bigram_key in missing_bigrams {
+        missing_bigrams.sort_unstable_by_key(|&bigram_key| {
+            let idx = bigram_key as usize;
+            db.bigram_offsets[idx + 1] - db.bigram_offsets[idx]
+        });
+
+        let missing_len = missing_bigrams.len();
+        for (missing_idx, bigram_key) in missing_bigrams.into_iter().enumerate() {
             let idx = bigram_key as usize;
             let start = db.bigram_offsets[idx] as usize;
             let end = db.bigram_offsets[idx + 1] as usize;
+            let remaining_bigrams = (missing_len - missing_idx - 1) as u16;
 
             for i in start..end {
                 let string_idx = db.bigram_data[i] as usize;
@@ -268,8 +286,19 @@ pub fn search_place_ids(
                     continue;
                 }
 
-                let was_zero = ctx.string_match_counts[string_idx] == 0;
-                if was_zero {
+                let count = if ctx.string_match_epochs[string_idx] == query_epoch {
+                    ctx.string_match_counts[string_idx]
+                } else {
+                    0
+                };
+
+                if count.saturating_add(1).saturating_add(remaining_bigrams) < min_match_count {
+                    continue;
+                }
+
+                if ctx.string_match_epochs[string_idx] != query_epoch {
+                    ctx.string_match_epochs[string_idx] = query_epoch;
+                    ctx.string_match_counts[string_idx] = 0;
                     ctx.touched_string_indices.push(string_idx as u32);
                 }
                 ctx.string_match_counts[string_idx] =
@@ -279,7 +308,9 @@ pub fn search_place_ids(
         log_phase_timing("search_place_ids", "expand_missing_bigrams", phase_started);
 
         let phase_started = Instant::now();
-        if !ctx.query_cache.has_exact(&query_bigrams) {
+        if !ctx.query_cache.has_exact(&query_bigrams)
+            && ctx.touched_string_indices.len() <= MAX_CACHEABLE_SPARSE_COUNTS
+        {
             let mut sparse_cache_scratch = Vec::with_capacity(ctx.touched_string_indices.len());
             for &string_idx in &ctx.touched_string_indices {
                 let count = ctx.string_match_counts[string_idx as usize];
@@ -294,9 +325,6 @@ pub fn search_place_ids(
             "cache_store_sparse_counts",
             phase_started,
         );
-
-        let query_bigram_count = query_bigram_count as u32;
-        let min_match_count = (2 + query_bigram_count / (4 + query_bigram_count / 10)) as u16;
 
         let touched_string_indices = ctx.touched_string_indices.clone();
 
@@ -314,7 +342,7 @@ pub fn search_place_ids(
             }
 
             let cos_sim = (match_count as f32 * match_count as f32)
-                / (str_bigram_count * query_bigram_count as f32);
+                / (str_bigram_count * query_bigram_count_u32 as f32);
             if cos_sim >= COS_SIM_CUTOFF {
                 ctx.string_matches.push(CosSimMatch {
                     string_idx,
@@ -356,6 +384,7 @@ pub fn search_place_ids(
             .iter()
             .map(|m| (m.string_idx, m.cos_sim))
             .collect();
+        let query_epoch = ctx.query_epoch;
         for (string_idx, cos_sim) in string_matches {
             let sid = string_idx as usize;
             let p_start = db.string_to_places_offsets[sid] as usize;
@@ -369,17 +398,22 @@ pub fn search_place_ids(
                     continue;
                 }
 
-                let current_best = ctx.place_best_scores[place_idx];
+                let current_best = if ctx.place_score_epochs[place_idx] == query_epoch {
+                    ctx.place_best_scores[place_idx]
+                } else {
+                    f32::NEG_INFINITY
+                };
                 if max_possible_score <= current_best as f64 {
                     continue;
                 }
 
-                let Some(place) = memdb_data.get_place(place_idx) else {
+                let Some((lat, lon, importance)) = memdb_data.get_place_scoring_fields(place_idx)
+                else {
                     continue;
                 };
 
-                let lat = place.lat as f64;
-                let lon = place.lon as f64;
+                let lat = lat as f64;
+                let lon = lon as f64;
 
                 if let Some(bb) = bbox {
                     if lon < bb[0] || lat < bb[1] || lon > bb[2] || lat > bb[3] {
@@ -387,9 +421,10 @@ pub fn search_place_ids(
                     }
                 }
 
-                let base_score = (cos_sim as f64) * (1.0 + (place.importance as f64) * 10.0);
+                let base_score = (cos_sim as f64) * (1.0 + (importance as f64) * 10.0);
                 if base_score > current_best as f64 {
-                    if !current_best.is_finite() {
+                    if ctx.place_score_epochs[place_idx] != query_epoch {
+                        ctx.place_score_epochs[place_idx] = query_epoch;
                         ctx.touched_place_indices.push(place_id);
                     }
                     ctx.place_best_scores[place_idx] = base_score as f32;
@@ -419,10 +454,11 @@ pub fn search_place_ids(
             }
 
             for (place_id, score) in &mut results {
-                let Some(place) = memdb_data.get_place(*place_id as usize) else {
+                let Some((lat, lon, _)) = memdb_data.get_place_scoring_fields(*place_id as usize)
+                else {
                     continue;
                 };
-                let dist = haversine_distance_km(focus_point, (place.lat as f64, place.lon as f64));
+                let dist = haversine_distance_km(focus_point, (lat as f64, lon as f64));
                 let decay = (-(dist * dist) / (2.0 * safe_focus_weight * safe_focus_weight)).exp();
                 *score *= decay;
             }
@@ -559,12 +595,14 @@ fn spatial_search_place_ids(
 
                 for i in start..end {
                     let place_id = db.cell_places[i];
-                    let Some(place) = memdb_data.get_place(place_id as usize) else {
+                    let Some((place_lat, place_lon, _)) =
+                        memdb_data.get_place_scoring_fields(place_id as usize)
+                    else {
                         continue;
                     };
 
                     let dist =
-                        haversine_distance_km((lat, lon), (place.lat as f64, place.lon as f64));
+                        haversine_distance_km((lat, lon), (place_lat as f64, place_lon as f64));
                     if dist <= radius_km {
                         candidates.push((place_id, dist));
                     }
