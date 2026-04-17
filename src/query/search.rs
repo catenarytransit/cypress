@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, warn};
 
-use cypress::models::memdb::CypressMemDb;
+use cypress::models::memdb::{CypressMemDb, PLACE_RECORD_DISK_BYTES};
 use cypress::models::normalized::NormalizedPlace;
 use cypress::models::place::Layer;
 use cypress::models::AdminEntry;
@@ -128,6 +128,7 @@ const FOCUS_RESCORE_MULTIPLIER: usize = 20;
 const FOCUS_RESCORE_FLOOR: usize = 200;
 const SLOW_PHASE_WARN_MS: u128 = 250;
 const SLOW_SEARCH_WARN_MS: u128 = 1000;
+const MAX_IMPORTANCE_BOOST: f64 = 11.0;
 
 fn log_phase_timing(op: &str, phase: &str, phase_started: Instant) {
     let elapsed_ms = phase_started.elapsed().as_millis();
@@ -200,6 +201,7 @@ pub fn search_place_ids(
     let memdb_data = memdb.get_data();
     let db = memdb_data.get_archived();
     let string_count = db.string_bigram_counts.len();
+    let place_count = memdb_data.places_mmap.len() / PLACE_RECORD_DISK_BYTES;
     let safe_focus_weight = focus_weight.max(0.001);
 
     let mut results = Vec::<(u32, f64)>::new();
@@ -207,7 +209,7 @@ pub fn search_place_ids(
     GUESS_CONTEXT.with(|cell| {
         let phase_started = Instant::now();
         let mut ctx = cell.borrow_mut();
-        ctx.clear(string_count);
+        ctx.clear(string_count, place_count);
         log_phase_timing("search_place_ids", "clear_context", phase_started);
 
         let phase_started = Instant::now();
@@ -349,16 +351,30 @@ pub fn search_place_ids(
         );
 
         let phase_started = Instant::now();
-        let mut best_place_scores = HashMap::<u32, f64>::new();
-
-        for text_match in &ctx.string_matches {
-            let sid = text_match.string_idx as usize;
+        let string_matches: Vec<(u32, f32)> = ctx
+            .string_matches
+            .iter()
+            .map(|m| (m.string_idx, m.cos_sim))
+            .collect();
+        for (string_idx, cos_sim) in string_matches {
+            let sid = string_idx as usize;
             let p_start = db.string_to_places_offsets[sid] as usize;
             let p_end = db.string_to_places_offsets[sid + 1] as usize;
+            let max_possible_score = (cos_sim as f64) * MAX_IMPORTANCE_BOOST;
 
             for i in p_start..p_end {
                 let place_id = db.string_to_places_data[i];
-                let Some(place) = memdb_data.get_place(place_id as usize) else {
+                let place_idx = place_id as usize;
+                if place_idx >= place_count {
+                    continue;
+                }
+
+                let current_best = ctx.place_best_scores[place_idx];
+                if max_possible_score <= current_best as f64 {
+                    continue;
+                }
+
+                let Some(place) = memdb_data.get_place(place_idx) else {
                     continue;
                 };
 
@@ -371,19 +387,23 @@ pub fn search_place_ids(
                     }
                 }
 
-                let base_score =
-                    (text_match.cos_sim as f64) * (1.0 + (place.importance as f64) * 10.0);
-                let entry = best_place_scores.entry(place_id).or_insert(base_score);
-                if base_score > *entry {
-                    *entry = base_score;
+                let base_score = (cos_sim as f64) * (1.0 + (place.importance as f64) * 10.0);
+                if base_score > current_best as f64 {
+                    if !current_best.is_finite() {
+                        ctx.touched_place_indices.push(place_id);
+                    }
+                    ctx.place_best_scores[place_idx] = base_score as f32;
                 }
             }
         }
         log_phase_timing("search_place_ids", "score_places_with_bbox", phase_started);
 
         let phase_started = Instant::now();
-        results = best_place_scores.into_iter().collect();
-        results.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results = ctx
+            .touched_place_indices
+            .iter()
+            .map(|&place_id| (place_id, ctx.place_best_scores[place_id as usize] as f64))
+            .collect();
 
         if let Some(focus_point) = focus {
             let limit = results.len().min(
@@ -391,7 +411,12 @@ pub fn search_place_ids(
                     .saturating_mul(FOCUS_RESCORE_MULTIPLIER)
                     .max(FOCUS_RESCORE_FLOOR),
             );
-            results.truncate(limit);
+            if results.len() > limit {
+                results.select_nth_unstable_by(limit, |a, b| {
+                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                results.truncate(limit);
+            }
 
             for (place_id, score) in &mut results {
                 let Some(place) = memdb_data.get_place(*place_id as usize) else {
@@ -402,6 +427,16 @@ pub fn search_place_ids(
                 *score *= decay;
             }
 
+            results.sort_unstable_by(|a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        } else {
+            if results.len() > max_results {
+                results.select_nth_unstable_by(max_results, |a, b| {
+                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                results.truncate(max_results);
+            }
             results.sort_unstable_by(|a, b| {
                 b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
             });

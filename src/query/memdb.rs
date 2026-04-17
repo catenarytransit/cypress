@@ -145,22 +145,26 @@ pub struct GuessContext {
     pub string_matches: Vec<CosSimMatch>,
     pub query_bigrams: Vec<u16>,
     pub query_cache: QueryNgramCache,
+    pub place_best_scores: Vec<f32>,
+    pub touched_place_indices: Vec<u32>,
 }
 
 impl GuessContext {
-    pub fn new(size: usize) -> Self {
+    pub fn new(string_count: usize, place_count: usize) -> Self {
         Self {
-            string_match_counts: vec![0; size],
+            string_match_counts: vec![0; string_count],
             touched_string_indices: Vec::new(),
             string_matches: Vec::with_capacity(6000),
             query_bigrams: Vec::with_capacity(64),
             query_cache: QueryNgramCache::new(QUERY_CACHE_MAX_ENTRIES),
+            place_best_scores: vec![f32::NEG_INFINITY; place_count],
+            touched_place_indices: Vec::new(),
         }
     }
 
-    pub fn clear(&mut self, needed_size: usize) {
-        if self.string_match_counts.len() != needed_size {
-            self.string_match_counts.resize(needed_size, 0);
+    pub fn clear(&mut self, needed_string_count: usize, needed_place_count: usize) {
+        if self.string_match_counts.len() != needed_string_count {
+            self.string_match_counts.resize(needed_string_count, 0);
             self.query_cache.clear();
             self.touched_string_indices.clear();
         } else {
@@ -172,11 +176,20 @@ impl GuessContext {
 
         self.string_matches.clear();
         self.query_bigrams.clear();
+
+        if self.place_best_scores.len() < needed_place_count {
+            self.place_best_scores
+                .resize(needed_place_count, f32::NEG_INFINITY);
+        }
+        for &idx in &self.touched_place_indices {
+            self.place_best_scores[idx as usize] = f32::NEG_INFINITY;
+        }
+        self.touched_place_indices.clear();
     }
 }
 
 thread_local! {
-    pub static GUESS_CONTEXT: std::cell::RefCell<GuessContext> = std::cell::RefCell::new(GuessContext::new(0));
+    pub static GUESS_CONTEXT: std::cell::RefCell<GuessContext> = std::cell::RefCell::new(GuessContext::new(0, 0));
 }
 
 pub struct MemdbData {
