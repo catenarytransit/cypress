@@ -94,6 +94,13 @@ pub struct CypressMemDb {
     pub place_source_id_offsets: Vec<u32>,
     pub place_source_id_bytes: Vec<u8>,
 
+    pub place_layer_ranks: Vec<u8>,
+    pub place_populations: Vec<u32>,
+
+    // Normalized string text (lowercased) for SIFT4 re-scoring
+    pub string_name_offsets: Vec<u32>,
+    pub string_name_bytes: Vec<u8>,
+
     // ==== Sparse Spatial Grid ====
     // Sorted array of cell IDs that contain at least one place
     pub active_cells: Vec<u32>,

@@ -470,6 +470,8 @@ async fn main() -> Result<()> {
     let mut place_importances = Vec::with_capacity(total_places as usize);
     let mut place_source_id_offsets = Vec::with_capacity(total_places as usize + 1);
     let mut place_source_id_bytes = Vec::new();
+    let mut place_layer_ranks = Vec::with_capacity(total_places as usize);
+    let mut place_populations = Vec::with_capacity(total_places as usize);
 
     place_source_id_offsets.push(0);
 
@@ -485,6 +487,8 @@ async fn main() -> Result<()> {
         place_latitudes.push(place.lat);
         place_longitudes.push(place.lon);
         place_importances.push(place.importance);
+        place_layer_ranks.push(place.layer_rank);
+        place_populations.push((place.importance * 1_000_000.0) as u32);
 
         let id_bytes = &place.source_id_bytes[..place.source_id_len as usize];
         place_source_id_bytes.extend_from_slice(id_bytes);
@@ -539,7 +543,10 @@ async fn main() -> Result<()> {
     let mut string_bigram_counts = Vec::new();
     let mut string_to_places_offsets = Vec::new();
     let mut string_to_places_data = Vec::new();
+    let mut string_name_offsets: Vec<u32> = Vec::new();
+    let mut string_name_bytes: Vec<u8> = Vec::new();
     let mut next_string_id = 0u32;
+    string_name_offsets.push(0);
 
     for bucket in 0..TERM_BUCKETS {
         let bucket_path = term_bucket_dir.join(format!("terms_{:03}.bin", bucket));
@@ -566,6 +573,10 @@ async fn main() -> Result<()> {
 
             string_to_places_offsets.push(string_to_places_data.len() as u32);
 
+            // Store the normalized string text for query-time SIFT4 re-scoring
+            string_name_bytes.extend_from_slice(phrase.as_bytes());
+            string_name_offsets.push(string_name_bytes.len() as u32);
+
             let mut last_place = None::<u32>;
             while i < entries.len() && entries[i].0 == phrase {
                 let place_id = entries[i].1;
@@ -576,11 +587,12 @@ async fn main() -> Result<()> {
                 i += 1;
             }
 
-            let mut local_bigrams = phrase
+            let mut local_bigrams: Vec<u16> = phrase
                 .as_bytes()
                 .windows(2)
+                .filter(|w| w[0] != b' ' && w[1] != b' ')
                 .map(|w| ((w[0] as u16) << 8) | (w[1] as u16))
-                .collect::<Vec<_>>();
+                .collect();
             local_bigrams.sort_unstable();
             local_bigrams.dedup();
 
@@ -694,6 +706,10 @@ async fn main() -> Result<()> {
         place_importances,
         place_source_id_offsets,
         place_source_id_bytes,
+        place_layer_ranks,
+        place_populations,
+        string_name_offsets,
+        string_name_bytes,
         active_cells,
         cell_offsets,
         cell_places,

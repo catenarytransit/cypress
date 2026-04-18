@@ -123,8 +123,8 @@ pub struct TimedSearchResultsV2 {
 }
 
 const COS_SIM_CUTOFF: f32 = 0.17;
-const MAX_STRING_MATCHES: usize = 6000;
-const MAX_SCORED_MATCHES: usize = 10_000;
+const MAX_STRING_MATCHES: usize = 2000;
+const MAX_SCORED_MATCHES: usize = 3000;
 const FOCUS_RESCORE_MULTIPLIER: usize = 20;
 const FOCUS_RESCORE_FLOOR: usize = 200;
 const SLOW_PHASE_WARN_MS: u128 = 250;
@@ -152,6 +152,7 @@ fn collect_query_bigrams(query: &str, out: &mut Vec<u16>) {
         query
             .as_bytes()
             .windows(2)
+            .filter(|w| w[0] != b' ' && w[1] != b' ')
             .map(|w| ((w[0] as u16) << 8) | (w[1] as u16)),
     );
     out.sort_unstable();
@@ -203,6 +204,7 @@ pub fn search_place_ids(
     let string_count = db.string_bigram_counts.len();
     let place_count = db.place_latitudes.len();
     let safe_focus_weight = focus_weight.max(0.001);
+    let query_bytes = query.as_bytes();
 
     let mut results = Vec::<(u32, f64)>::new();
 
@@ -257,6 +259,7 @@ pub fn search_place_ids(
         );
 
         let phase_started = Instant::now();
+        let string_epoch = ctx.string_epoch;
         for missing_idx in missing_bigrams.into_iter() {
             let start = db.bigram_offsets[missing_idx as usize] as usize;
             let end = db.bigram_offsets[(missing_idx + 1) as usize] as usize;
@@ -265,6 +268,11 @@ pub fn search_place_ids(
                 let string_idx = db.bigram_data[i] as usize;
                 ctx.string_match_counts[string_idx] =
                     ctx.string_match_counts[string_idx].saturating_add(1);
+
+                if ctx.string_touch_epochs[string_idx] != string_epoch {
+                    ctx.string_touch_epochs[string_idx] = string_epoch;
+                    ctx.touched_string_indices.push(string_idx as u32);
+                }
             }
         }
         log_phase_timing("search_place_ids", "expand_missing_bigrams", phase_started);
@@ -277,24 +285,47 @@ pub fn search_place_ids(
         log_phase_timing("search_place_ids", "cache_store_counts", phase_started);
 
         let phase_started = Instant::now();
-        for string_idx in 0..ctx.string_match_counts.len() {
-            let match_count = ctx.string_match_counts[string_idx];
-            if (match_count as u16) < min_match_count {
-                continue;
+        if ctx.touched_string_indices.is_empty() {
+            // Cache was a full hit — scan all strings
+            for string_idx in 0..ctx.string_match_counts.len() {
+                let match_count = ctx.string_match_counts[string_idx];
+                if (match_count as u16) < min_match_count {
+                    continue;
+                }
+                let str_bigram_count = db.string_bigram_counts[string_idx] as f32;
+                if str_bigram_count == 0.0 {
+                    continue;
+                }
+                let cos_sim = (match_count as f32 * match_count as f32)
+                    / (str_bigram_count * query_bigram_count_u32 as f32);
+                if cos_sim >= COS_SIM_CUTOFF {
+                    ctx.string_matches.push(CosSimMatch {
+                        string_idx: string_idx as u32,
+                        cos_sim,
+                    });
+                }
             }
-
-            let str_bigram_count = db.string_bigram_counts[string_idx] as f32;
-            if str_bigram_count == 0.0 {
-                continue;
-            }
-
-            let cos_sim = (match_count as f32 * match_count as f32)
-                / (str_bigram_count * query_bigram_count_u32 as f32);
-            if cos_sim >= COS_SIM_CUTOFF {
-                ctx.string_matches.push(CosSimMatch {
-                    string_idx: string_idx as u32,
-                    cos_sim,
-                });
+        } else {
+            // Only check strings that were touched during bigram expansion
+            let touched_snapshot: Vec<u32> = ctx.touched_string_indices.clone();
+            for &string_idx_u32 in &touched_snapshot {
+                let string_idx = string_idx_u32 as usize;
+                let match_count = ctx.string_match_counts[string_idx];
+                if (match_count as u16) < min_match_count {
+                    continue;
+                }
+                let str_bigram_count = db.string_bigram_counts[string_idx] as f32;
+                if str_bigram_count == 0.0 {
+                    continue;
+                }
+                let cos_sim = (match_count as f32 * match_count as f32)
+                    / (str_bigram_count * query_bigram_count_u32 as f32);
+                if cos_sim >= COS_SIM_CUTOFF {
+                    ctx.string_matches.push(CosSimMatch {
+                        string_idx: string_idx_u32,
+                        cos_sim,
+                    });
+                }
             }
         }
         log_phase_timing(
@@ -325,15 +356,36 @@ pub fn search_place_ids(
             phase_started,
         );
 
+        // SIFT4 re-score: compute actual text match quality for each candidate
         let phase_started = Instant::now();
-        let string_matches: Vec<(u32, f32)> = ctx
+        let query_epoch = ctx.query_epoch;
+
+        let match_snapshot: Vec<(u32, f32)> = ctx
             .string_matches
             .iter()
             .map(|m| (m.string_idx, m.cos_sim))
             .collect();
-        let query_epoch = ctx.query_epoch;
-        for (string_idx, cos_sim) in string_matches {
-            let sid = string_idx as usize;
+
+        for (string_idx, _cos_sim) in &match_snapshot {
+            let sid = *string_idx as usize;
+            let string_name = if sid < db.string_name_offsets.len().saturating_sub(1) {
+                let start = db.string_name_offsets[sid] as usize;
+                let end = db.string_name_offsets[sid + 1] as usize;
+                if start <= end && end <= db.string_name_bytes.len() {
+                    &db.string_name_bytes[start..end]
+                } else {
+                    continue;
+                }
+            } else {
+                continue;
+            };
+
+            let match_score = cypress::models::scoring::get_match_score(string_name, query_bytes);
+
+            if match_score == cypress::models::scoring::NO_MATCH {
+                continue;
+            }
+
             let p_start = db.string_to_places_offsets[sid] as usize;
             let p_end = db.string_to_places_offsets[sid + 1] as usize;
 
@@ -344,12 +396,21 @@ pub fn search_place_ids(
                     continue;
                 }
 
+                let layer_rank = db.place_layer_ranks[place_idx];
+                let population = db.place_populations[place_idx] as f32;
+                let layer_bonus = cypress::models::scoring::get_layer_score_bonus(layer_rank);
+                let population_bonus = (population / 200_000.0).clamp(0.0, 3.0);
+                let place_bonus = 5.0_f32;
+
+                let total_score = match_score - layer_bonus - population_bonus - place_bonus;
+                let neg_score = -total_score;
+
                 let current_best = if ctx.place_score_epochs[place_idx] == query_epoch {
                     ctx.place_best_scores[place_idx]
                 } else {
                     f32::NEG_INFINITY
                 };
-                if cos_sim <= current_best {
+                if neg_score <= current_best {
                     continue;
                 }
 
@@ -358,14 +419,10 @@ pub fn search_place_ids(
                     ctx.touched_place_indices.push(place_id);
                 }
 
-                ctx.place_best_scores[place_idx] = cos_sim;
+                ctx.place_best_scores[place_idx] = neg_score;
             }
         }
-        log_phase_timing(
-            "search_place_ids",
-            "accumulate_base_place_scores",
-            phase_started,
-        );
+        log_phase_timing("search_place_ids", "sift4_rescore_places", phase_started);
 
         let phase_started = Instant::now();
         results = ctx
@@ -387,7 +444,7 @@ pub fn search_place_ids(
 
         let phase_started = Instant::now();
         let mut rescored = Vec::with_capacity(results.len());
-        for (place_id, base_cos) in results.drain(..) {
+        for (place_id, base_score) in results.drain(..) {
             let place_idx = place_id as usize;
             if place_idx >= place_count {
                 continue;
@@ -395,7 +452,6 @@ pub fn search_place_ids(
 
             let lat = db.place_latitudes[place_idx] as f64;
             let lon = db.place_longitudes[place_idx] as f64;
-            let importance = db.place_importances[place_idx] as f64;
 
             if let Some(bb) = bbox {
                 if lon < bb[0] || lat < bb[1] || lon > bb[2] || lat > bb[3] {
@@ -403,7 +459,7 @@ pub fn search_place_ids(
                 }
             }
 
-            let mut score = base_cos * (1.0 + importance * 10.0);
+            let mut score = base_score;
             if let Some(focus_point) = focus {
                 let dist = haversine_distance_km(focus_point, (lat, lon));
                 let decay = (-(dist * dist) / (2.0 * safe_focus_weight * safe_focus_weight)).exp();
