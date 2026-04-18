@@ -118,6 +118,10 @@ pub struct AdminArea {
     /// ISO Country Code (e.g., "CA" from "CA-ON")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub iso_country_code: Option<String>,
+
+    /// Population from OSM `population` tag
+    #[serde(default)]
+    pub population: Option<u32>,
 }
 
 impl AdminArea {
@@ -130,6 +134,7 @@ impl AdminArea {
             bbox: None,
             abbr: None,
             iso_country_code: None,
+            population: None,
         }
     }
 
@@ -171,6 +176,10 @@ pub struct AdminEntry {
     /// Use `to_scylla_json()` to include this field for ScyllaDB storage.
     #[serde(skip)]
     pub names: HashMap<String, String>,
+
+    /// Population from OSM
+    #[serde(default)]
+    pub population: Option<u32>,
 }
 
 /// ScyllaDB-specific representation that includes the full `names` HashMap.
@@ -187,6 +196,9 @@ pub struct AdminEntryScylla {
     /// Full multilingual names preserved for ScyllaDB
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub names: HashMap<String, String>,
+
+    #[serde(default)]
+    pub population: Option<u32>,
 }
 
 impl AdminEntry {
@@ -198,6 +210,7 @@ impl AdminEntry {
             id: self.id,
             bbox: self.bbox.clone(),
             names: self.names.clone(),
+            population: self.population,
         };
         serde_json::to_string(&scylla_entry)
     }
@@ -210,6 +223,7 @@ impl AdminEntry {
             id: scylla_entry.id,
             bbox: scylla_entry.bbox,
             names: scylla_entry.names,
+            population: scylla_entry.population,
         }
     }
 
@@ -228,6 +242,7 @@ impl AdminEntry {
             id: Some(area.osm_id),
             bbox: area.bbox.clone(),
             names: area.name.clone(),
+            population: area.population,
         }
     }
 }

@@ -31,6 +31,7 @@ use tracing_subscriber::FmtSubscriber;
 use cypress::discord::DiscordWebhook;
 use cypress::elasticsearch::{create_index, BulkIndexer, EsClient};
 use cypress::models::normalized::NormalizedPlace;
+use cypress::models::population::{compress_population, parse_osm_population};
 use cypress::models::{Address, AdminLevel, GeoBbox, GeoPoint, Layer, OsmType, Place};
 use cypress::pip::{extract_admin_boundaries, AdminSpatialIndex, GeometryResolver, PipService};
 use cypress::scylla::ScyllaClient;
@@ -411,6 +412,7 @@ pub async fn run_single(args: Args, synonyms: Arc<SynonymService>) -> Result<()>
             place.name = boundary.area.name.clone();
             place.wikidata_id = boundary.area.wikidata_id.clone();
             place.bbox = bbox;
+            place.population = boundary.area.population;
 
             // PIP lookup for admin hierarchy (limit to higher levels)
             let hierarchy = pip_service.lookup(
@@ -676,7 +678,11 @@ async fn process_buffer(
             let normalized = NormalizedPlace::from_place(place.clone());
             let json_data = serde_json::to_string(&normalized)?;
             scylla
-                .upsert_place(&normalized.source_id, &json_data)
+                .upsert_place(
+                    &normalized.source_id,
+                    &json_data,
+                    compress_population(normalized.population),
+                )
                 .await?;
 
             Ok::<(), anyhow::Error>(())
@@ -963,6 +969,12 @@ fn extract_tags(place: &mut Place, tags: &osmpbfreader::Tags) {
         {
             place.add_category(key_str, value);
         }
+        // Population (from OSM population tag)
+        else if key_str == "population" {
+            if let Some(pop) = parse_osm_population(value) {
+                place.population = Some(pop);
+            }
+        }
     }
 }
 
@@ -1071,7 +1083,13 @@ async fn upsert_admin_areas(place: &Place, scylla: &ScyllaClient) -> Result<()> 
             let source_id = format!("relation/{}", id);
             // Use to_scylla_json() to preserve full multilingual names for ScyllaDB
             let json_data = parent.to_scylla_json()?;
-            scylla.upsert_admin_area(&source_id, &json_data).await?;
+            scylla
+                .upsert_admin_area(
+                    &source_id,
+                    &json_data,
+                    compress_population(parent.population),
+                )
+                .await?;
         }
     }
     Ok(())

@@ -1,6 +1,6 @@
 use rkyv::{Archive, Deserialize, Serialize};
 
-pub const PLACE_RECORD_DISK_BYTES: usize = 64 + 1 + 128 + 1 + 4 + 4 + 4 + 1;
+pub const PLACE_RECORD_DISK_BYTES: usize = 64 + 1 + 128 + 1 + 4 + 4 + 4 + 1 + 4;
 
 #[derive(Archive, Serialize, Deserialize, Debug, Clone)]
 pub struct PlaceRecord {
@@ -11,7 +11,8 @@ pub struct PlaceRecord {
     pub lat: f32,
     pub lon: f32,
     pub importance: f32,
-    pub layer_rank: u8, // Useful for filtering
+    pub layer_rank: u8,
+    pub population: u32,
 }
 
 impl PlaceRecord {
@@ -54,6 +55,9 @@ impl PlaceRecord {
         offset += 4;
 
         let layer_rank = bytes[offset];
+        offset += 1;
+
+        let population = u32::from_le_bytes(bytes[offset..offset + 4].try_into().ok()?);
 
         Some(Self {
             source_id_bytes,
@@ -64,6 +68,7 @@ impl PlaceRecord {
             lon,
             importance,
             layer_rank,
+            population,
         })
     }
 }
@@ -100,6 +105,21 @@ pub struct CypressMemDb {
     // Normalized string text (lowercased) for SIFT4 re-scoring
     pub string_name_offsets: Vec<u32>,
     pub string_name_bytes: Vec<u8>,
+
+    // ==== Area-Set Hierarchy (ADR-aligned) ====
+    // Area name bytes: area_name_bytes[area_name_offsets[i]..area_name_offsets[i+1]]
+    pub area_name_offsets: Vec<u32>,
+    pub area_name_bytes: Vec<u8>,
+
+    pub area_admin_levels: Vec<u8>,
+    pub area_populations: Vec<u32>,
+
+    // Area sets (deduplicated): area_set_data[area_set_offsets[i]..area_set_offsets[i+1]]
+    pub area_set_offsets: Vec<u32>,
+    pub area_set_data: Vec<u32>,
+
+    // place_idx → area_set_idx
+    pub place_area_sets: Vec<u32>,
 
     // ==== Sparse Spatial Grid ====
     // Sorted array of cell IDs that contain at least one place

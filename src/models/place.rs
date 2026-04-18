@@ -137,6 +137,10 @@ pub struct Place {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub importance: Option<f64>,
 
+    /// Population from OSM `population` tag
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub population: Option<u32>,
+
     /// Layer/type classification
     pub layer: Layer,
 
@@ -191,6 +195,7 @@ impl Place {
             osm_id,
             wikidata_id: None,
             importance: None,
+            population: None,
             layer,
             categories: Vec::new(),
             synonyms: Vec::new(),

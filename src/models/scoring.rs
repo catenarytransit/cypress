@@ -235,4 +235,107 @@ mod tests {
         assert!(get_layer_score_bonus(3) > get_layer_score_bonus(0));
         assert!(get_layer_score_bonus(9) > get_layer_score_bonus(1));
     }
+
+    #[test]
+    fn multi_token_full_match() {
+        let tokens: Vec<&[u8]> = vec![b"new", b"york"];
+        let (score, matched) = get_multi_token_match_score(b"new york city", &tokens);
+        assert_ne!(score, NO_MATCH);
+        assert_eq!(matched, 0b11);
+    }
+
+    #[test]
+    fn multi_token_partial_match() {
+        let tokens: Vec<&[u8]> = vec![b"roma", b"italia"];
+        let (score, matched) = get_multi_token_match_score(b"roma", &tokens);
+        assert_ne!(score, NO_MATCH);
+        assert_eq!(matched & 1, 1);
+        assert_eq!(matched & 2, 0);
+    }
+}
+
+/// Multi-token scoring: greedily matches each query token against dataset
+/// name tokens. Returns (combined_score, matched_token_bitmask).
+/// Unmatched query tokens are NOT penalized here — the caller applies
+/// area matching and penalties for unmatched tokens.
+pub fn get_multi_token_match_score(dataset_name: &[u8], query_tokens: &[&[u8]]) -> (f32, u8) {
+    if dataset_name.is_empty() || query_tokens.is_empty() {
+        return (NO_MATCH, 0);
+    }
+
+    if query_tokens.len() == 1 {
+        let score = get_match_score(dataset_name, query_tokens[0]);
+        let mask = if score != NO_MATCH { 1u8 } else { 0u8 };
+        return (score, mask);
+    }
+
+    let max_tokens = query_tokens.len().min(8);
+    let mut s_tokens: Vec<&[u8]> = Vec::new();
+    tokenize_bytes(dataset_name, &mut s_tokens);
+    if s_tokens.is_empty() {
+        return (NO_MATCH, 0);
+    }
+    let max_s = s_tokens.len().min(8);
+    let s_tokens = &s_tokens[..max_s];
+
+    // Score matrix: query_token[i] vs dataset_token[j]
+    let mut scores = [[NO_MATCH; 8]; 8];
+    for (qi, qt) in query_tokens[..max_tokens].iter().enumerate() {
+        for (si, st) in s_tokens.iter().enumerate() {
+            scores[qi][si] = get_token_match_score(st, qt);
+        }
+    }
+
+    // Greedy assignment: pick best (query_token, dataset_token) pairs
+    let mut matched_q = 0u8;
+    let mut matched_s = 0u8;
+    let mut total_score = 0.0f32;
+    let mut n_matched = 0u32;
+
+    for _ in 0..max_tokens.min(max_s) {
+        let mut best = NO_MATCH;
+        let mut best_qi = 0usize;
+        let mut best_si = 0usize;
+        for qi in 0..max_tokens {
+            if matched_q & (1 << qi) != 0 {
+                continue;
+            }
+            for si in 0..max_s {
+                if matched_s & (1 << si) != 0 {
+                    continue;
+                }
+                if scores[qi][si] < best {
+                    best = scores[qi][si];
+                    best_qi = qi;
+                    best_si = si;
+                }
+            }
+        }
+        if best == NO_MATCH {
+            break;
+        }
+        matched_q |= 1 << best_qi;
+        matched_s |= 1 << best_si;
+        total_score += best;
+        n_matched += 1;
+    }
+
+    if n_matched == 0 {
+        return (NO_MATCH, 0);
+    }
+
+    // Penalty for unmatched dataset tokens
+    for si in 0..max_s {
+        if matched_s & (1 << si) == 0 {
+            let penalty = (s_tokens[si].len() as f32 / 4.0).clamp(0.75, 3.0);
+            total_score += penalty;
+        }
+    }
+
+    (total_score, matched_q)
+}
+
+/// Score a single query token against a raw area name byte slice.
+pub fn get_area_match_score(area_name: &[u8], query_token: &[u8]) -> f32 {
+    get_match_score(area_name, query_token)
 }

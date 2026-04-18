@@ -14,6 +14,8 @@ pub struct NormalizedPlace {
     pub osm_id: i64,
     pub wikidata_id: Option<String>,
     pub importance: Option<f64>,
+    #[serde(default)]
+    pub population: Option<u32>,
     pub layer: Layer,
     pub categories: Vec<String>,
     pub name: std::collections::HashMap<String, String>,
@@ -86,6 +88,7 @@ impl NormalizedPlace {
             osm_id: place.osm_id,
             wikidata_id: place.wikidata_id,
             importance: place.importance,
+            population: place.population,
             layer: place.layer,
             categories: place.categories,
             name: place.name,

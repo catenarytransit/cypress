@@ -4,6 +4,7 @@ use geo::MultiPolygon;
 use osmpbfreader::{OsmObj, OsmPbfReader};
 use tracing::{debug, info};
 
+use crate::models::population::parse_osm_population;
 use crate::models::{AdminArea, AdminLevel};
 use crate::pip::geometry::GeometryResolver;
 
@@ -118,6 +119,10 @@ pub fn extract_admin_boundaries<R: std::io::Read + std::io::Seek>(
                 }
             } else if key == "wikidata" {
                 area.wikidata_id = Some(value.to_string());
+            } else if key == "population" {
+                if let Some(pop) = parse_osm_population(value) {
+                    area.population = Some(pop);
+                }
             }
         }
 

@@ -17,6 +17,7 @@ use xxhash_rust::xxh64::xxh64;
 
 use cypress::models::memdb::{CypressMemDb, PlaceRecord, PLACE_RECORD_DISK_BYTES};
 use cypress::models::normalized::NormalizedPlace;
+use cypress::models::population::decompress_population;
 use cypress::scylla::ScyllaClient;
 use rkyv::ser::{
     serializers::{AllocScratch, CompositeSerializer, SharedSerializeMap, WriteSerializer},
@@ -68,11 +69,27 @@ fn get_layer_rank(layer: cypress::models::place::Layer) -> u8 {
     }
 }
 
+fn admin_level_from_field(field: &str) -> u8 {
+    match field {
+        "country" => 2,
+        "macro_region" => 3,
+        "region" => 4,
+        "macro_county" => 5,
+        "county" => 6,
+        "local_admin" => 7,
+        "locality" => 8,
+        "borough" => 9,
+        "neighbourhood" => 10,
+        _ => 0,
+    }
+}
+
 #[derive(Debug, Clone)]
 struct WorkerSpill {
     worker_id: u32,
     place_file: PathBuf,
     term_file: PathBuf,
+    parent_file: PathBuf,
     place_count: u32,
 }
 
@@ -100,6 +117,7 @@ fn write_place_record<W: Write>(writer: &mut W, record: &PlaceRecord) -> Result<
     writer.write_all(&record.lon.to_le_bytes())?;
     writer.write_all(&record.importance.to_le_bytes())?;
     writer.write_all(&[record.layer_rank])?;
+    writer.write_all(&record.population.to_le_bytes())?;
     Ok(())
 }
 
@@ -162,6 +180,53 @@ fn read_bigram_pair<R: Read>(reader: &mut R) -> Result<Option<(u16, u32)>> {
     )))
 }
 
+/// Parent spill entry format:
+///   local_place_id: u32
+///   admin_level: u8
+///   id_len: u16
+///   id_bytes: [u8; id_len]
+fn write_parent_entry<W: Write>(
+    writer: &mut W,
+    local_place_id: u32,
+    admin_level: u8,
+    area_id: &str,
+) -> Result<()> {
+    writer.write_all(&local_place_id.to_le_bytes())?;
+    writer.write_all(&[admin_level])?;
+    let id_bytes = area_id.as_bytes();
+    let id_len = id_bytes.len() as u16;
+    writer.write_all(&id_len.to_le_bytes())?;
+    writer.write_all(id_bytes)?;
+    Ok(())
+}
+
+fn read_parent_entry<R: Read>(reader: &mut R) -> Result<Option<(u32, u8, String)>> {
+    let mut pid_buf = [0u8; 4];
+    if !read_exact_or_eof(reader, &mut pid_buf)? {
+        return Ok(None);
+    }
+    let place_id = u32::from_le_bytes(pid_buf);
+
+    let mut level_buf = [0u8; 1];
+    if !read_exact_or_eof(reader, &mut level_buf)? {
+        return Err(anyhow!("Unexpected EOF reading parent admin level"));
+    }
+
+    let mut len_buf = [0u8; 2];
+    if !read_exact_or_eof(reader, &mut len_buf)? {
+        return Err(anyhow!("Unexpected EOF reading parent id length"));
+    }
+    let id_len = u16::from_le_bytes(len_buf) as usize;
+
+    let mut id_bytes = vec![0u8; id_len];
+    if id_len > 0 && !read_exact_or_eof(reader, &mut id_bytes)? {
+        return Err(anyhow!("Unexpected EOF reading parent id bytes"));
+    }
+
+    let area_id = String::from_utf8(id_bytes).context("Invalid UTF-8 in parent spill")?;
+    Ok(Some((place_id, level_buf[0], area_id)))
+}
+
 fn get_or_create_writer<'a>(
     writers: &'a mut HashMap<usize, BufWriter<File>>,
     dir: &Path,
@@ -184,9 +249,10 @@ async fn fetch_range_to_spill(
     end: i64,
     place_file: &Path,
     term_file: &Path,
+    parent_file: &Path,
 ) -> Result<u32> {
     let query = format!(
-        "SELECT data FROM cypress.places WHERE token(id) >= {} AND token(id) < {}",
+        "SELECT data, population FROM cypress.places WHERE token(id) >= {} AND token(id) < {}",
         start, end
     );
 
@@ -200,6 +266,12 @@ async fn fetch_range_to_spill(
         BufWriter::new(File::create(term_file).with_context(|| {
             format!("Failed to create term spill file: {}", term_file.display())
         })?);
+    let mut parent_writer = BufWriter::new(File::create(parent_file).with_context(|| {
+        format!(
+            "Failed to create parent spill file: {}",
+            parent_file.display()
+        )
+    })?);
 
     let it = client
         .session
@@ -208,13 +280,13 @@ async fn fetch_range_to_spill(
         .context("Scylla query_iter failed")?;
 
     let mut rows = it
-        .rows_stream::<(String,)>()
+        .rows_stream::<(String, Option<i32>)>()
         .context("rows_stream type conversion failed")?;
 
     let mut local_place_id = 0u32;
 
     while let Some(row_result) = rows.next().await {
-        let (data,) = row_result.context("Row fetch failure")?;
+        let (data, compressed_population) = row_result.context("Row fetch failure")?;
 
         let Ok(place) = serde_json::from_str::<NormalizedPlace>(&data) else {
             continue;
@@ -236,6 +308,11 @@ async fn fetch_range_to_spill(
             lon: place.center_point.lon as f32,
             importance: place.importance.unwrap_or(0.0) as f32,
             layer_rank: get_layer_rank(place.layer),
+            population: decompress_population(
+                compressed_population.and_then(|p| u32::try_from(p).ok()),
+            )
+            .or(place.population)
+            .unwrap_or(0),
         };
 
         let src_id = place.source_id.as_bytes();
@@ -262,12 +339,38 @@ async fn fetch_range_to_spill(
             write_term_entry(&mut term_writer, local_place_id, &phrase)?;
         }
 
+        // Emit parent hierarchy entries
+        let parent_fields: [(&str, &Option<String>); 9] = [
+            ("country", &place.parent.country),
+            ("macro_region", &place.parent.macro_region),
+            ("region", &place.parent.region),
+            ("macro_county", &place.parent.macro_county),
+            ("county", &place.parent.county),
+            ("local_admin", &place.parent.local_admin),
+            ("locality", &place.parent.locality),
+            ("borough", &place.parent.borough),
+            ("neighbourhood", &place.parent.neighbourhood),
+        ];
+
+        for (field, id_opt) in &parent_fields {
+            if let Some(id) = id_opt {
+                let level = admin_level_from_field(field);
+                write_parent_entry(&mut parent_writer, local_place_id, level, id)?;
+            }
+        }
+
         local_place_id += 1;
     }
 
     place_writer.flush()?;
     term_writer.flush()?;
+    parent_writer.flush()?;
     Ok(local_place_id)
+}
+
+/// ADR-aligned little-endian bigram encoding: char[0] in low byte, char[1] in high byte.
+fn compress_bigram(b0: u8, b1: u8) -> u16 {
+    (b0 as u16) | ((b1 as u16) << 8)
 }
 
 #[tokio::main]
@@ -301,10 +404,8 @@ async fn main() -> Result<()> {
 
     let mut ranges = Vec::new();
     if tokens.is_empty() {
-        // Fallback for single-node setups without explicit vnodes
         ranges.push((i64::MIN, i64::MAX));
     } else {
-        // Create ranges: (MIN, T0), (T0, T1) ... (TN, MAX)
         ranges.push((i64::MIN, tokens[0]));
         for i in 0..tokens.len() - 1 {
             ranges.push((tokens[i], tokens[i + 1]));
@@ -337,6 +438,7 @@ async fn main() -> Result<()> {
                 let worker_id = worker_counter.fetch_add(1, Ordering::Relaxed);
                 let place_file = run_tmp_dir.join(format!("worker_{:08}.places.bin", worker_id));
                 let term_file = run_tmp_dir.join(format!("worker_{:08}.terms.bin", worker_id));
+                let parent_file = run_tmp_dir.join(format!("worker_{:08}.parents.bin", worker_id));
 
                 let mut attempt = 0u32;
                 let place_count = loop {
@@ -347,6 +449,7 @@ async fn main() -> Result<()> {
                         end,
                         &place_file,
                         &term_file,
+                        &parent_file,
                     )
                     .await
                     {
@@ -379,6 +482,7 @@ async fn main() -> Result<()> {
                     worker_id,
                     place_file,
                     term_file,
+                    parent_file,
                     place_count,
                 });
 
@@ -488,12 +592,177 @@ async fn main() -> Result<()> {
         place_longitudes.push(place.lon);
         place_importances.push(place.importance);
         place_layer_ranks.push(place.layer_rank);
-        place_populations.push((place.importance * 1_000_000.0) as u32);
+        place_populations.push(place.population);
 
         let id_bytes = &place.source_id_bytes[..place.source_id_len as usize];
         place_source_id_bytes.extend_from_slice(id_bytes);
         place_source_id_offsets.push(place_source_id_bytes.len() as u32);
     }
+
+    // === Pass 1.5: Process parent hierarchy spills ===
+    info!("Pass 1.5: collecting parent hierarchy entries");
+
+    // place_id → Vec<(admin_level, area_id)>
+    let mut place_parents: HashMap<u32, Vec<(u8, String)>> = HashMap::new();
+    let mut all_area_ids = HashSet::new();
+
+    for (spill, global_offset) in &worker_offsets {
+        let parent_path = &spill.parent_file;
+        if !parent_path.exists() || fs::metadata(parent_path)?.len() == 0 {
+            continue;
+        }
+
+        let mut reader = BufReader::new(File::open(parent_path).with_context(|| {
+            format!(
+                "Failed to open parent spill file: {}",
+                parent_path.display()
+            )
+        })?);
+
+        while let Some((local_place_id, admin_level, area_id)) = read_parent_entry(&mut reader)? {
+            let global_place_id = global_offset + local_place_id;
+            all_area_ids.insert(area_id.clone());
+            place_parents
+                .entry(global_place_id)
+                .or_default()
+                .push((admin_level, area_id));
+        }
+    }
+
+    info!(
+        "Collected {} unique admin area IDs from {} places with parents",
+        all_area_ids.len(),
+        place_parents.len()
+    );
+
+    // Batch-fetch admin areas from ScyllaDB
+    info!("Fetching admin area names from ScyllaDB...");
+    let all_area_ids_vec: Vec<String> = all_area_ids.into_iter().collect();
+
+    // Process in batches (ScyllaDB IN clause has limits)
+    let mut admin_area_data: HashMap<String, (String, u32)> = HashMap::new();
+    let batch_size = 10;
+
+    for chunk in all_area_ids_vec.chunks(batch_size) {
+        let chunk_vec: Vec<String> = chunk.to_vec();
+        match scylla_client_ref
+            .get_admin_areas_with_population(&chunk_vec)
+            .await
+        {
+            Ok(map) => {
+                for (id, (json_data, compressed_population)) in map {
+                    if let Ok(entry) =
+                        serde_json::from_str::<cypress::models::admin::AdminEntryScylla>(&json_data)
+                    {
+                        let admin_entry = cypress::models::admin::AdminEntry::from_scylla(entry);
+                        let name = admin_entry
+                            .name
+                            .clone()
+                            .or_else(|| admin_entry.names.get("default").cloned())
+                            .or_else(|| admin_entry.names.values().next().cloned())
+                            .unwrap_or_default()
+                            .trim()
+                            .to_lowercase();
+                        let population = decompress_population(compressed_population)
+                            .or(admin_entry.population)
+                            .unwrap_or(0);
+                        admin_area_data.insert(id, (name, population));
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to fetch admin area batch: {}", e);
+            }
+        }
+    }
+
+    info!(
+        "Resolved {} admin area names from ScyllaDB",
+        admin_area_data.len()
+    );
+
+    // Build area index: assign area_idx to each unique admin area
+    let mut area_id_to_idx: HashMap<String, u32> = HashMap::new();
+    let mut area_name_offsets: Vec<u32> = Vec::new();
+    let mut area_name_bytes: Vec<u8> = Vec::new();
+    let mut area_admin_levels: Vec<u8> = Vec::new();
+    let mut area_populations: Vec<u32> = Vec::new();
+
+    area_name_offsets.push(0);
+
+    // Sorted for deterministic output
+    let mut sorted_area_ids: Vec<String> = admin_area_data.keys().cloned().collect();
+    sorted_area_ids.sort();
+
+    for area_id in &sorted_area_ids {
+        let (name, population) = admin_area_data.get(area_id).unwrap();
+        let area_idx = area_id_to_idx.len() as u32;
+        area_id_to_idx.insert(area_id.clone(), area_idx);
+
+        area_name_bytes.extend_from_slice(name.as_bytes());
+        area_name_offsets.push(area_name_bytes.len() as u32);
+        area_populations.push(*population);
+
+        // Look up admin level from any place that references this area
+        let level = place_parents
+            .values()
+            .flat_map(|v| v.iter())
+            .find(|(_, id)| id == area_id)
+            .map(|(lvl, _)| *lvl)
+            .unwrap_or(0);
+        area_admin_levels.push(level);
+    }
+
+    info!("Built {} area entries", area_id_to_idx.len());
+
+    // Build area sets for each place (deduplicated)
+    let sentinel_area_set = u32::MAX;
+    let mut area_set_map: HashMap<Vec<u32>, u32> = HashMap::new();
+    let mut area_set_offsets: Vec<u32> = Vec::new();
+    let mut area_set_data: Vec<u32> = Vec::new();
+    let mut place_area_sets = vec![sentinel_area_set; total_places as usize];
+
+    area_set_offsets.push(0);
+
+    for place_idx in 0..total_places {
+        let parents = place_parents.get(&place_idx);
+        if parents.is_none() {
+            continue;
+        }
+
+        let parents = parents.unwrap();
+        let mut area_indices: Vec<u32> = parents
+            .iter()
+            .filter_map(|(_, area_id)| area_id_to_idx.get(area_id).copied())
+            .collect();
+        area_indices.sort_unstable();
+        area_indices.dedup();
+
+        if area_indices.is_empty() {
+            continue;
+        }
+
+        let area_set_idx = if let Some(&existing_idx) = area_set_map.get(&area_indices) {
+            existing_idx
+        } else {
+            let idx = area_set_map.len() as u32;
+            area_set_data.extend_from_slice(&area_indices);
+            area_set_offsets.push(area_set_data.len() as u32);
+            area_set_map.insert(area_indices, idx);
+            idx
+        };
+
+        place_area_sets[place_idx as usize] = area_set_idx;
+    }
+
+    info!(
+        "Built {} deduplicated area sets for {} places",
+        area_set_map.len(),
+        place_area_sets
+            .iter()
+            .filter(|&&v| v != sentinel_area_set)
+            .count()
+    );
 
     info!(
         "Distributing worker term spills into {} hash buckets",
@@ -568,12 +837,11 @@ async fn main() -> Result<()> {
         let mut i = 0usize;
         while i < entries.len() {
             let phrase = entries[i].0.clone();
-            let string_id = next_string_id;
+            let _string_id = next_string_id;
             next_string_id += 1;
 
             string_to_places_offsets.push(string_to_places_data.len() as u32);
 
-            // Store the normalized string text for query-time SIFT4 re-scoring
             string_name_bytes.extend_from_slice(phrase.as_bytes());
             string_name_offsets.push(string_name_bytes.len() as u32);
 
@@ -587,11 +855,12 @@ async fn main() -> Result<()> {
                 i += 1;
             }
 
+            // ADR-aligned little-endian bigram encoding
             let mut local_bigrams: Vec<u16> = phrase
                 .as_bytes()
                 .windows(2)
                 .filter(|w| w[0] != b' ' && w[1] != b' ')
-                .map(|w| ((w[0] as u16) << 8) | (w[1] as u16))
+                .map(|w| compress_bigram(w[0], w[1]))
                 .collect();
             local_bigrams.sort_unstable();
             local_bigrams.dedup();
@@ -599,14 +868,14 @@ async fn main() -> Result<()> {
             string_bigram_counts.push(local_bigrams.len().min(255) as u8);
 
             for bg in local_bigrams {
-                let shard = (bg >> 8) as usize;
+                let shard = (bg & 0xFF) as usize; // low byte = first char
                 let writer = get_or_create_writer(
                     &mut bigram_shard_writers,
                     &bigram_shard_dir,
                     "bg",
                     shard,
                 )?;
-                write_bigram_pair(writer, bg, string_id)?;
+                write_bigram_pair(writer, bg, _string_id)?;
             }
         }
     }
@@ -710,6 +979,13 @@ async fn main() -> Result<()> {
         place_populations,
         string_name_offsets,
         string_name_bytes,
+        area_name_offsets,
+        area_name_bytes,
+        area_admin_levels,
+        area_populations,
+        area_set_offsets,
+        area_set_data,
+        place_area_sets,
         active_cells,
         cell_offsets,
         cell_places,

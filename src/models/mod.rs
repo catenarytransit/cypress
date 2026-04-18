@@ -4,6 +4,7 @@ pub mod admin;
 pub mod memdb;
 pub mod normalized;
 pub mod place;
+pub mod population;
 pub mod scoring;
 pub mod sift4;
 
