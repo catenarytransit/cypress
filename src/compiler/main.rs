@@ -26,6 +26,7 @@ use rkyv::ser::{
 
 const TERM_BUCKETS: usize = 128;
 const BIGRAM_SHARDS: usize = 256;
+const HIERARCHY_PAIR_BUCKETS: usize = 512;
 
 #[derive(Parser, Debug)]
 #[command(name = "compiler")]
@@ -225,6 +226,29 @@ fn read_parent_entry<R: Read>(reader: &mut R) -> Result<Option<(u32, u8, String)
 
     let area_id = String::from_utf8(id_bytes).context("Invalid UTF-8 in parent spill")?;
     Ok(Some((place_id, level_buf[0], area_id)))
+}
+
+fn write_u32_pair<W: Write>(writer: &mut W, left: u32, right: u32) -> Result<()> {
+    writer.write_all(&left.to_le_bytes())?;
+    writer.write_all(&right.to_le_bytes())?;
+    Ok(())
+}
+
+fn read_u32_pair<R: Read>(reader: &mut R) -> Result<Option<(u32, u32)>> {
+    let mut left_buf = [0u8; 4];
+    if !read_exact_or_eof(reader, &mut left_buf)? {
+        return Ok(None);
+    }
+
+    let mut right_buf = [0u8; 4];
+    if !read_exact_or_eof(reader, &mut right_buf)? {
+        return Err(anyhow!("Unexpected EOF reading u32 pair spill"));
+    }
+
+    Ok(Some((
+        u32::from_le_bytes(left_buf),
+        u32::from_le_bytes(right_buf),
+    )))
 }
 
 fn get_or_create_writer<'a>(
@@ -599,14 +623,13 @@ async fn main() -> Result<()> {
         place_source_id_offsets.push(place_source_id_bytes.len() as u32);
     }
 
-    // === Pass 1.5: Process parent hierarchy spills ===
-    info!("Pass 1.5: collecting parent hierarchy entries");
+    // === Pass 1.5a: Process parent hierarchy spills (collect unique area ids only) ===
+    info!("Pass 1.5a: collecting unique parent area IDs");
 
-    // place_id → Vec<(admin_level, area_id)>
-    let mut place_parents: HashMap<u32, Vec<(u8, String)>> = HashMap::new();
     let mut all_area_ids = HashSet::new();
+    let mut area_level_by_id: HashMap<String, u8> = HashMap::new();
 
-    for (spill, global_offset) in &worker_offsets {
+    for (spill, _) in &worker_offsets {
         let parent_path = &spill.parent_file;
         if !parent_path.exists() || fs::metadata(parent_path)?.len() == 0 {
             continue;
@@ -619,21 +642,23 @@ async fn main() -> Result<()> {
             )
         })?);
 
-        while let Some((local_place_id, admin_level, area_id)) = read_parent_entry(&mut reader)? {
-            let global_place_id = global_offset + local_place_id;
-            all_area_ids.insert(area_id.clone());
-            place_parents
-                .entry(global_place_id)
-                .or_default()
-                .push((admin_level, area_id));
+        while let Some((_, admin_level, area_id)) = read_parent_entry(&mut reader)? {
+            if let Some(existing_level) = area_level_by_id.get(&area_id).copied() {
+                if existing_level != admin_level {
+                    warn!(
+                        "Area {} encountered with inconsistent admin levels {} and {}; keeping first",
+                        area_id, existing_level, admin_level
+                    );
+                }
+            } else {
+                area_level_by_id.insert(area_id.clone(), admin_level);
+            }
+
+            all_area_ids.insert(area_id);
         }
     }
 
-    info!(
-        "Collected {} unique admin area IDs from {} places with parents",
-        all_area_ids.len(),
-        place_parents.len()
-    );
+    info!("Collected {} unique admin area IDs", all_area_ids.len());
 
     // Batch-fetch admin areas from ScyllaDB
     info!("Fetching admin area names from ScyllaDB...");
@@ -703,19 +728,73 @@ async fn main() -> Result<()> {
         area_name_offsets.push(area_name_bytes.len() as u32);
         area_populations.push(*population);
 
-        // Look up admin level from any place that references this area
-        let level = place_parents
-            .values()
-            .flat_map(|v| v.iter())
-            .find(|(_, id)| id == area_id)
-            .map(|(lvl, _)| *lvl)
-            .unwrap_or(0);
+        let level = area_level_by_id.get(area_id).copied().unwrap_or(0);
         area_admin_levels.push(level);
     }
 
     info!("Built {} area entries", area_id_to_idx.len());
 
-    // Build area sets for each place (deduplicated)
+    // === Pass 1.5b: Spill compact (global_place_id, area_idx) pairs ===
+    info!(
+        "Pass 1.5b: spilling place-area pairs into {} buckets",
+        HIERARCHY_PAIR_BUCKETS
+    );
+
+    let hierarchy_bucket_dir = run_tmp_dir.join("hierarchy_pair_buckets");
+    fs::create_dir_all(&hierarchy_bucket_dir)?;
+    let mut hierarchy_bucket_writers: HashMap<usize, BufWriter<File>> = HashMap::new();
+    let mut hierarchy_pair_count = 0u64;
+
+    for (spill, global_offset) in &worker_offsets {
+        let parent_path = &spill.parent_file;
+        if !parent_path.exists() || fs::metadata(parent_path)?.len() == 0 {
+            continue;
+        }
+
+        let mut reader = BufReader::new(File::open(parent_path).with_context(|| {
+            format!(
+                "Failed to open parent spill file: {}",
+                parent_path.display()
+            )
+        })?);
+
+        while let Some((local_place_id, _, area_id)) = read_parent_entry(&mut reader)? {
+            if local_place_id >= spill.place_count {
+                return Err(anyhow!(
+                    "Corrupt parent spill {}: local place id {} >= {}",
+                    parent_path.display(),
+                    local_place_id,
+                    spill.place_count
+                ));
+            }
+
+            let Some(&area_idx) = area_id_to_idx.get(&area_id) else {
+                continue;
+            };
+
+            let global_place_id = global_offset + local_place_id;
+            let bucket = (global_place_id as usize) % HIERARCHY_PAIR_BUCKETS;
+            let writer = get_or_create_writer(
+                &mut hierarchy_bucket_writers,
+                &hierarchy_bucket_dir,
+                "pairs",
+                bucket,
+            )?;
+            write_u32_pair(writer, global_place_id, area_idx)?;
+            hierarchy_pair_count += 1;
+        }
+    }
+
+    for writer in hierarchy_bucket_writers.values_mut() {
+        writer.flush()?;
+    }
+
+    info!(
+        "Pass 1.5b complete: spilled {} place-area pairs",
+        hierarchy_pair_count
+    );
+
+    // === Pass 1.5c: Build area sets from bucketed compact pair spills ===
     let sentinel_area_set = u32::MAX;
     let mut area_set_map: HashMap<Vec<u32>, u32> = HashMap::new();
     let mut area_set_offsets: Vec<u32> = Vec::new();
@@ -724,39 +803,86 @@ async fn main() -> Result<()> {
 
     area_set_offsets.push(0);
 
-    for place_idx in 0..total_places {
-        let parents = place_parents.get(&place_idx);
-        if parents.is_none() {
+    info!(
+        "Pass 1.5c: building deduplicated area sets from {} pair buckets",
+        HIERARCHY_PAIR_BUCKETS
+    );
+
+    for bucket in 0..HIERARCHY_PAIR_BUCKETS {
+        let bucket_path = hierarchy_bucket_dir.join(format!("pairs_{:03}.bin", bucket));
+        if !bucket_path.exists() {
             continue;
         }
-
-        let parents = parents.unwrap();
-        let mut area_indices: Vec<u32> = parents
-            .iter()
-            .filter_map(|(_, area_id)| area_id_to_idx.get(area_id).copied())
-            .collect();
-        area_indices.sort_unstable();
-        area_indices.dedup();
-
-        if area_indices.is_empty() {
+        let bucket_len = fs::metadata(&bucket_path)?.len();
+        if bucket_len == 0 {
             continue;
         }
+        if bucket_len % 8 != 0 {
+            return Err(anyhow!(
+                "Corrupt hierarchy pair bucket {}: byte length {} is not divisible by 8",
+                bucket_path.display(),
+                bucket_len
+            ));
+        }
 
-        let area_set_idx = if let Some(&existing_idx) = area_set_map.get(&area_indices) {
-            existing_idx
-        } else {
-            let idx = area_set_map.len() as u32;
-            area_set_data.extend_from_slice(&area_indices);
-            area_set_offsets.push(area_set_data.len() as u32);
-            area_set_map.insert(area_indices, idx);
-            idx
-        };
+        let mut pairs = Vec::<(u32, u32)>::with_capacity((bucket_len / 8) as usize);
+        let mut reader = BufReader::new(File::open(&bucket_path).with_context(|| {
+            format!(
+                "Failed to open hierarchy pair bucket: {}",
+                bucket_path.display()
+            )
+        })?);
 
-        place_area_sets[place_idx as usize] = area_set_idx;
+        while let Some(pair) = read_u32_pair(&mut reader)? {
+            pairs.push(pair);
+        }
+
+        pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+        let mut i = 0usize;
+        while i < pairs.len() {
+            let place_id = pairs[i].0;
+            if place_id >= total_places {
+                return Err(anyhow!(
+                    "Corrupt hierarchy pair bucket {}: place id {} >= {}",
+                    bucket_path.display(),
+                    place_id,
+                    total_places
+                ));
+            }
+
+            let mut area_indices = Vec::<u32>::new();
+            let mut last_area = None::<u32>;
+
+            while i < pairs.len() && pairs[i].0 == place_id {
+                let area_idx = pairs[i].1;
+                if last_area != Some(area_idx) {
+                    area_indices.push(area_idx);
+                    last_area = Some(area_idx);
+                }
+                i += 1;
+            }
+
+            if area_indices.is_empty() {
+                continue;
+            }
+
+            let area_set_idx = if let Some(&existing_idx) = area_set_map.get(&area_indices) {
+                existing_idx
+            } else {
+                let idx = area_set_map.len() as u32;
+                area_set_data.extend_from_slice(&area_indices);
+                area_set_offsets.push(area_set_data.len() as u32);
+                area_set_map.insert(area_indices, idx);
+                idx
+            };
+
+            place_area_sets[place_id as usize] = area_set_idx;
+        }
     }
 
     info!(
-        "Built {} deduplicated area sets for {} places",
+        "Pass 1.5 complete: built {} deduplicated area sets for {} places",
         area_set_map.len(),
         place_area_sets
             .iter()
