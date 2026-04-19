@@ -994,7 +994,7 @@ async fn main() -> Result<()> {
             string_bigram_counts.push(local_bigrams.len().min(255) as u8);
 
             for bg in local_bigrams {
-                let shard = (bg & 0xFF) as usize; // low byte = first char
+                let shard = (bg >> 8) as usize; // high byte = second char
                 let writer = get_or_create_writer(
                     &mut bigram_shard_writers,
                     &bigram_shard_dir,
