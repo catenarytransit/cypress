@@ -127,22 +127,35 @@ pub fn get_match_score(dataset_name: &[u8], query: &[u8]) -> f32 {
             let token_bits: u8 = ((1u16 << to) - (1u16 << from)) as u8;
 
             // Build phrase by concatenating tokens with spaces
-            let phrase: Vec<u8> = if len == 1 {
-                s_tokens[from].to_vec()
+            let mut buf_storage = [0u8; 256];
+            let score = if len == 1 {
+                get_token_match_score(s_tokens[from], query)
             } else {
                 let total_len: usize =
                     s_tokens[from..to].iter().map(|t| t.len()).sum::<usize>() + len - 1;
-                let mut buf = Vec::with_capacity(total_len);
-                for (i, t) in s_tokens[from..to].iter().enumerate() {
-                    if i > 0 {
-                        buf.push(b' ');
-                    }
-                    buf.extend_from_slice(t);
-                }
-                buf
-            };
 
-            let score = get_token_match_score(&phrase, query);
+                if total_len <= buf_storage.len() {
+                    let mut buf_len = 0;
+                    for (i, t) in s_tokens[from..to].iter().enumerate() {
+                        if i > 0 {
+                            buf_storage[buf_len] = b' ';
+                            buf_len += 1;
+                        }
+                        buf_storage[buf_len..buf_len + t.len()].copy_from_slice(t);
+                        buf_len += t.len();
+                    }
+                    get_token_match_score(&buf_storage[..buf_len], query)
+                } else {
+                    let mut fallback = Vec::with_capacity(total_len);
+                    for (i, t) in s_tokens[from..to].iter().enumerate() {
+                        if i > 0 {
+                            fallback.push(b' ');
+                        }
+                        fallback.extend_from_slice(t);
+                    }
+                    get_token_match_score(&fallback, query)
+                }
+            };
             if score < best_score {
                 best_score = score;
                 best_token_bits = token_bits;

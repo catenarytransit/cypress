@@ -172,12 +172,10 @@ fn tokenize_query(query: &str) -> Vec<&[u8]> {
 /// Try to match unmatched query tokens against area names for a place.
 fn score_area_matches(
     db: &cypress::models::memdb::ArchivedCypressMemDb,
-    place_idx: usize,
+    area_set_idx: usize,
     query_tokens: &[&[u8]],
     matched_mask: u8,
 ) -> (f32, u8) {
-    let area_set_idx = db.place_area_sets[place_idx] as usize;
-
     if area_set_idx as u32 == u32::MAX {
         return (0.0, matched_mask);
     }
@@ -330,15 +328,14 @@ pub fn search_place_ids(
         let phase_started = Instant::now();
         let cached_counts = ctx
             .query_cache
-            .get_closest_dense_ref(&query_bigrams, &mut missing_bigrams);
+            .get_closest_sparse_ref(&query_bigrams, &mut missing_bigrams);
         if let Some(cached) = cached_counts {
-            if cached.len() == ctx.string_match_counts.len() {
-                ctx.string_match_counts.copy_from_slice(cached.as_slice());
-            } else {
-                ctx.string_match_counts.fill(0);
+            for &(idx, count) in cached.iter() {
+                ctx.string_match_counts[idx as usize] = count;
+                ctx.touched_string_indices.push(idx);
             }
         } else {
-            ctx.string_match_counts.fill(0);
+            // Already cleared sparsely in `clear`
         }
         let missing_bigram_count = missing_bigrams.len();
         log_phase_timing("search_place_ids", "cache_lookup_restore", phase_started);
@@ -357,6 +354,9 @@ pub fn search_place_ids(
 
             for i in start..end {
                 let string_idx = db.bigram_data[i] as usize;
+                if ctx.string_match_counts[string_idx] == 0 {
+                    ctx.touched_string_indices.push(string_idx as u32);
+                }
                 ctx.string_match_counts[string_idx] =
                     ctx.string_match_counts[string_idx].saturating_add(1);
             }
@@ -365,13 +365,19 @@ pub fn search_place_ids(
 
         let phase_started = Instant::now();
         if !ctx.query_cache.has_exact(&query_bigrams) {
-            let dense_counts = Arc::new(ctx.string_match_counts.clone());
-            ctx.query_cache.put_dense(&query_bigrams, dense_counts);
+            let sparse_counts = Arc::new(
+                ctx.touched_string_indices
+                    .iter()
+                    .map(|&idx| (idx, ctx.string_match_counts[idx as usize]))
+                    .collect::<Vec<_>>(),
+            );
+            ctx.query_cache.put_sparse(&query_bigrams, sparse_counts);
         }
         log_phase_timing("search_place_ids", "cache_store_counts", phase_started);
 
         let phase_started = Instant::now();
-        for string_idx in 0..ctx.string_match_counts.len() {
+        for i in 0..ctx.touched_string_indices.len() {
+            let string_idx = ctx.touched_string_indices[i] as usize;
             let match_count = ctx.string_match_counts[string_idx];
             if (match_count as u16) < min_match_count {
                 continue;
@@ -476,8 +482,19 @@ pub fn search_place_ids(
 
                 // Area matching for unmatched tokens
                 if is_multi_token && place_idx < db.place_area_sets.len() {
-                    let (area_score, final_mask) =
-                        score_area_matches(db, place_idx, &query_tokens, matched_mask);
+                    let area_set_idx = db.place_area_sets[place_idx] as usize;
+                    let (area_score, final_mask) = if area_set_idx as u32 == u32::MAX {
+                        (0.0, matched_mask)
+                    } else if let Some(&cached) =
+                        ctx.area_match_scores.get(&(area_set_idx, matched_mask))
+                    {
+                        cached
+                    } else {
+                        let res = score_area_matches(db, area_set_idx, &query_tokens, matched_mask);
+                        ctx.area_match_scores
+                            .insert((area_set_idx, matched_mask), res);
+                        res
+                    };
                     total_score += area_score;
 
                     // Penalty for tokens that matched neither name nor area
