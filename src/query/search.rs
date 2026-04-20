@@ -351,7 +351,6 @@ pub fn search_place_ids(
         );
 
         let phase_started = Instant::now();
-        let string_epoch = ctx.string_epoch;
         for missing_idx in missing_bigrams.into_iter() {
             let start = db.bigram_offsets[missing_idx as usize] as usize;
             let end = db.bigram_offsets[(missing_idx + 1) as usize] as usize;
@@ -360,11 +359,6 @@ pub fn search_place_ids(
                 let string_idx = db.bigram_data[i] as usize;
                 ctx.string_match_counts[string_idx] =
                     ctx.string_match_counts[string_idx].saturating_add(1);
-
-                if ctx.string_touch_epochs[string_idx] != string_epoch {
-                    ctx.string_touch_epochs[string_idx] = string_epoch;
-                    ctx.touched_string_indices.push(string_idx as u32);
-                }
             }
         }
         log_phase_timing("search_place_ids", "expand_missing_bigrams", phase_started);
@@ -377,45 +371,22 @@ pub fn search_place_ids(
         log_phase_timing("search_place_ids", "cache_store_counts", phase_started);
 
         let phase_started = Instant::now();
-        if ctx.touched_string_indices.is_empty() {
-            for string_idx in 0..ctx.string_match_counts.len() {
-                let match_count = ctx.string_match_counts[string_idx];
-                if (match_count as u16) < min_match_count {
-                    continue;
-                }
-                let str_bigram_count = db.string_bigram_counts[string_idx] as f32;
-                if str_bigram_count == 0.0 {
-                    continue;
-                }
-                let cos_sim = (match_count as f32 * match_count as f32)
-                    / (str_bigram_count * query_bigram_count_u32 as f32);
-                if cos_sim >= COS_SIM_CUTOFF {
-                    ctx.string_matches.push(CosSimMatch {
-                        string_idx: string_idx as u32,
-                        cos_sim,
-                    });
-                }
+        for string_idx in 0..ctx.string_match_counts.len() {
+            let match_count = ctx.string_match_counts[string_idx];
+            if (match_count as u16) < min_match_count {
+                continue;
             }
-        } else {
-            let touched_snapshot: Vec<u32> = ctx.touched_string_indices.clone();
-            for &string_idx_u32 in &touched_snapshot {
-                let string_idx = string_idx_u32 as usize;
-                let match_count = ctx.string_match_counts[string_idx];
-                if (match_count as u16) < min_match_count {
-                    continue;
-                }
-                let str_bigram_count = db.string_bigram_counts[string_idx] as f32;
-                if str_bigram_count == 0.0 {
-                    continue;
-                }
-                let cos_sim = (match_count as f32 * match_count as f32)
-                    / (str_bigram_count * query_bigram_count_u32 as f32);
-                if cos_sim >= COS_SIM_CUTOFF {
-                    ctx.string_matches.push(CosSimMatch {
-                        string_idx: string_idx_u32,
-                        cos_sim,
-                    });
-                }
+            let str_bigram_count = db.string_bigram_counts[string_idx] as f32;
+            if str_bigram_count == 0.0 {
+                continue;
+            }
+            let cos_sim = (match_count as f32 * match_count as f32)
+                / (str_bigram_count * query_bigram_count_u32 as f32);
+            if cos_sim >= COS_SIM_CUTOFF {
+                ctx.string_matches.push(CosSimMatch {
+                    string_idx: string_idx as u32,
+                    cos_sim,
+                });
             }
         }
         log_phase_timing(

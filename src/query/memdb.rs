@@ -146,9 +146,6 @@ pub struct GuessContext {
     pub place_score_epochs: Vec<u32>,
     pub touched_place_indices: Vec<u32>,
     pub query_epoch: u32,
-    pub touched_string_indices: Vec<u32>,
-    pub string_touch_epochs: Vec<u32>,
-    pub string_epoch: u32,
 }
 
 impl GuessContext {
@@ -162,19 +159,14 @@ impl GuessContext {
             place_score_epochs: vec![0; place_count],
             touched_place_indices: Vec::new(),
             query_epoch: 1,
-            touched_string_indices: Vec::new(),
-            string_touch_epochs: Vec::new(),
-            string_epoch: 1,
         }
     }
 
     pub fn clear(&mut self, needed_string_count: usize, needed_place_count: usize) {
         if self.string_match_counts.len() != needed_string_count {
             self.string_match_counts.resize(needed_string_count, 0);
-        }
-
-        if self.string_touch_epochs.len() != needed_string_count {
-            self.string_touch_epochs.resize(needed_string_count, 0);
+        } else {
+            self.string_match_counts.fill(0);
         }
 
         self.string_matches.clear();
@@ -192,14 +184,7 @@ impl GuessContext {
             self.place_score_epochs.fill(0);
         }
 
-        self.string_epoch = self.string_epoch.wrapping_add(1);
-        if self.string_epoch == 0 {
-            self.string_epoch = 1;
-            self.string_touch_epochs.fill(0);
-        }
-
         self.touched_place_indices.clear();
-        self.touched_string_indices.clear();
     }
 }
 

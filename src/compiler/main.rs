@@ -975,7 +975,33 @@ async fn main() -> Result<()> {
             while i < entries.len() && entries[i].0 == phrase {
                 let place_id = entries[i].1;
                 if last_place != Some(place_id) {
-                    string_to_places_data.push(place_id);
+                    let lat2 = place_latitudes[place_id as usize];
+                    let lon2 = place_longitudes[place_id as usize];
+                    let mut duplicate = false;
+
+                    let start_idx = *string_to_places_offsets.last().unwrap() as usize;
+                    for &existing_id in &string_to_places_data[start_idx..] {
+                        let lat1 = place_latitudes[existing_id as usize];
+                        let lon1 = place_longitudes[existing_id as usize];
+
+                        let d_lat = (lat2 - lat1).to_radians();
+                        let d_lon = (lon2 - lon1).to_radians();
+                        let a = (d_lat / 2.0).sin().powi(2)
+                            + lat1.to_radians().cos()
+                                * lat2.to_radians().cos()
+                                * (d_lon / 2.0).sin().powi(2);
+                        let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
+                        let dist_km = 6371.0 * c;
+
+                        if dist_km < 1.5 {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+
+                    if !duplicate {
+                        string_to_places_data.push(place_id);
+                    }
                     last_place = Some(place_id);
                 }
                 i += 1;
