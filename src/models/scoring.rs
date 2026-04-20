@@ -43,7 +43,11 @@ fn tokenize_bytes<'a>(s: &'a [u8], out: &mut Vec<&'a [u8]>) {
     }
 }
 
-fn get_token_match_score(dataset_token: &[u8], query: &[u8], offset_arr: &mut Vec<SiftOffset>) -> f32 {
+fn get_token_match_score(
+    dataset_token: &[u8],
+    query: &[u8],
+    offset_arr: &mut Vec<SiftOffset>,
+) -> f32 {
     if dataset_token == query {
         return -2.0 - query.len() as f32 * 0.75;
     }
@@ -258,7 +262,8 @@ mod tests {
     fn multi_token_full_match() {
         let mut offset_arr = Vec::new();
         let tokens: Vec<&[u8]> = vec![b"new", b"york"];
-        let (score, matched) = get_multi_token_match_score(b"new york city", &tokens, &mut offset_arr);
+        let (score, matched) =
+            get_multi_token_match_score(b"new york city", &tokens, &mut offset_arr);
         assert_ne!(score, NO_MATCH);
         assert_eq!(matched, 0b11);
     }
@@ -360,6 +365,10 @@ pub fn get_multi_token_match_score(
 }
 
 /// Score a single query token against a raw area name byte slice.
-pub fn get_area_match_score(area_name: &[u8], query_token: &[u8], offset_arr: &mut Vec<SiftOffset>) -> f32 {
+pub fn get_area_match_score(
+    area_name: &[u8],
+    query_token: &[u8],
+    offset_arr: &mut Vec<SiftOffset>,
+) -> f32 {
     get_match_score(area_name, query_token, offset_arr)
 }

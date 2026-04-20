@@ -214,7 +214,8 @@ fn score_area_matches(
             }
 
             let area_name = &db.area_name_bytes[name_start..name_end];
-            let score = cypress::models::scoring::get_area_match_score(area_name, token, offset_arr);
+            let score =
+                cypress::models::scoring::get_area_match_score(area_name, token, offset_arr);
             if score < best_area_score {
                 best_area_score = score;
             }
@@ -303,6 +304,13 @@ pub fn search_place_ids(
         let phase_started = Instant::now();
         let mut ctx = cell.borrow_mut();
         ctx.clear(string_count, place_count);
+
+        let needed_area_sets = db.area_set_offsets.len();
+        if ctx.area_match_cache.len() < needed_area_sets {
+            ctx.area_match_cache
+                .resize(needed_area_sets, (0.0, 0, 0, 0));
+        }
+
         log_phase_timing("search_place_ids", "clear_context", phase_started);
 
         let phase_started = Instant::now();
@@ -365,7 +373,7 @@ pub fn search_place_ids(
         log_phase_timing("search_place_ids", "expand_missing_bigrams", phase_started);
 
         let phase_started = Instant::now();
-        if !ctx.query_cache.has_exact(&query_bigrams) {
+        if !ctx.query_cache.has_exact(&query_bigrams) && ctx.touched_string_indices.len() < 10_000 {
             let sparse_counts = Arc::new(
                 ctx.touched_string_indices
                     .iter()
@@ -448,9 +456,17 @@ pub fn search_place_ids(
             };
 
             let (match_score, matched_mask) = if is_multi_token {
-                cypress::models::scoring::get_multi_token_match_score(string_name, &query_tokens, &mut ctx.sift4_offset_arr)
+                cypress::models::scoring::get_multi_token_match_score(
+                    string_name,
+                    &query_tokens,
+                    &mut ctx.sift4_offset_arr,
+                )
             } else {
-                let s = cypress::models::scoring::get_match_score(string_name, query_tokens[0], &mut ctx.sift4_offset_arr);
+                let s = cypress::models::scoring::get_match_score(
+                    string_name,
+                    query_tokens[0],
+                    &mut ctx.sift4_offset_arr,
+                );
                 let mask = if s != cypress::models::scoring::NO_MATCH {
                     1u8
                 } else {
@@ -486,15 +502,21 @@ pub fn search_place_ids(
                     let area_set_idx = db.place_area_sets[place_idx] as usize;
                     let (area_score, final_mask) = if area_set_idx as u32 == u32::MAX {
                         (0.0, matched_mask)
-                    } else if let Some(&cached) =
-                        ctx.area_match_scores.get(&(area_set_idx, matched_mask))
-                    {
-                        cached
                     } else {
-                        let res = score_area_matches(db, area_set_idx, &query_tokens, matched_mask, &mut ctx.sift4_offset_arr);
-                        ctx.area_match_scores
-                            .insert((area_set_idx, matched_mask), res);
-                        res
+                        let cache_entry = &mut ctx.area_match_cache[area_set_idx];
+                        if cache_entry.3 == query_epoch && cache_entry.2 == matched_mask {
+                            (cache_entry.0, cache_entry.1)
+                        } else {
+                            let res = score_area_matches(
+                                db,
+                                area_set_idx,
+                                &query_tokens,
+                                matched_mask,
+                                &mut ctx.sift4_offset_arr,
+                            );
+                            *cache_entry = (res.0, res.1, matched_mask, query_epoch);
+                            res
+                        }
                     };
                     total_score += area_score;
 

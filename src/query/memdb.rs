@@ -147,7 +147,7 @@ pub struct GuessContext {
     pub place_score_epochs: Vec<u32>,
     pub touched_place_indices: Vec<u32>,
     pub query_epoch: u32,
-    pub area_match_scores: hashbrown::HashMap<(usize, u8), (f32, u8)>,
+    pub area_match_cache: Vec<(f32, u8, u8, u32)>,
     pub sift4_offset_arr: Vec<cypress::models::sift4::SiftOffset>,
 }
 
@@ -163,7 +163,7 @@ impl GuessContext {
             place_score_epochs: vec![0; place_count],
             touched_place_indices: Vec::new(),
             query_epoch: 1,
-            area_match_scores: hashbrown::HashMap::with_capacity(2048),
+            area_match_cache: Vec::new(),
             sift4_offset_arr: Vec::new(),
         }
     }
@@ -181,7 +181,6 @@ impl GuessContext {
 
         self.string_matches.clear();
         self.query_bigrams.clear();
-        self.area_match_scores.clear();
 
         if self.place_best_scores.len() < needed_place_count {
             self.place_best_scores
