@@ -1,6 +1,6 @@
 /// ADR-style token match scoring — ported from adr/score.h.
 /// Lower scores are better; `NO_MATCH` (f32::MAX) means rejected.
-use super::sift4::sift4;
+use super::sift4::{sift4, SiftOffset};
 
 pub const NO_MATCH: f32 = f32::MAX;
 
@@ -43,7 +43,7 @@ fn tokenize_bytes<'a>(s: &'a [u8], out: &mut Vec<&'a [u8]>) {
     }
 }
 
-fn get_token_match_score(dataset_token: &[u8], query: &[u8]) -> f32 {
+fn get_token_match_score(dataset_token: &[u8], query: &[u8], offset_arr: &mut Vec<SiftOffset>) -> f32 {
     if dataset_token == query {
         return -2.0 - query.len() as f32 * 0.75;
     }
@@ -51,7 +51,7 @@ fn get_token_match_score(dataset_token: &[u8], query: &[u8]) -> f32 {
     let cut_len = dataset_token.len().min(query.len());
     let cut = &dataset_token[..cut_len];
     let max_dist = cut_len / 2 + 2;
-    let dist = sift4(cut, query, 3, max_dist);
+    let dist = sift4(cut, query, 3, max_dist, offset_arr);
 
     if dist >= cut_len {
         return NO_MATCH;
@@ -99,7 +99,7 @@ fn get_token_match_score(dataset_token: &[u8], query: &[u8]) -> f32 {
 /// Scores a dataset name against a single query input.
 /// The dataset name is split into tokens and all contiguous sub-phrases
 /// (up to 4 tokens) are checked. Returns the best score, or `NO_MATCH`.
-pub fn get_match_score(dataset_name: &[u8], query: &[u8]) -> f32 {
+pub fn get_match_score(dataset_name: &[u8], query: &[u8], offset_arr: &mut Vec<SiftOffset>) -> f32 {
     if dataset_name.is_empty() || query.is_empty() {
         return NO_MATCH;
     }
@@ -107,7 +107,7 @@ pub fn get_match_score(dataset_name: &[u8], query: &[u8]) -> f32 {
     let mut s_tokens = Vec::new();
     tokenize_bytes(dataset_name, &mut s_tokens);
 
-    let fallback = get_token_match_score(dataset_name, query);
+    let fallback = get_token_match_score(dataset_name, query, offset_arr);
 
     if s_tokens.len() <= 1 {
         return fallback;
@@ -129,7 +129,7 @@ pub fn get_match_score(dataset_name: &[u8], query: &[u8]) -> f32 {
             // Build phrase by concatenating tokens with spaces
             let mut buf_storage = [0u8; 256];
             let score = if len == 1 {
-                get_token_match_score(s_tokens[from], query)
+                get_token_match_score(s_tokens[from], query, offset_arr)
             } else {
                 let total_len: usize =
                     s_tokens[from..to].iter().map(|t| t.len()).sum::<usize>() + len - 1;
@@ -144,7 +144,7 @@ pub fn get_match_score(dataset_name: &[u8], query: &[u8]) -> f32 {
                         buf_storage[buf_len..buf_len + t.len()].copy_from_slice(t);
                         buf_len += t.len();
                     }
-                    get_token_match_score(&buf_storage[..buf_len], query)
+                    get_token_match_score(&buf_storage[..buf_len], query, offset_arr)
                 } else {
                     let mut fallback = Vec::with_capacity(total_len);
                     for (i, t) in s_tokens[from..to].iter().enumerate() {
@@ -153,7 +153,7 @@ pub fn get_match_score(dataset_name: &[u8], query: &[u8]) -> f32 {
                         }
                         fallback.extend_from_slice(t);
                     }
-                    get_token_match_score(&fallback, query)
+                    get_token_match_score(&fallback, query, offset_arr)
                 }
             };
             if score < best_score {
@@ -212,34 +212,39 @@ mod tests {
 
     #[test]
     fn exact_match_best_score() {
-        let score = get_match_score(b"paris", b"paris");
+        let mut offset_arr = Vec::new();
+        let score = get_match_score(b"paris", b"paris", &mut offset_arr);
         assert!(score < -4.0);
         assert_ne!(score, NO_MATCH);
     }
 
     #[test]
     fn prefix_match_good_score() {
-        let score = get_match_score(b"paris", b"par");
+        let mut offset_arr = Vec::new();
+        let score = get_match_score(b"paris", b"par", &mut offset_arr);
         assert_ne!(score, NO_MATCH);
         assert!(score < 3.0);
     }
 
     #[test]
     fn no_match_unrelated() {
-        let score = get_match_score(b"london", b"xyz");
+        let mut offset_arr = Vec::new();
+        let score = get_match_score(b"london", b"xyz", &mut offset_arr);
         assert_eq!(score, NO_MATCH);
     }
 
     #[test]
     fn multi_token_match() {
-        let score = get_match_score(b"new york city", b"new york");
+        let mut offset_arr = Vec::new();
+        let score = get_match_score(b"new york city", b"new york", &mut offset_arr);
         assert_ne!(score, NO_MATCH);
         assert!(score < 2.0);
     }
 
     #[test]
     fn typo_tolerance() {
-        let score = get_match_score(b"paris", b"pars");
+        let mut offset_arr = Vec::new();
+        let score = get_match_score(b"paris", b"pars", &mut offset_arr);
         assert_ne!(score, NO_MATCH);
     }
 
@@ -251,16 +256,18 @@ mod tests {
 
     #[test]
     fn multi_token_full_match() {
+        let mut offset_arr = Vec::new();
         let tokens: Vec<&[u8]> = vec![b"new", b"york"];
-        let (score, matched) = get_multi_token_match_score(b"new york city", &tokens);
+        let (score, matched) = get_multi_token_match_score(b"new york city", &tokens, &mut offset_arr);
         assert_ne!(score, NO_MATCH);
         assert_eq!(matched, 0b11);
     }
 
     #[test]
     fn multi_token_partial_match() {
+        let mut offset_arr = Vec::new();
         let tokens: Vec<&[u8]> = vec![b"roma", b"italia"];
-        let (score, matched) = get_multi_token_match_score(b"roma", &tokens);
+        let (score, matched) = get_multi_token_match_score(b"roma", &tokens, &mut offset_arr);
         assert_ne!(score, NO_MATCH);
         assert_eq!(matched & 1, 1);
         assert_eq!(matched & 2, 0);
@@ -271,13 +278,17 @@ mod tests {
 /// name tokens. Returns (combined_score, matched_token_bitmask).
 /// Unmatched query tokens are NOT penalized here — the caller applies
 /// area matching and penalties for unmatched tokens.
-pub fn get_multi_token_match_score(dataset_name: &[u8], query_tokens: &[&[u8]]) -> (f32, u8) {
+pub fn get_multi_token_match_score(
+    dataset_name: &[u8],
+    query_tokens: &[&[u8]],
+    offset_arr: &mut Vec<SiftOffset>,
+) -> (f32, u8) {
     if dataset_name.is_empty() || query_tokens.is_empty() {
         return (NO_MATCH, 0);
     }
 
     if query_tokens.len() == 1 {
-        let score = get_match_score(dataset_name, query_tokens[0]);
+        let score = get_match_score(dataset_name, query_tokens[0], offset_arr);
         let mask = if score != NO_MATCH { 1u8 } else { 0u8 };
         return (score, mask);
     }
@@ -295,7 +306,7 @@ pub fn get_multi_token_match_score(dataset_name: &[u8], query_tokens: &[&[u8]]) 
     let mut scores = [[NO_MATCH; 8]; 8];
     for (qi, qt) in query_tokens[..max_tokens].iter().enumerate() {
         for (si, st) in s_tokens.iter().enumerate() {
-            scores[qi][si] = get_token_match_score(st, qt);
+            scores[qi][si] = get_token_match_score(st, qt, offset_arr);
         }
     }
 
@@ -349,6 +360,6 @@ pub fn get_multi_token_match_score(dataset_name: &[u8], query_tokens: &[&[u8]]) 
 }
 
 /// Score a single query token against a raw area name byte slice.
-pub fn get_area_match_score(area_name: &[u8], query_token: &[u8]) -> f32 {
-    get_match_score(area_name, query_token)
+pub fn get_area_match_score(area_name: &[u8], query_token: &[u8], offset_arr: &mut Vec<SiftOffset>) -> f32 {
+    get_match_score(area_name, query_token, offset_arr)
 }

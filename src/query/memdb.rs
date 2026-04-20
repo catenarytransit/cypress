@@ -148,6 +148,7 @@ pub struct GuessContext {
     pub touched_place_indices: Vec<u32>,
     pub query_epoch: u32,
     pub area_match_scores: hashbrown::HashMap<(usize, u8), (f32, u8)>,
+    pub sift4_offset_arr: Vec<cypress::models::sift4::SiftOffset>,
 }
 
 impl GuessContext {
@@ -163,6 +164,7 @@ impl GuessContext {
             touched_place_indices: Vec::new(),
             query_epoch: 1,
             area_match_scores: hashbrown::HashMap::with_capacity(2048),
+            sift4_offset_arr: Vec::new(),
         }
     }
 

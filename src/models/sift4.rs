@@ -4,19 +4,20 @@
 use std::cell::RefCell;
 
 #[derive(Clone, Copy)]
-struct SiftOffset {
-    c1: usize,
-    c2: usize,
-    trans: bool,
+pub struct SiftOffset {
+    pub c1: usize,
+    pub c2: usize,
+    pub trans: bool,
 }
 
-pub fn sift4(s1: &[u8], s2: &[u8], max_offset: usize, max_distance: usize) -> usize {
-    let mut offset_arr = [SiftOffset {
-        c1: 0,
-        c2: 0,
-        trans: false,
-    }; 32];
-    let mut offset_count = 0;
+pub fn sift4(
+    s1: &[u8],
+    s2: &[u8],
+    max_offset: usize,
+    max_distance: usize,
+    offset_arr: &mut Vec<SiftOffset>,
+) -> usize {
+    offset_arr.clear();
 
     if s1.is_empty() {
         return s2.len();
@@ -40,7 +41,7 @@ pub fn sift4(s1: &[u8], s2: &[u8], max_offset: usize, max_distance: usize) -> us
             let mut is_trans = false;
 
             let mut i = 0;
-            while i < offset_count {
+            while i < offset_arr.len() {
                 let ofs = offset_arr[i];
                 if c1 <= ofs.c1 || c2 <= ofs.c2 {
                     is_trans = c2.abs_diff(c1) >= ofs.c2.abs_diff(ofs.c1);
@@ -52,21 +53,17 @@ pub fn sift4(s1: &[u8], s2: &[u8], max_offset: usize, max_distance: usize) -> us
                     }
                     break;
                 } else if c1 > ofs.c2 && c2 > ofs.c1 {
-                    offset_arr.copy_within((i + 1)..offset_count, i);
-                    offset_count -= 1;
+                    offset_arr.remove(i);
                 } else {
                     i += 1;
                 }
             }
 
-            if offset_count < offset_arr.len() {
-                offset_arr[offset_count] = SiftOffset {
-                    c1,
-                    c2,
-                    trans: is_trans,
-                };
-                offset_count += 1;
-            }
+            offset_arr.push(SiftOffset {
+                c1,
+                c2,
+                trans: is_trans,
+            });
         } else {
             lcss += local_cs;
             local_cs = 0;
@@ -83,7 +80,7 @@ pub fn sift4(s1: &[u8], s2: &[u8], max_offset: usize, max_distance: usize) -> us
                 }
             }
 
-            for i in 1..=max_offset {
+            for i in 1..max_offset {
                 if c1 + i >= l1 && c2 + i >= l2 {
                     break;
                 }
