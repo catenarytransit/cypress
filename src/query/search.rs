@@ -337,11 +337,12 @@ pub fn search_place_ids(
         let phase_started = Instant::now();
         let cached_counts = ctx
             .query_cache
-            .get_closest_sparse_ref(&query_bigrams, &mut missing_bigrams);
+            .get_closest_ref(&query_bigrams, &mut missing_bigrams);
         if let Some(cached) = cached_counts {
-            for &(idx, count) in cached.iter() {
-                ctx.string_match_counts[idx as usize] = count;
-                ctx.touched_string_indices.push(idx);
+            ctx.string_match_counts.copy_from_slice(&cached);
+            // Fake a large touched list so it falls into bulk clearing next time
+            if ctx.touched_string_indices.len() == 0 {
+                ctx.touched_string_indices.resize(string_count / 8, 0); 
             }
         } else {
             // Already cleared sparsely in `clear`
@@ -373,37 +374,58 @@ pub fn search_place_ids(
         log_phase_timing("search_place_ids", "expand_missing_bigrams", phase_started);
 
         let phase_started = Instant::now();
-        if !ctx.query_cache.has_exact(&query_bigrams) && ctx.touched_string_indices.len() < 10_000 {
-            let sparse_counts = Arc::new(
-                ctx.touched_string_indices
-                    .iter()
-                    .map(|&idx| (idx, ctx.string_match_counts[idx as usize]))
-                    .collect::<Vec<_>>(),
-            );
-            ctx.query_cache.put_sparse(&query_bigrams, sparse_counts);
+        if !ctx.query_cache.has_exact(&query_bigrams) {
+            let clones = Arc::new(ctx.string_match_counts.clone());
+            ctx.query_cache.put(&query_bigrams, clones);
         }
         log_phase_timing("search_place_ids", "cache_store_counts", phase_started);
 
         let phase_started = Instant::now();
-        for i in 0..ctx.touched_string_indices.len() {
-            let string_idx = ctx.touched_string_indices[i] as usize;
-            let match_count = ctx.string_match_counts[string_idx];
-            if (match_count as u16) < min_match_count {
-                continue;
+        // Since we may have used a cached dense array, we must collect all non-zero matches
+        // by iterating the full dense array if touched_string_indices is big (bulk cleared).
+        // Otherwise, iterate just the touched indices.
+        let mut string_matches = Vec::new();
+        if ctx.touched_string_indices.len() > string_count / 10 {
+            for i in 0..string_count {
+                let match_count = ctx.string_match_counts[i];
+                if (match_count as u16) < min_match_count {
+                    continue;
+                }
+                let str_bigram_count = db.string_bigram_counts[i] as f32;
+                if str_bigram_count == 0.0 {
+                    continue;
+                }
+                let cos_sim = (match_count as f32 * match_count as f32)
+                    / (str_bigram_count * query_bigram_count_u32 as f32);
+                if cos_sim >= COS_SIM_CUTOFF {
+                    string_matches.push(CosSimMatch {
+                        string_idx: i as u32,
+                        cos_sim,
+                    });
+                }
             }
-            let str_bigram_count = db.string_bigram_counts[string_idx] as f32;
-            if str_bigram_count == 0.0 {
-                continue;
-            }
-            let cos_sim = (match_count as f32 * match_count as f32)
-                / (str_bigram_count * query_bigram_count_u32 as f32);
-            if cos_sim >= COS_SIM_CUTOFF {
-                ctx.string_matches.push(CosSimMatch {
-                    string_idx: string_idx as u32,
-                    cos_sim,
-                });
+        } else {
+            for i in 0..ctx.touched_string_indices.len() {
+                let string_idx = ctx.touched_string_indices[i] as usize;
+                let match_count = ctx.string_match_counts[string_idx];
+                if (match_count as u16) < min_match_count {
+                    continue;
+                }
+                let str_bigram_count = db.string_bigram_counts[string_idx] as f32;
+                if str_bigram_count == 0.0 {
+                    continue;
+                }
+                let cos_sim = (match_count as f32 * match_count as f32)
+                    / (str_bigram_count * query_bigram_count_u32 as f32);
+                if cos_sim >= COS_SIM_CUTOFF {
+                    string_matches.push(CosSimMatch {
+                        string_idx: string_idx as u32,
+                        cos_sim,
+                    });
+                }
             }
         }
+        ctx.string_matches.extend(string_matches);
         log_phase_timing(
             "search_place_ids",
             "compute_cosine_candidates",

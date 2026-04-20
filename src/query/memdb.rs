@@ -72,7 +72,7 @@ fn missing_elements(subset: &[u16], superset: &[u16], out: &mut Vec<u16>) {
 pub struct QueryNgramCache {
     max_entries: usize,
     insert_order: VecDeque<Vec<u16>>,
-    entries: HashMap<Vec<u16>, Arc<Vec<(u32, u8)>>>,
+    entries: HashMap<Vec<u16>, Arc<Vec<u8>>>,
 }
 
 impl QueryNgramCache {
@@ -88,11 +88,11 @@ impl QueryNgramCache {
         self.entries.contains_key(key)
     }
 
-    pub fn get_closest_sparse_ref(
+    pub fn get_closest_ref(
         &self,
         key: &[u16],
         missing: &mut Vec<u16>,
-    ) -> Option<Arc<Vec<(u32, u8)>>> {
+    ) -> Option<Arc<Vec<u8>>> {
         if let Some(exact) = self.entries.get(key) {
             missing.clear();
             return Some(exact.clone());
@@ -119,7 +119,7 @@ impl QueryNgramCache {
         None
     }
 
-    pub fn put_sparse(&mut self, key: &[u16], counts: Arc<Vec<(u32, u8)>>) {
+    pub fn put(&mut self, key: &[u16], counts: Arc<Vec<u8>>) {
         if self.max_entries == 0 || self.entries.contains_key(key) {
             return;
         }
@@ -159,7 +159,7 @@ impl GuessContext {
             query_bigrams: Vec::with_capacity(64),
             query_cache: QueryNgramCache::new(QUERY_CACHE_MAX_ENTRIES),
             touched_string_indices: Vec::new(),
-            place_best_scores: vec![f32::NEG_INFINITY; place_count],
+            place_best_scores: vec![0.0; place_count], // Zeroed instead of NEG_INFINITY
             place_score_epochs: vec![0; place_count],
             touched_place_indices: Vec::new(),
             query_epoch: 1,
@@ -173,8 +173,13 @@ impl GuessContext {
             self.string_match_counts.resize(needed_string_count, 0);
             self.touched_string_indices.clear();
         } else {
-            for &idx in &self.touched_string_indices {
-                self.string_match_counts[idx as usize] = 0;
+            // Bulk zero if touched a significant portion
+            if self.touched_string_indices.len() > needed_string_count / 10 {
+                self.string_match_counts.fill(0);
+            } else {
+                for &idx in &self.touched_string_indices {
+                    self.string_match_counts[idx as usize] = 0;
+                }
             }
             self.touched_string_indices.clear();
         }
@@ -184,7 +189,7 @@ impl GuessContext {
 
         if self.place_best_scores.len() < needed_place_count {
             self.place_best_scores
-                .resize(needed_place_count, f32::NEG_INFINITY);
+                .resize(needed_place_count, 0.0); // Zeroed
             self.place_score_epochs.resize(needed_place_count, 0);
         }
 
