@@ -3,6 +3,13 @@
 //! All search and autocomplete endpoints use the zero-copy rkyv memory-mapped
 //! bigram inverted index. Elasticsearch is not required.
 
+#[cfg(not(target_env = "msvc"))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
 use std::sync::Arc;
 
 use anyhow::Result;
