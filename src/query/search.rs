@@ -503,9 +503,9 @@ pub fn search_place_ids(
                     let (area_score, final_mask) = if area_set_idx as u32 == u32::MAX {
                         (0.0, matched_mask)
                     } else {
-                        let cache_entry = &mut ctx.area_match_cache[area_set_idx];
-                        if cache_entry.3 == query_epoch && cache_entry.2 == matched_mask {
-                            (cache_entry.0, cache_entry.1)
+                        let (c_score, c_mask, c_matched, c_epoch) = ctx.area_match_cache[area_set_idx];
+                        if c_epoch == query_epoch && c_matched == matched_mask {
+                            (c_score, c_mask)
                         } else {
                             let res = score_area_matches(
                                 db,
@@ -514,7 +514,7 @@ pub fn search_place_ids(
                                 matched_mask,
                                 &mut ctx.sift4_offset_arr,
                             );
-                            *cache_entry = (res.0, res.1, matched_mask, query_epoch);
+                            ctx.area_match_cache[area_set_idx] = (res.0, res.1, matched_mask, query_epoch);
                             res
                         }
                     };
