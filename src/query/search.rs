@@ -340,12 +340,6 @@ pub fn search_place_ids(
             .get_closest_ref(&query_bigrams, &mut missing_bigrams);
         if let Some(cached) = cached_counts {
             ctx.string_match_counts.copy_from_slice(&cached);
-            // Fake a large touched list so it falls into bulk clearing next time
-            if ctx.touched_string_indices.len() == 0 {
-                ctx.touched_string_indices.resize(string_count / 8, 0); 
-            }
-        } else {
-            // Already cleared sparsely in `clear`
         }
         let missing_bigram_count = missing_bigrams.len();
         log_phase_timing("search_place_ids", "cache_lookup_restore", phase_started);
@@ -364,9 +358,6 @@ pub fn search_place_ids(
 
             for i in start..end {
                 let string_idx = db.bigram_data[i] as usize;
-                if ctx.string_match_counts[string_idx] == 0 {
-                    ctx.touched_string_indices.push(string_idx as u32);
-                }
                 ctx.string_match_counts[string_idx] =
                     ctx.string_match_counts[string_idx].saturating_add(1);
             }
@@ -385,44 +376,22 @@ pub fn search_place_ids(
         // by iterating the full dense array if touched_string_indices is big (bulk cleared).
         // Otherwise, iterate just the touched indices.
         let mut string_matches = Vec::new();
-        if ctx.touched_string_indices.len() > string_count / 10 {
-            for i in 0..string_count {
-                let match_count = ctx.string_match_counts[i];
-                if (match_count as u16) < min_match_count {
-                    continue;
-                }
-                let str_bigram_count = db.string_bigram_counts[i] as f32;
-                if str_bigram_count == 0.0 {
-                    continue;
-                }
-                let cos_sim = (match_count as f32 * match_count as f32)
-                    / (str_bigram_count * query_bigram_count_u32 as f32);
-                if cos_sim >= COS_SIM_CUTOFF {
-                    string_matches.push(CosSimMatch {
-                        string_idx: i as u32,
-                        cos_sim,
-                    });
-                }
+        for i in 0..string_count {
+            let match_count = ctx.string_match_counts[i];
+            if (match_count as u16) < min_match_count {
+                continue;
             }
-        } else {
-            for i in 0..ctx.touched_string_indices.len() {
-                let string_idx = ctx.touched_string_indices[i] as usize;
-                let match_count = ctx.string_match_counts[string_idx];
-                if (match_count as u16) < min_match_count {
-                    continue;
-                }
-                let str_bigram_count = db.string_bigram_counts[string_idx] as f32;
-                if str_bigram_count == 0.0 {
-                    continue;
-                }
-                let cos_sim = (match_count as f32 * match_count as f32)
-                    / (str_bigram_count * query_bigram_count_u32 as f32);
-                if cos_sim >= COS_SIM_CUTOFF {
-                    string_matches.push(CosSimMatch {
-                        string_idx: string_idx as u32,
-                        cos_sim,
-                    });
-                }
+            let str_bigram_count = db.string_bigram_counts[i] as f32;
+            if str_bigram_count == 0.0 {
+                continue;
+            }
+            let cos_sim = (match_count as f32 * match_count as f32)
+                / (str_bigram_count * query_bigram_count_u32 as f32);
+            if cos_sim >= COS_SIM_CUTOFF {
+                string_matches.push(CosSimMatch {
+                    string_idx: i as u32,
+                    cos_sim,
+                });
             }
         }
         ctx.string_matches.extend(string_matches);
@@ -525,7 +494,8 @@ pub fn search_place_ids(
                     let (area_score, final_mask) = if area_set_idx as u32 == u32::MAX {
                         (0.0, matched_mask)
                     } else {
-                        let (c_score, c_mask, c_matched, c_epoch) = ctx.area_match_cache[area_set_idx];
+                        let (c_score, c_mask, c_matched, c_epoch) =
+                            ctx.area_match_cache[area_set_idx];
                         if c_epoch == query_epoch && c_matched == matched_mask {
                             (c_score, c_mask)
                         } else {
@@ -536,7 +506,8 @@ pub fn search_place_ids(
                                 matched_mask,
                                 &mut ctx.sift4_offset_arr,
                             );
-                            ctx.area_match_cache[area_set_idx] = (res.0, res.1, matched_mask, query_epoch);
+                            ctx.area_match_cache[area_set_idx] =
+                                (res.0, res.1, matched_mask, query_epoch);
                             res
                         }
                     };
@@ -563,31 +534,22 @@ pub fn search_place_ids(
                 total_score -= place_bonus;
 
                 let neg_score = -total_score;
-
-                let current_best = if ctx.place_score_epochs[place_idx] == query_epoch {
-                    ctx.place_best_scores[place_idx]
-                } else {
-                    f32::NEG_INFINITY
-                };
-                if neg_score <= current_best {
-                    continue;
-                }
-
-                if ctx.place_score_epochs[place_idx] != query_epoch {
-                    ctx.place_score_epochs[place_idx] = query_epoch;
-                    ctx.touched_place_indices.push(place_id);
-                }
-
-                ctx.place_best_scores[place_idx] = neg_score;
+                ctx.place_scores.push((place_id, neg_score));
             }
         }
         log_phase_timing("search_place_ids", "sift4_rescore_places", phase_started);
 
         let phase_started = Instant::now();
+        ctx.place_scores.sort_unstable_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        ctx.place_scores.dedup_by(|a, b| a.0 == b.0);
+
         results = ctx
-            .touched_place_indices
+            .place_scores
             .iter()
-            .map(|&place_id| (place_id, ctx.place_best_scores[place_id as usize] as f64))
+            .map(|&(place_id, score)| (place_id, score as f64))
             .collect();
         if results.len() > MAX_SCORED_MATCHES {
             results.select_nth_unstable_by(MAX_SCORED_MATCHES, |a, b| {

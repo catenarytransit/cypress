@@ -88,11 +88,7 @@ impl QueryNgramCache {
         self.entries.contains_key(key)
     }
 
-    pub fn get_closest_ref(
-        &self,
-        key: &[u16],
-        missing: &mut Vec<u16>,
-    ) -> Option<Arc<Vec<u8>>> {
+    pub fn get_closest_ref(&self, key: &[u16], missing: &mut Vec<u16>) -> Option<Arc<Vec<u8>>> {
         if let Some(exact) = self.entries.get(key) {
             missing.clear();
             return Some(exact.clone());
@@ -142,64 +138,47 @@ pub struct GuessContext {
     pub string_matches: Vec<CosSimMatch>,
     pub query_bigrams: Vec<u16>,
     pub query_cache: QueryNgramCache,
-    pub touched_string_indices: Vec<u32>,
-    pub place_best_scores: Vec<f32>,
-    pub place_score_epochs: Vec<u32>,
-    pub touched_place_indices: Vec<u32>,
     pub query_epoch: u32,
     pub area_match_cache: Vec<(f32, u8, u8, u32)>,
     pub sift4_offset_arr: Vec<cypress::models::sift4::SiftOffset>,
+    pub place_scores: Vec<(u32, f32)>,
 }
 
 impl GuessContext {
-    pub fn new(_string_count: usize, place_count: usize) -> Self {
+    pub fn new(string_count: usize, _place_count: usize) -> Self {
+        let mut string_match_counts = Vec::new();
+        string_match_counts.resize(string_count, 0);
         Self {
-            string_match_counts: Vec::new(),
+            string_match_counts,
             string_matches: Vec::with_capacity(6000),
             query_bigrams: Vec::with_capacity(64),
             query_cache: QueryNgramCache::new(QUERY_CACHE_MAX_ENTRIES),
-            touched_string_indices: Vec::new(),
-            place_best_scores: vec![0.0; place_count], // Zeroed instead of NEG_INFINITY
-            place_score_epochs: vec![0; place_count],
-            touched_place_indices: Vec::new(),
             query_epoch: 1,
             area_match_cache: Vec::new(),
             sift4_offset_arr: Vec::new(),
+            place_scores: Vec::new(),
         }
     }
 
-    pub fn clear(&mut self, needed_string_count: usize, needed_place_count: usize) {
+    pub fn clear(&mut self, needed_string_count: usize, _needed_place_count: usize) {
         if self.string_match_counts.len() != needed_string_count {
             self.string_match_counts.resize(needed_string_count, 0);
-            self.touched_string_indices.clear();
         } else {
-            // Bulk zero if touched a significant portion
-            if self.touched_string_indices.len() > needed_string_count / 10 {
-                self.string_match_counts.fill(0);
-            } else {
-                for &idx in &self.touched_string_indices {
-                    self.string_match_counts[idx as usize] = 0;
-                }
-            }
-            self.touched_string_indices.clear();
+            self.string_match_counts.fill(0);
         }
 
         self.string_matches.clear();
         self.query_bigrams.clear();
+        self.place_scores.clear();
 
-        if self.place_best_scores.len() < needed_place_count {
-            self.place_best_scores
-                .resize(needed_place_count, 0.0); // Zeroed
-            self.place_score_epochs.resize(needed_place_count, 0);
+        if self.area_match_cache.is_empty() {
+            // Will be sized in search.rs
         }
 
         self.query_epoch = self.query_epoch.wrapping_add(1);
         if self.query_epoch == 0 {
             self.query_epoch = 1;
-            self.place_score_epochs.fill(0);
         }
-
-        self.touched_place_indices.clear();
     }
 }
 
