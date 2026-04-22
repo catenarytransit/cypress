@@ -365,10 +365,17 @@ pub fn search_place_ids(
             let start = db.bigram_offsets[missing_idx as usize] as usize;
             let end = db.bigram_offsets[(missing_idx + 1) as usize] as usize;
 
-            for i in start..end {
-                let string_idx = db.bigram_data[i] as usize;
-                ctx.string_match_counts[string_idx] =
-                    ctx.string_match_counts[string_idx].saturating_add(1);
+            // Use a slice iterator to eliminate bounds checks on bigram_data
+            if let Some(bigrams) = db.bigram_data.get(start..end) {
+                for &string_idx in bigrams {
+                    let string_idx = string_idx as usize;
+
+                    // SAFETY: The memdb builder guarantees string_idx is always < string_count.
+                    unsafe {
+                        let count = ctx.string_match_counts.get_unchecked_mut(string_idx);
+                        *count = count.saturating_add(1);
+                    }
+                }
             }
         }
         log_phase_timing("search_place_ids", "expand_missing_bigrams", phase_started);
