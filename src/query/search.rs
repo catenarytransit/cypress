@@ -123,8 +123,8 @@ pub struct TimedSearchResultsV2 {
 }
 
 const COS_SIM_CUTOFF: f32 = 0.17;
-const MAX_STRING_MATCHES: usize = 500;
-const MAX_SCORED_MATCHES: usize = 500;
+const MAX_STRING_MATCHES: usize = 6000;
+const MAX_SCORED_MATCHES: usize = 10000;
 const FOCUS_RESCORE_MULTIPLIER: usize = 5;
 const FOCUS_RESCORE_FLOOR: usize = 50;
 const SLOW_PHASE_WARN_MS: u128 = 250;
@@ -173,7 +173,7 @@ fn tokenize_query(query: &str) -> Vec<&[u8]> {
 fn score_area_matches(
     db: &cypress::models::memdb::ArchivedCypressMemDb,
     area_set_idx: usize,
-    query_tokens: &[&[u8]],
+    phrases: &[(Vec<u8>, u8)],
     matched_mask: u8,
     offset_arr: &mut Vec<cypress::models::sift4::SiftOffset>,
 ) -> (f32, u8) {
@@ -188,56 +188,48 @@ fn score_area_matches(
         db.area_set_data.len()
     };
 
-    let max_tokens = query_tokens.len().min(8);
     let mut current_mask = matched_mask;
     let mut area_score = 0.0f32;
     let mut areas_matched = 0u32;
 
-    for t_idx in 0..max_tokens {
-        if current_mask & (1 << t_idx) != 0 {
+    for ai in as_start..as_end {
+        let area_idx = db.area_set_data[ai] as usize;
+        if area_idx >= db.area_name_offsets.len().saturating_sub(1) {
             continue;
         }
 
-        let token = query_tokens[t_idx];
-        let mut best_area_score = cypress::models::scoring::NO_MATCH;
+        let name_start = db.area_name_offsets[area_idx] as usize;
+        let name_end = db.area_name_offsets[area_idx + 1] as usize;
+        if name_start > name_end || name_end > db.area_name_bytes.len() {
+            continue;
+        }
 
-        for ai in as_start..as_end {
-            let area_idx = db.area_set_data[ai] as usize;
-            if area_idx >= db.area_name_offsets.len().saturating_sub(1) {
+        let area_name = &db.area_name_bytes[name_start..name_end];
+        let mut best_phrase_score = cypress::models::scoring::NO_MATCH;
+        let mut best_phrase_mask = 0u8;
+
+        for (phrase, mask) in phrases {
+            if (*mask & current_mask) != 0 {
                 continue;
             }
-
-            let name_start = db.area_name_offsets[area_idx] as usize;
-            let name_end = db.area_name_offsets[area_idx + 1] as usize;
-            if name_start > name_end || name_end > db.area_name_bytes.len() {
-                continue;
-            }
-
-            let area_name = &db.area_name_bytes[name_start..name_end];
             let score =
-                cypress::models::scoring::get_area_match_score(area_name, token, offset_arr);
-            if score < best_area_score {
-                best_area_score = score;
+                cypress::models::scoring::get_area_match_score(area_name, phrase, offset_arr);
+            if score != cypress::models::scoring::NO_MATCH && score < best_phrase_score {
+                best_phrase_score = score;
+                best_phrase_mask = *mask;
             }
         }
 
-        if best_area_score != cypress::models::scoring::NO_MATCH {
-            current_mask |= 1 << t_idx;
-            area_score += best_area_score;
+        if best_phrase_score != cypress::models::scoring::NO_MATCH {
+            current_mask |= best_phrase_mask;
+            area_score += best_phrase_score;
 
-            let area_pop_bonus = {
-                let mut best_pop = 0u32;
-                for ai in as_start..as_end {
-                    let area_idx = db.area_set_data[ai] as usize;
-                    if area_idx < db.area_populations.len() {
-                        let p = db.area_populations[area_idx];
-                        if p > best_pop {
-                            best_pop = p;
-                        }
-                    }
-                }
-                (best_pop as f32 / 10_000_000.0) * 2.0
+            let area_pop = if area_idx < db.area_populations.len() {
+                db.area_populations[area_idx] as f32
+            } else {
+                0.0
             };
+            let area_pop_bonus = (area_pop / 10_000_000.0) * 2.0;
             area_score -= area_pop_bonus;
             areas_matched += 1;
         }
@@ -297,6 +289,23 @@ pub fn search_place_ids(
 
     let query_tokens = tokenize_query(&query);
     let is_multi_token = query_tokens.len() > 1;
+
+    let max_tokens = query_tokens.len().min(8);
+    let mut phrases: Vec<(Vec<u8>, u8)> = Vec::new();
+    if is_multi_token {
+        for i in 0..max_tokens {
+            let mut phrase = Vec::new();
+            let mut mask = 0u8;
+            for j in i..max_tokens {
+                if j != i {
+                    phrase.push(b' ');
+                }
+                phrase.extend_from_slice(query_tokens[j]);
+                mask |= 1 << j;
+                phrases.push((phrase.clone(), mask));
+            }
+        }
+    }
 
     let mut results = Vec::<(u32, f64)>::new();
 
@@ -447,11 +456,20 @@ pub fn search_place_ids(
             };
 
             let (match_score, matched_mask) = if is_multi_token {
-                cypress::models::scoring::get_multi_token_match_score(
-                    string_name,
-                    &query_tokens,
-                    &mut ctx.sift4_offset_arr,
-                )
+                let mut best_score = cypress::models::scoring::NO_MATCH;
+                let mut best_mask = 0u8;
+                for (phrase_bytes, mask) in &phrases {
+                    let s = cypress::models::scoring::get_match_score(
+                        string_name,
+                        phrase_bytes,
+                        &mut ctx.sift4_offset_arr,
+                    );
+                    if s != cypress::models::scoring::NO_MATCH && s < best_score {
+                        best_score = s;
+                        best_mask = *mask;
+                    }
+                }
+                (best_score, best_mask)
             } else {
                 let s = cypress::models::scoring::get_match_score(
                     string_name,
@@ -481,9 +499,16 @@ pub fn search_place_ids(
                 }
 
                 let layer_rank = db.place_layer_ranks[place_idx];
-                let importance = db.place_importances[place_idx];
+                let population = db.place_populations[place_idx] as f32;
                 let layer_bonus = cypress::models::scoring::get_layer_score_bonus(layer_rank);
-                let importance_bonus = (importance * 3.0).clamp(0.0, 3.0);
+
+                let is_extra = layer_rank == 0;
+                let importance_bonus = if is_extra {
+                    (population / 2_000.0).clamp(1.2, 5.0)
+                } else {
+                    (population / 200_000.0).clamp(0.0, 3.0)
+                };
+
                 let place_bonus = 5.0_f32;
 
                 let mut total_score = match_score;
@@ -502,7 +527,7 @@ pub fn search_place_ids(
                             let res = score_area_matches(
                                 db,
                                 area_set_idx,
-                                &query_tokens,
+                                &phrases,
                                 matched_mask,
                                 &mut ctx.sift4_offset_arr,
                             );
@@ -523,8 +548,8 @@ pub fn search_place_ids(
                         }
                     }
 
-                    // Bonus when all tokens matched
-                    if all_matched {
+                    // Bonus when all tokens matched by the primary name explicitly, no area needed
+                    if matched_mask == ((1u8 << query_tokens.len().min(8)) - 1) {
                         total_score -= 2.5;
                     }
                 }
@@ -582,9 +607,19 @@ pub fn search_place_ids(
 
             let mut score = base_score;
             if let Some(focus_point) = focus {
-                let dist = haversine_distance_km(focus_point, (lat, lon));
-                let decay = (-(dist * dist) / (2.0 * safe_focus_weight * safe_focus_weight)).exp();
-                score *= decay;
+                let dist_m = haversine_distance_km(focus_point, (lat, lon)) * 1000.0;
+                let bonus = if dist_m < 2_000.0 {
+                    2.5 * safe_focus_weight
+                } else if dist_m < 10_000.0 {
+                    2.0 * safe_focus_weight
+                } else if dist_m < 100_000.0 {
+                    1.0 * safe_focus_weight
+                } else if dist_m < 1_000_000.0 {
+                    0.5 * safe_focus_weight
+                } else {
+                    0.0
+                };
+                score += bonus;
             }
 
             rescored.push((place_id, score));
