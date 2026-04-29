@@ -171,6 +171,9 @@ impl GuessContext {
         self.query_bigrams.clear();
         self.place_scores.clear();
 
+        self.area_match_cache.clear();
+        self.sift4_offset_arr.clear();
+
         if self.area_match_cache.is_empty() {
             // Will be sized in search.rs
         }
