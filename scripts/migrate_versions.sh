@@ -76,7 +76,8 @@ if [ -n "$HITS" ]; then
             REGION=$(echo "$row" | jq -r '.region_name')
             FILENAME=$(echo "$row" | jq -r '.filename')
             HASH=$(echo "$row" | jq -r '.hash')
-            TIMESTAMP=$(echo "$row" | jq -r '.timestamp')
+            # ScyllaDB timestamp parser fails if fractional seconds exceed 3 digits.
+            TIMESTAMP=$(echo "$row" | jq -r '.timestamp' | sed -E 's/\.([0-9]{3})[0-9]+/\.\1/')
 
             # Perform insert
             cqlsh $SCYLLA_HOST $SCYLLA_PORT -e "INSERT INTO cypress.cypress_versions (region_name, filename, hash, timestamp) VALUES ('$REGION', '$FILENAME', '$HASH', '$TIMESTAMP');" >/dev/null
