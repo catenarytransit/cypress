@@ -1,12 +1,10 @@
 use anyhow::{Context, Result};
-use cypress::elasticsearch::EsClient;
-use elasticsearch::indices::{IndicesCreateParts, IndicesExistsParts};
-use elasticsearch::SearchParts;
+use cypress::scylla::ScyllaClient;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-
 use std::io::Read;
 use std::path::Path;
+use std::sync::Arc;
 use tracing::info;
 use xxhash_rust::xxh64::Xxh64;
 
@@ -15,122 +13,88 @@ pub struct VersionDoc {
     pub region_name: String,
     pub filename: String,
     pub hash: String,
-    pub timestamp: String,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
 pub struct VersionManager {
-    es_client: EsClient,
-    index_name: String,
+    scylla_client: Arc<ScyllaClient>,
 }
 
 impl VersionManager {
-    pub async fn new(es_url: &str) -> Result<Self> {
-        let index_name = "cypress_versions".to_string();
-        let es_client = EsClient::new(es_url, &index_name)
-            .await
-            .context("Failed to connect to ES for version manager")?;
-
+    pub async fn new(scylla_url: &str) -> Result<Self> {
+        let scylla_client = ScyllaClient::new(scylla_url).await?;
         let manager = Self {
-            es_client,
-            index_name,
+            scylla_client: Arc::new(scylla_client),
         };
 
-        manager.ensure_index().await?;
-
+        manager.ensure_table().await?;
         Ok(manager)
     }
 
-    async fn ensure_index(&self) -> Result<()> {
-        let es = self.es_client.client();
-        let exists = es
-            .indices()
-            .exists(IndicesExistsParts::Index(&[&self.index_name]))
-            .send()
-            .await?
-            .status_code()
-            .is_success();
-
-        if !exists {
-            info!("Creating version index: {}", self.index_name);
-            let mapping = serde_json::json!({
-                "mappings": {
-                    "properties": {
-                        "region_name": { "type": "keyword" },
-                        "filename": { "type": "keyword" },
-                        "hash": { "type": "keyword" },
-                        "timestamp": { "type": "date" }
-                    }
-                }
-            });
-
-            es.indices()
-                .create(IndicesCreateParts::Index(&self.index_name))
-                .body(mapping)
-                .send()
-                .await
-                .context("Failed to create version index")?;
-        }
+    async fn ensure_table(&self) -> Result<()> {
+        let session = &self.scylla_client.session;
+        session
+            .query_unpaged(
+                "CREATE TABLE IF NOT EXISTS cypress.cypress_versions (
+                region_name text,
+                filename text,
+                hash text,
+                timestamp timestamp,
+                PRIMARY KEY ((region_name, filename), hash)
+            );",
+                &[],
+            )
+            .await
+            .context("Failed to ensure ScyllaDB version tracking table")?;
         Ok(())
     }
 
     pub async fn is_latest(&self, region_name: &str, filename: &str, hash: &str) -> Result<bool> {
-        let query = serde_json::json!({
-            "query": {
-                "bool": {
-                    "must": [
-                        { "term": { "region_name": region_name } },
-                        { "term": { "filename": filename } },
-                        { "term": { "hash": hash } }
-                    ]
-                }
+        let session = &self.scylla_client.session;
+        let query = "SELECT COUNT(*) FROM cypress.cypress_versions \
+                     WHERE region_name = ? AND filename = ? AND hash = ?;";
+
+        let result = session
+            .query_unpaged(query, (region_name, filename, hash))
+            .await
+            .context("Failed executing historical hash state selection inside Scylla")?;
+
+        if let Ok(rows_result) = result.into_rows_result() {
+            if let Some((count,)) = rows_result.maybe_first_row::<(i64,)>()? {
+                return Ok(count > 0);
             }
-        });
-
-        let response = self
-            .es_client
-            .client()
-            .search(SearchParts::Index(&[&self.index_name]))
-            .body(query)
-            .send()
-            .await?;
-
-        let body = response.json::<serde_json::Value>().await?;
-        let hits = body["hits"]["total"]["value"].as_u64().unwrap_or(0);
-        Ok(hits > 0)
+        }
+        Ok(false)
     }
 
     pub async fn save_version(&self, version: VersionDoc) -> Result<()> {
-        self.es_client
-            .client()
-            .index(elasticsearch::IndexParts::Index(&self.index_name))
-            .body(version)
-            .send()
-            .await?;
+        let session = &self.scylla_client.session;
+        let statement =
+            "INSERT INTO cypress.cypress_versions (region_name, filename, hash, timestamp) \
+                         VALUES (?, ?, ?, ?);";
+
+        session
+            .query_unpaged(
+                statement,
+                (
+                    version.region_name,
+                    version.filename,
+                    version.hash,
+                    version.timestamp,
+                ),
+            )
+            .await
+            .context("Failed persisting processing metadata state verification sequence")?;
         Ok(())
     }
 
     pub async fn reset(&self) -> Result<()> {
-        let es = self.es_client.client();
-        let exists = es
-            .indices()
-            .exists(IndicesExistsParts::Index(&[&self.index_name]))
-            .send()
-            .await?
-            .status_code()
-            .is_success();
-
-        if exists {
-            info!("Deleting version index: {}", self.index_name);
-            es.indices()
-                .delete(elasticsearch::indices::IndicesDeleteParts::Index(&[
-                    &self.index_name
-                ]))
-                .send()
-                .await
-                .context("Failed to delete version index")?;
-        } else {
-            info!("Version index {} does not exist", self.index_name);
-        }
+        let session = &self.scylla_client.session;
+        info!("Truncating historical record layers stored inside cypress_versions");
+        session
+            .query_unpaged("TRUNCATE cypress.cypress_versions;", &[])
+            .await
+            .context("Failed to safely prune persistent storage elements")?;
         Ok(())
     }
 }

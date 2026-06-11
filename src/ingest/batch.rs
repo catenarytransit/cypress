@@ -23,7 +23,7 @@ pub async fn run_batch(
     synonyms: Arc<crate::synonyms::SynonymService>,
 ) -> Result<()> {
     let config = Config::load_from_file(config_path)?;
-    let version_manager = Arc::new(VersionManager::new(&config.global.es_url).await?);
+    let version_manager = Arc::new(VersionManager::new(&config.global.scylla_url).await?);
 
     info!("Starting batch import for {} regions", config.regions.len());
 
@@ -128,7 +128,7 @@ pub async fn run_batch(
                 region_name: prepared.region.name.clone(),
                 filename: prepared.filename,
                 hash: prepared.hash,
-                timestamp: prepared.import_start.to_rfc3339(),
+                timestamp: prepared.import_start,
             })
             .await;
 
@@ -249,7 +249,7 @@ async fn prepare_region(
     let mut args = base_args.clone();
     args.file = Some(filtered_pbf);
     args.admin_file = admin_file_arg;
-    args.es_url = config.global.es_url.clone();
+    args.scylla_url = config.global.scylla_url.clone();
 
     if !is_first_region {
         args.create_index = false;

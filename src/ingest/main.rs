@@ -1,11 +1,10 @@
 //! OSM PBF ingest pipeline.
 //!
 //! Parses OSM data, extracts places, performs PIP lookups,
-//! and indexes into Elasticsearch.
+//! and indexes into ScyllaDB.
 
 mod batch;
 mod config;
-mod es_place_doc;
 mod importance;
 mod synonyms;
 mod version;
@@ -13,7 +12,6 @@ mod way_merger;
 
 use std::fs::File;
 
-use self::es_place_doc::EsPlaceDoc;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,7 +27,6 @@ use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use cypress::discord::DiscordWebhook;
-use cypress::elasticsearch::{create_index, BulkIndexer, EsClient};
 use cypress::models::normalized::NormalizedPlace;
 use cypress::models::population::{compress_population, parse_osm_population};
 use cypress::models::{Address, AdminLevel, GeoBbox, GeoPoint, Layer, OsmType, Place};
@@ -50,7 +47,7 @@ static GLOBAL: Jemalloc = Jemalloc;
 
 #[derive(Parser, Debug)]
 #[command(name = "ingest")]
-#[command(about = "Ingest OSM PBF data into Elasticsearch")]
+#[command(about = "Ingest OSM PBF data into ScyllaDB")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -72,9 +69,9 @@ enum Commands {
     },
     /// Reset version history (forces re-import of all regions)
     ResetVersions {
-        /// Elasticsearch URL
-        #[arg(long, default_value = "http://localhost:9200")]
-        es_url: String,
+        /// ScyllaDB connection address string
+        #[arg(long, default_value = "127.0.0.1")]
+        scylla_url: String,
     },
 }
 
@@ -88,14 +85,6 @@ pub struct Args {
     #[arg(long)]
     pub admin_file: Option<PathBuf>,
 
-    /// Elasticsearch URL
-    #[arg(long, default_value = "http://localhost:9200")]
-    pub es_url: String,
-
-    /// Elasticsearch index name
-    #[arg(long, default_value = "places")]
-    pub index: String,
-
     /// ScyllaDB URL
     #[arg(long, default_value = "127.0.0.1")]
     pub scylla_url: String,
@@ -108,7 +97,7 @@ pub struct Args {
     #[arg(long)]
     pub refresh: bool,
 
-    /// Create/recreate index before import
+    /// Truncate database tables before import
     #[arg(long)]
     pub create_index: bool,
 
@@ -157,24 +146,16 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Single(args) => run_single(args, synonym_service).await,
-        Commands::Batch { config, args } => {
-            // TODO: Pass Scylla URL to batch if needed, currently batch likely calls run_single or similar logic.
-            // Check batch.rs content. For now we assume batch uses its own config or args.
-            // Actually batch usually calls run_single logic or re-implements it.
-            // Let's check batch.rs but for now I'll just update Single.
-            // Wait, I should probably check batch.rs.
-            // But let's proceed with run_single first as per plan.
-            batch::run_batch(config, args, synonym_service).await
-        }
-        Commands::ResetVersions { es_url } => run_reset(&es_url).await,
+        Commands::Batch { config, args } => batch::run_batch(config, args, synonym_service).await,
+        Commands::ResetVersions { scylla_url } => run_reset(&scylla_url).await,
     }
 }
 
-pub async fn run_reset(es_url: &str) -> Result<()> {
+pub async fn run_reset(scylla_url: &str) -> Result<()> {
     use crate::version::VersionManager;
 
-    info!("Connecting to Elasticsearch at {}...", es_url);
-    let version_manager = VersionManager::new(es_url).await?;
+    info!("Connecting to ScyllaDB at {}...", scylla_url);
+    let version_manager = VersionManager::new(scylla_url).await?;
 
     info!("Resetting version history...");
     version_manager.reset().await?;
@@ -183,7 +164,7 @@ pub async fn run_reset(es_url: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn run_single(args: Args, synonyms: Arc<SynonymService>) -> Result<()> {
+pub async fn run_single(args: Args, _synonyms: Arc<SynonymService>) -> Result<()> {
     let file_path = args
         .file
         .clone()
@@ -191,16 +172,6 @@ pub async fn run_single(args: Args, synonyms: Arc<SynonymService>) -> Result<()>
 
     info!("Cypress Ingest Pipeline");
     info!("File: {}", file_path.display());
-
-    // Connect to Elasticsearch
-    let es_client = EsClient::new(&args.es_url, &args.index)
-        .await
-        .context("Failed to connect to Elasticsearch")?;
-
-    if !es_client.health_check().await? {
-        anyhow::bail!("Elasticsearch cluster is not healthy");
-    }
-    info!("Connected to Elasticsearch");
 
     // Connect to ScyllaDB
     let scylla_client = ScyllaClient::new(&args.scylla_url).await?;
@@ -230,9 +201,10 @@ pub async fn run_single(args: Args, synonyms: Arc<SynonymService>) -> Result<()>
             .await;
     }
 
-    // Create index if requested
+    // Truncate tables if requested
     if args.create_index {
-        create_index(&es_client, true).await?;
+        info!("Truncating ScyllaDB places, admin_areas, and places_by_source tables...");
+        scylla_client.truncate_tables().await?;
     }
 
     let import_start = Utc::now();
@@ -367,9 +339,6 @@ pub async fn run_single(args: Args, synonyms: Arc<SynonymService>) -> Result<()>
             .progress_chars("#>-"),
     );
 
-    // Create bulk indexer (starts background task)
-    let indexer = BulkIndexer::new(es_client.clone(), args.batch_size);
-
     // Create pipeline channel
     let (tx, rx) = mpsc::channel::<Place>(2000);
 
@@ -378,7 +347,6 @@ pub async fn run_single(args: Args, synonyms: Arc<SynonymService>) -> Result<()>
         rx,
         wikidata,
         scylla_client.clone(),
-        indexer.sender_clone(),
         args.batch_size,
     ));
 
@@ -584,31 +552,36 @@ pub async fn run_single(args: Args, synonyms: Arc<SynonymService>) -> Result<()>
     drop(tx);
 
     // Wait for pipeline to finish
-    if let Err(e) = pipeline_handle.await {
-        error!("Pipeline task failed: {}", e);
-    }
+    let pipeline_result = match pipeline_handle.await {
+        Ok(count) => count,
+        Err(e) => {
+            error!("Pipeline task failed: {}", e);
+            0
+        }
+    };
 
-    // Finish indexing
-    let (indexed, errors) = indexer.finish().await?;
-
-    info!("Indexed {} documents ({} errors)", indexed, errors);
+    info!("Imported {} documents", pipeline_result);
 
     // Refresh: delete stale documents
     if args.refresh {
         info!("Deleting stale documents from previous import...");
-        delete_stale_documents(&es_client, &source_file, import_start).await?;
+        let deleted = scylla_client
+            .delete_stale_places(&source_file, import_start)
+            .await?;
+        info!("Deleted {} stale documents", deleted);
     }
 
-    // Final stats
-    let doc_count = es_client.doc_count().await?;
-    info!("Total documents in index: {}", doc_count);
-
     if let Some(ref dw) = discord {
-        let _ = dw.send_notification(
-            "Ingestion Complete",
-            &format!("Successfully indexed **{}** documents (with **{}** errors) for **{}**.\nTotal documents in index: **{}**", indexed, errors, source_file, doc_count),
-            true
-        ).await;
+        let _ = dw
+            .send_notification(
+                "Ingestion Complete",
+                &format!(
+                    "Successfully imported **{}** documents for **{}**.",
+                    pipeline_result, source_file
+                ),
+                true,
+            )
+            .await;
     }
 
     Ok(())
@@ -618,17 +591,20 @@ async fn run_processing_pipeline(
     mut rx: mpsc::Receiver<Place>,
     wikidata: Option<WikidataFetcher>,
     scylla: Arc<ScyllaClient>,
-    indexer_tx: mpsc::Sender<EsPlaceDoc>,
     batch_size: usize,
-) {
+) -> usize {
     let mut buffer = Vec::with_capacity(batch_size);
+    let mut total_imported = 0;
 
     while let Some(place) = rx.recv().await {
         buffer.push(place);
 
         if buffer.len() >= batch_size {
-            if let Err(e) = process_buffer(&mut buffer, &wikidata, &scylla, &indexer_tx).await {
+            let len = buffer.len();
+            if let Err(e) = process_buffer(&mut buffer, &wikidata, &scylla).await {
                 error!("Error processing batch: {}", e);
+            } else {
+                total_imported += len;
             }
             buffer.clear();
         }
@@ -636,17 +612,21 @@ async fn run_processing_pipeline(
 
     // Process remaining
     if !buffer.is_empty() {
-        if let Err(e) = process_buffer(&mut buffer, &wikidata, &scylla, &indexer_tx).await {
+        let len = buffer.len();
+        if let Err(e) = process_buffer(&mut buffer, &wikidata, &scylla).await {
             error!("Error processing final batch: {}", e);
+        } else {
+            total_imported += len;
         }
     }
+
+    total_imported
 }
 
 async fn process_buffer(
     places: &mut [Place],
     wikidata: &Option<WikidataFetcher>,
     scylla: &ScyllaClient,
-    indexer_tx: &mpsc::Sender<EsPlaceDoc>,
 ) -> Result<()> {
     // 1. Fetch Wikidata
     if let Some(wd) = wikidata {
@@ -666,15 +646,12 @@ async fn process_buffer(
         }
     }
 
-    // 2. Scylla Upsert (parallel) & Indexer Send
-    // Prepare all upsert futures for parallel execution
+    // 2. Scylla Upsert (parallel)
     let upsert_futures: Vec<_> = places
         .iter()
         .map(|place| async {
-            // Upsert Admin Areas (Scylla)
             upsert_admin_areas(place, scylla).await?;
 
-            // Upsert Normalized Place (Scylla)
             let normalized = NormalizedPlace::from_place(place.clone());
             let json_data = serde_json::to_string(&normalized)?;
             scylla
@@ -682,6 +659,8 @@ async fn process_buffer(
                     &normalized.source_id,
                     &json_data,
                     compress_population(normalized.population),
+                    &normalized.source_file,
+                    normalized.import_timestamp,
                 )
                 .await?;
 
@@ -689,18 +668,10 @@ async fn process_buffer(
         })
         .collect();
 
-    // Execute all ScyllaDB writes in parallel
     let results = futures::future::join_all(upsert_futures).await;
 
-    // Check for errors
     for result in results {
         result?;
-    }
-
-    // Send to Indexer (sequential - channel ordering)
-    for place in places.iter() {
-        let doc = EsPlaceDoc::from(place);
-        indexer_tx.send(doc).await?;
     }
 
     Ok(())
@@ -1092,41 +1063,5 @@ async fn upsert_admin_areas(place: &Place, scylla: &ScyllaClient) -> Result<()> 
                 .await?;
         }
     }
-    Ok(())
-}
-
-/// Delete documents from previous import of the same file
-async fn delete_stale_documents(
-    client: &EsClient,
-    source_file: &str,
-    import_start: chrono::DateTime<Utc>,
-) -> Result<()> {
-    let query = serde_json::json!({
-        "query": {
-            "bool": {
-                "must": [
-                    { "term": { "source_file": source_file } }
-                ],
-                "filter": [
-                    { "range": { "import_timestamp": { "lt": import_start.to_rfc3339() } } }
-                ]
-            }
-        }
-    });
-
-    let response = client
-        .client()
-        .delete_by_query(elasticsearch::DeleteByQueryParts::Index(&[
-            &client.index_name
-        ]))
-        .body(query)
-        .send()
-        .await?;
-
-    let body = response.json::<serde_json::Value>().await?;
-    let deleted = body["deleted"].as_u64().unwrap_or(0);
-
-    info!("Deleted {} stale documents", deleted);
-
     Ok(())
 }

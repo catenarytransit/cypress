@@ -25,9 +25,6 @@ tokio = { version = "1.35", features = ["full"] }
 # Geographic/DB dependencies
 osmpbfreader = "0.16"
 
-# Elasticsearch (used by ingest binary)
-elasticsearch = "8.5.0-alpha.1"
-
 # HTTP client (for Wikidata)
 reqwest = { version = "0.13", features = ["json", "gzip"] }
 
@@ -76,7 +73,7 @@ regex = "1.11"
 walkdir = "2.4"
 
 # Database
-scylla = { version = "1.4.1" }
+scylla = { version = "1.4.1", features = ["chrono-04"] }
 uuid = { version = "1.19", features = ["v4", "serde"] }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]

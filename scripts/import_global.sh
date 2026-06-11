@@ -99,13 +99,8 @@ WIKIDATA=""
 FRESH_FLAG=""
 NO_FILTER=false
 IS_FIRST_IMPORT=true
-ES_URL="http://localhost:9200"
+SCYLLA_URL="127.0.0.1"
 DISCORD_WEBHOOK=""
-
-# Use ELASTICSEARCH_URL env var if set
-if [ -n "$ELASTICSEARCH_URL" ]; then
-    ES_URL="$ELASTICSEARCH_URL"
-fi
 
 while [[ $# -gt 0 ]]; do
     key="$1"
@@ -127,7 +122,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --url)
-            ES_URL="$2"
+            SCYLLA_URL="$2"
             shift 2
             ;;
         --tmp-dir)
@@ -139,12 +134,8 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         *)
-            # Ignore unknown args or warn? 
-            # Previous script just ignored known flags if loop was simple `for arg in "$@"` but `case` matches.
-            # If we see unknown, we should probably warn or ignore. 
-            # But the original script had a simple loop that just matched known flags.
             echo "Unknown option: $1"
-            shift # Just skip it
+            shift
             ;;
     esac
 done
@@ -154,7 +145,7 @@ mkdir -p "$DATA_DIR"
 
 echo "=== Cypress Global Import ==="
 echo "Regions: ${#REGIONS[@]}"
-echo "Elasticsearch URL: $ES_URL"
+echo "ScyllaDB URL: $SCYLLA_URL"
 echo "Data Directory: $DATA_DIR"
 if [ -n "$FRESH_FLAG" ]; then
     echo "Mode: FRESH IMPORT (Index will be recreated)"
@@ -239,14 +230,14 @@ for region in "${REGIONS[@]}"; do
         IS_FIRST_IMPORT=false
     fi
     
-    echo "Importing $NAME into Elasticsearch..."
+    echo "Importing $NAME into ScyllaDB..."
     cd "$PROJECT_DIR"
     
     if [ -n "$ADMIN_PBF" ]; then
         cargo run --release --bin ingest -- \
             --file "$PBF_TO_IMPORT" \
             --admin-file "$ADMIN_PBF" \
-            --es-url "$ES_URL" \
+            --scylla-url "$SCYLLA_URL" \
             --refresh \
             --merge-roads \
             $WIKIDATA \
@@ -256,7 +247,7 @@ for region in "${REGIONS[@]}"; do
     else
         cargo run --release --bin ingest -- \
             --file "$PBF_TO_IMPORT" \
-            --es-url "$ES_URL" \
+            --scylla-url "$SCYLLA_URL" \
             --refresh \
             --merge-roads \
             $WIKIDATA \

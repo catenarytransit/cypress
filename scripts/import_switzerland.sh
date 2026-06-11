@@ -109,20 +109,17 @@ fi
 echo
 echo "Importing: $PBF_FILE ($(du -h "$PBF_FILE" | cut -f1))"
 
-# Check Elasticsearch is running
+# Check ScyllaDB is running
 echo
-echo "Checking Elasticsearch..."
-if ! curl -s "http://localhost:9200" > /dev/null; then
-    echo "ERROR: Elasticsearch is not running on localhost:9200"
+echo "Checking ScyllaDB..."
+if ! nc -z localhost 9042 > /dev/null 2>&1; then
+    echo "ERROR: ScyllaDB is not running on localhost:9042"
     echo
     echo "Start it with Docker:"
-    echo "  docker run -d --name cypress-es -p 9200:9200 \\"
-    echo "    -e \"discovery.type=single-node\" \\"
-    echo "    -e \"xpack.security.enabled=false\" \\"
-    echo "    docker.elastic.co/elasticsearch/elasticsearch:8.11.0"
+    echo "  docker run -d --name cypress-scylla -p 9042:9042 scylladb/scylla:5.2.0"
     exit 1
 fi
-echo "Elasticsearch is running"
+echo "ScyllaDB is running"
 
 # Build in release mode
 echo
@@ -145,12 +142,12 @@ cargo run --release --bin ingest -- \
 echo
 echo "=== Import Complete ==="
 echo
-echo "Document count:"
-curl -s "http://localhost:9200/places/_count" | jq .
+echo "Document count in cypress.places:"
+cqlsh -e "SELECT count(*) FROM cypress.places;"
 
 echo
-echo "Sample search for 'Zurich':"
-curl -s "http://localhost:9200/places/_search?q=name.default:Zurich&size=3" | jq '.hits.hits[]._source | {name: .name.default, layer: .layer, locality: .parent.locality.name}'
+echo "Sample places:"
+cqlsh -e "SELECT id, data FROM cypress.places LIMIT 3;"
 
 echo
 echo "Done! Start the query server with:"

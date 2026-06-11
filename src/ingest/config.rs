@@ -11,7 +11,7 @@ pub struct Config {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct GlobalConfig {
-    pub es_url: String,
+    pub scylla_url: String,
     pub tmp_dir: PathBuf,
 }
 

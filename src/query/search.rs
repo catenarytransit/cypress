@@ -1377,6 +1377,7 @@ mod tests {
             id: Some(1),
             bbox: None,
             names: country_names.clone(),
+            population: None,
         };
 
         let mut admin_map = HashMap::new();
@@ -1390,6 +1391,7 @@ mod tests {
             osm_id: 123,
             wikidata_id: None,
             importance: Some(0.5),
+            population: None,
             layer: Layer::Locality,
             categories: vec![],
             name: names.clone(),
@@ -1456,6 +1458,7 @@ mod tests {
             osm_id: 456,
             wikidata_id: None,
             importance: Some(0.8),
+            population: None,
             layer: Layer::Locality,
             categories: vec![],
             name: names,
@@ -1527,6 +1530,7 @@ mod tests {
             osm_id: 111,
             wikidata_id: None,
             importance: Some(1.0),
+            population: None,
             layer: Layer::Region,
             categories: vec![],
             name: names,

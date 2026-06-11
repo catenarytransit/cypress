@@ -16,16 +16,11 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 IMPORT_SCRIPT="${SCRIPT_DIR}/import_global.sh"
 
 REGION_NAME="$1"
-ES_URL="http://localhost:9200"
-INDEX_NAME="places"
-
-# Use ELASTICSEARCH_URL env var if set
-if [ -n "$ELASTICSEARCH_URL" ]; then
-    ES_URL="$ELASTICSEARCH_URL"
-fi
+SCYLLA_HOST="127.0.0.1"
+SCYLLA_PORT="9042"
 
 if [ -z "$REGION_NAME" ]; then
-    echo "Usage: $0 <region_name> [--url <url>] [--index <name>]"
+    echo "Usage: $0 <region_name> [--host <host>] [--port <port>]"
     echo "Example: $0 Albania"
     exit 1
 fi
@@ -35,12 +30,12 @@ shift
 while [[ $# -gt 0 ]]; do
     key="$1"
     case $key in
-        --url)
-            ES_URL="$2"
+        --host)
+            SCYLLA_HOST="$2"
             shift 2
             ;;
-        --index)
-            INDEX_NAME="$2"
+        --port)
+            SCYLLA_PORT="$2"
             shift 2
             ;;
         *)
@@ -52,8 +47,8 @@ done
 
 echo "=== Cypress Wipe Region ==="
 echo "Region: $REGION_NAME"
-echo "Elasticsearch URL: $ES_URL"
-echo "Index: $INDEX_NAME"
+echo "ScyllaDB Host: $SCYLLA_HOST"
+echo "ScyllaDB Port: $SCYLLA_PORT"
 echo
 
 # Find region in import_global.sh to get filename
@@ -74,9 +69,8 @@ fi
 
 if [ -z "$REGION_LINE" ]; then
     echo "Warning: Region '$REGION_NAME' not found in import_global.sh."
-    echo "Falling back to using '$REGION_NAME' as a wildcard match for source_file."
-    # Sanitize REGION_NAME for wildcard
-    SOURCE_PATTERN="*${REGION_NAME}*"
+    echo "Falling back to using '$REGION_NAME' as base name."
+    BASE_NAME="$REGION_NAME"
 else
     # Extract URL and filename
     # Line looks like: "Albania|https://.../albania-latest.osm.pbf"
@@ -84,39 +78,36 @@ else
     FILENAME=$(basename "$URL")
     # Base source file name (e.g. albania-latest)
     BASE_NAME="${FILENAME%.osm.pbf}"
-    # Use BASE_NAME with wildcard to catch -filtered, -admins, etc.
-    SOURCE_PATTERN="${BASE_NAME}*"
 fi
 
-echo "Deleting documents with source_file matching: '$SOURCE_PATTERN'"
-
-# Perform delete by query
-QUERY=$(cat <<EOF
-{
-  "query": {
-    "wildcard": {
-      "source_file": {
-        "value": "$SOURCE_PATTERN"
-      }
-    }
-  }
-}
-EOF
+# Files that could represent this region
+FILES=(
+    "${BASE_NAME}-filtered.osm.pbf"
+    "${BASE_NAME}-admins.osm.pbf"
+    "${BASE_NAME}.osm.pbf"
 )
 
-# Use -s for silent, -S for show error
-RESPONSE=$(curl -s -S -X POST "$ES_URL/$INDEX_NAME/_delete_by_query?refresh&wait_for_completion=true" \
-    -H 'Content-Type: application/json' \
-    -d "$QUERY")
+TOTAL_DELETED=0
 
-if echo "$RESPONSE" | grep -q '"deleted"'; then
-    # Extract deleted count using grep/sed
-    DELETED=$(echo "$RESPONSE" | sed -n 's/.*"deleted":\([0-9]*\).*/\1/p')
-    echo "Successfully deleted $DELETED documents."
-else
-    echo "Error or no documents found:"
-    echo "$RESPONSE"
-fi
+for SF in "${FILES[@]}"; do
+    echo "Querying IDs for source file: '$SF'..."
+    # Query IDs from ScyllaDB
+    IDS=$(cqlsh $SCYLLA_HOST $SCYLLA_PORT -e "SELECT id FROM cypress.places_by_source WHERE source_file = '$SF';" | grep -v -E "(^id|^---|^\s*$|\([0-9]+ rows\))" | tr -d '\r ' || true)
+    
+    if [ -n "$IDS" ]; then
+        echo "Deleting documents from cypress.places..."
+        for id in $IDS; do
+            if [ -n "$id" ]; then
+                cqlsh $SCYLLA_HOST $SCYLLA_PORT -e "DELETE FROM cypress.places WHERE id = '$id';" > /dev/null
+                TOTAL_DELETED=$((TOTAL_DELETED + 1))
+            fi
+        done
+        
+        echo "Clearing partition from cypress.places_by_source..."
+        cqlsh $SCYLLA_HOST $SCYLLA_PORT -e "DELETE FROM cypress.places_by_source WHERE source_file = '$SF';" > /dev/null
+    fi
+done
 
+echo "Successfully deleted $TOTAL_DELETED documents."
 echo
 echo "Wipe complete."

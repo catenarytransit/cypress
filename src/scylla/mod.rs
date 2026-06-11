@@ -29,7 +29,6 @@ impl ScyllaClient {
     }
 
     async fn init_schema(&self) -> Result<()> {
-        // Create keyspace if not exists
         self.session
             .query_unpaged(
                 "CREATE KEYSPACE IF NOT EXISTS cypress 
@@ -41,25 +40,47 @@ impl ScyllaClient {
             )
             .await?;
 
-        // Create places table
         self.session
             .query_unpaged(
                 "CREATE TABLE IF NOT EXISTS cypress.places (
                     id text PRIMARY KEY,
                     data text,
-                    population int
+                    population int,
+                    source_file text,
+                    import_timestamp timestamp
                 ) WITH compression = { 'sstable_compression': 'ZstdCompressor', 'chunk_length_in_kb': 64 }",
                 &[],
             )
             .await?;
 
-        // Backward-compatible schema migration for existing deployments.
         let _ = self
             .session
             .query_unpaged("ALTER TABLE cypress.places ADD population int", &[])
             .await;
+        let _ = self
+            .session
+            .query_unpaged("ALTER TABLE cypress.places ADD source_file text", &[])
+            .await;
+        let _ = self
+            .session
+            .query_unpaged(
+                "ALTER TABLE cypress.places ADD import_timestamp timestamp",
+                &[],
+            )
+            .await;
 
-        // Create admin_areas table
+        self.session
+            .query_unpaged(
+                "CREATE TABLE IF NOT EXISTS cypress.places_by_source (
+                    source_file text,
+                    import_timestamp timestamp,
+                    id text,
+                    PRIMARY KEY ((source_file), import_timestamp, id)
+                ) WITH compression = { 'sstable_compression': 'ZstdCompressor', 'chunk_length_in_kb': 64 }",
+                &[],
+            )
+            .await?;
+
         self.session
             .query_unpaged(
                 "CREATE TABLE IF NOT EXISTS cypress.admin_areas (
@@ -71,7 +92,6 @@ impl ScyllaClient {
             )
             .await?;
 
-        // Backward-compatible schema migration for existing deployments.
         let _ = self
             .session
             .query_unpaged("ALTER TABLE cypress.admin_areas ADD population int", &[])
@@ -80,12 +100,25 @@ impl ScyllaClient {
         Ok(())
     }
 
-    pub async fn upsert_place(&self, id: &str, data: &str, population: Option<u32>) -> Result<()> {
+    pub async fn upsert_place(
+        &self,
+        id: &str,
+        data: &str,
+        population: Option<u32>,
+        source_file: &str,
+        import_timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
         let population_i32 = population.and_then(|p| i32::try_from(p).ok());
         self.session
             .query_unpaged(
-                "INSERT INTO cypress.places (id, data, population) VALUES (?, ?, ?)",
-                (id, data, population_i32),
+                "INSERT INTO cypress.places (id, data, population, source_file, import_timestamp) VALUES (?, ?, ?, ?, ?)",
+                (id, data, population_i32, source_file, import_timestamp),
+            )
+            .await?;
+        self.session
+            .query_unpaged(
+                "INSERT INTO cypress.places_by_source (source_file, import_timestamp, id) VALUES (?, ?, ?)",
+                (source_file, import_timestamp, id),
             )
             .await?;
         Ok(())
@@ -176,5 +209,55 @@ impl ScyllaClient {
         }
 
         Ok(map)
+    }
+
+    pub async fn delete_stale_places(
+        &self,
+        source_file: &str,
+        import_start: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64> {
+        let result = self.session
+            .query_unpaged(
+                "SELECT id, import_timestamp FROM cypress.places_by_source WHERE source_file = ? AND import_timestamp < ?",
+                (source_file, import_start),
+            )
+            .await?;
+
+        let mut count = 0;
+        if let Ok(rows_result) = result.into_rows_result() {
+            let mut items_to_delete = Vec::new();
+            for row_res in rows_result.rows::<(String, chrono::DateTime<chrono::Utc>)>()? {
+                if let Ok((id, ts)) = row_res {
+                    items_to_delete.push((id, ts));
+                }
+            }
+
+            for (id, ts) in &items_to_delete {
+                self.session
+                    .query_unpaged("DELETE FROM cypress.places WHERE id = ?", (id,))
+                    .await?;
+                self.session
+                    .query_unpaged(
+                        "DELETE FROM cypress.places_by_source WHERE source_file = ? AND import_timestamp = ? AND id = ?",
+                        (source_file, *ts, id),
+                    )
+                    .await?;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    pub async fn truncate_tables(&self) -> Result<()> {
+        self.session
+            .query_unpaged("TRUNCATE cypress.places", &[])
+            .await?;
+        self.session
+            .query_unpaged("TRUNCATE cypress.admin_areas", &[])
+            .await?;
+        self.session
+            .query_unpaged("TRUNCATE cypress.places_by_source", &[])
+            .await?;
+        Ok(())
     }
 }
