@@ -82,6 +82,7 @@ if [ -n "$HITS" ]; then
             # Perform insert
             cqlsh $SCYLLA_HOST $SCYLLA_PORT -e "INSERT INTO cypress.cypress_versions (region_name, filename, hash, timestamp) VALUES ('$REGION', '$FILENAME', '$HASH', '$TIMESTAMP');" >/dev/null
             COUNT=$((COUNT + 1))
+            echo $REGION
         fi
     done <<< "$HITS"
     echo "Migration complete. Successfully migrated $COUNT versions."
