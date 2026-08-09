@@ -1,5 +1,5 @@
 use anyhow::Result;
-use geo::{Coord, LineString, MultiPolygon, Polygon};
+use geo::{Contains, Coord, LineString, MultiPolygon, Point, Polygon};
 use hashbrown::{HashMap, HashSet};
 use memmap2::Mmap;
 use osmpbfreader::{NodeId, OsmObj, OsmPbfReader, RelationId, WayId};
@@ -15,12 +15,24 @@ struct NodeData {
     lat: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RingRole {
+    Outer,
+    Inner,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RelationWayMember {
+    way_id: WayId,
+    role: RingRole,
+}
+
 /// Manages geometry resolution for Ways and Relations
 pub struct GeometryResolver {
     nodes_mmap: Mmap,
     num_nodes: usize,
     way_nodes: HashMap<WayId, Vec<NodeId>>,
-    relation_members: HashMap<RelationId, Vec<WayId>>,
+    relation_members: HashMap<RelationId, Vec<RelationWayMember>>,
 }
 
 impl GeometryResolver {
@@ -50,10 +62,19 @@ impl GeometryResolver {
                     let mut ways = Vec::new();
                     for member in &rel.refs {
                         if let osmpbfreader::OsmId::Way(way_id) = member.member {
-                            if member.role == "outer" || member.role == "" {
-                                ways.push(way_id);
-                                needed_ways.insert(way_id);
-                            }
+                            let role = if member.role == "inner" {
+                                RingRole::Inner
+                            } else if member.role == "outer" || member.role == "" {
+                                // Empty roles are commonly used as outer members on
+                                // boundary relations. Unknown roles such as subarea,
+                                // admin_centre, and label are not geometry members.
+                                RingRole::Outer
+                            } else {
+                                continue;
+                            };
+
+                            ways.push(RelationWayMember { way_id, role });
+                            needed_ways.insert(way_id);
                         }
                     }
                     relation_members_map.insert(rel.id, ways);
@@ -202,51 +223,74 @@ impl GeometryResolver {
     pub fn resolve_relation(&self, rel_id: RelationId) -> Option<MultiPolygon<f64>> {
         let member_ways = self.relation_members.get(&rel_id)?;
 
-        let mut rings: Vec<Vec<Coord<f64>>> = Vec::new();
+        let mut outer_segments: Vec<Vec<NodeId>> = Vec::new();
+        let mut inner_segments: Vec<Vec<NodeId>> = Vec::new();
 
-        for way_id in member_ways {
-            if let Some(nodes) = self.way_nodes.get(way_id) {
-                let coords: Vec<Coord<f64>> = nodes
-                    .iter()
-                    .filter_map(|nid| self.get_node_coords(*nid))
-                    .collect();
+        for member in member_ways {
+            // A multipolygon relation is only valid if all geometry members and
+            // all of their referenced nodes are available. Do not silently build
+            // a partial country boundary from a clipped or stale PBF.
+            let nodes = self.way_nodes.get(&member.way_id)?;
+            if nodes.len() < 2 {
+                return None;
+            }
 
-                if coords.len() >= 2 {
-                    rings.push(coords);
-                }
+            match member.role {
+                RingRole::Outer => outer_segments.push(nodes.clone()),
+                RingRole::Inner => inner_segments.push(nodes.clone()),
             }
         }
 
-        if rings.is_empty() {
+        if outer_segments.is_empty() {
             return None;
         }
 
-        let polygons = merge_rings_to_polygons(rings);
-        if polygons.is_empty() {
-            return None;
-        }
+        // OSM multipolygon rings are defined by shared node IDs. Assemble them
+        // topologically first, then resolve coordinates. Crucially, an open chain
+        // is invalid and must never be closed by inventing a straight segment.
+        let outer_node_rings = merge_way_segments_to_rings(outer_segments)?;
+        let inner_node_rings = merge_way_segments_to_rings(inner_segments)?;
 
+        let outer_rings: Vec<LineString<f64>> = outer_node_rings
+            .into_iter()
+            .map(|ring| self.node_ring_to_linestring(ring))
+            .collect::<Option<Vec<_>>>()?;
+        let inner_rings: Vec<LineString<f64>> = inner_node_rings
+            .into_iter()
+            .map(|ring| self.node_ring_to_linestring(ring))
+            .collect::<Option<Vec<_>>>()?;
+
+        let polygons = polygons_from_rings(outer_rings, inner_rings)?;
         Some(MultiPolygon::new(polygons))
+    }
+
+    fn node_ring_to_linestring(&self, ring: Vec<NodeId>) -> Option<LineString<f64>> {
+        if ring.len() < 4 || ring.first() != ring.last() {
+            return None;
+        }
+
+        let coords = ring
+            .into_iter()
+            .map(|node_id| self.get_node_coords(node_id))
+            .collect::<Option<Vec<_>>>()?;
+
+        Some(LineString::new(coords))
     }
 
     /// Resolve geometry for a Way
     pub fn resolve_way(&self, way_id: WayId) -> Option<Polygon<f64>> {
         let nodes = self.way_nodes.get(&way_id)?;
 
+        // OSM closed ways are closed by repeating the same node ID, not merely
+        // by having two distinct nodes at identical coordinates.
+        if nodes.len() < 4 || nodes.first() != nodes.last() {
+            return None;
+        }
+
         let coords: Vec<Coord<f64>> = nodes
             .iter()
-            .filter_map(|nid| self.get_node_coords(*nid))
-            .collect();
-
-        // Need at least 4 points for a closed polygon (3 points + 1 repeat)
-        if coords.len() < 4 {
-            return None;
-        }
-
-        // IMPORTANT: Do NOT auto-close rings. If it's not closed, it's not a polygon for our purposes.
-        if coords.first() != coords.last() {
-            return None;
-        }
+            .map(|nid| self.get_node_coords(*nid))
+            .collect::<Option<Vec<_>>>()?;
 
         Some(Polygon::new(LineString::new(coords), vec![]))
     }
@@ -257,6 +301,160 @@ impl GeometryResolver {
         let poly = self.resolve_way(way_id)?;
         poly.centroid().map(|p| (p.x(), p.y()))
     }
+}
+
+/// Assemble OSM way members into naturally closed rings using node IDs.
+///
+/// Returns `None` when a chain cannot be closed or when more than one way can
+/// continue from the same endpoint. Rejecting ambiguous/incomplete topology is
+/// safer than manufacturing a polygon that can cover the wrong country.
+fn merge_way_segments_to_rings(mut segments: Vec<Vec<NodeId>>) -> Option<Vec<Vec<NodeId>>> {
+    let mut rings = Vec::new();
+
+    // Closed ways are already complete rings. Pull them out first so they cannot
+    // accidentally be joined to an open chain that happens to share a node.
+    let mut i = 0;
+    while i < segments.len() {
+        if segments[i].len() < 2 {
+            return None;
+        }
+        if segments[i].first() == segments[i].last() {
+            let ring = segments.remove(i);
+            if ring.len() < 4 {
+                return None;
+            }
+            rings.push(ring);
+        } else {
+            i += 1;
+        }
+    }
+
+    while !segments.is_empty() {
+        let mut current = segments.remove(0);
+
+        loop {
+            if current.first() == current.last() {
+                if current.len() < 4 {
+                    return None;
+                }
+                rings.push(current);
+                break;
+            }
+
+            let start = *current.first()?;
+            let end = *current.last()?;
+
+            // Prefer extending the end of the chain. A single matching way at the
+            // start is also valid; multiple matches at the same endpoint are
+            // ambiguous and should not be guessed.
+            let mut append_match: Option<(usize, bool)> = None;
+            for (idx, segment) in segments.iter().enumerate() {
+                let seg_start = *segment.first()?;
+                let seg_end = *segment.last()?;
+                let reverse = if end == seg_start {
+                    Some(false)
+                } else if end == seg_end {
+                    Some(true)
+                } else {
+                    None
+                };
+
+                if let Some(reverse) = reverse {
+                    if append_match.is_some() {
+                        return None;
+                    }
+                    append_match = Some((idx, reverse));
+                }
+            }
+
+            if let Some((idx, reverse)) = append_match {
+                let mut segment = segments.remove(idx);
+                if reverse {
+                    segment.reverse();
+                }
+                segment.remove(0); // duplicate shared endpoint
+                current.extend(segment);
+                continue;
+            }
+
+            let mut prepend_match: Option<(usize, bool)> = None;
+            for (idx, segment) in segments.iter().enumerate() {
+                let seg_start = *segment.first()?;
+                let seg_end = *segment.last()?;
+                let reverse = if start == seg_end {
+                    Some(false)
+                } else if start == seg_start {
+                    Some(true)
+                } else {
+                    None
+                };
+
+                if let Some(reverse) = reverse {
+                    if prepend_match.is_some() {
+                        return None;
+                    }
+                    prepend_match = Some((idx, reverse));
+                }
+            }
+
+            if let Some((idx, reverse)) = prepend_match {
+                let mut segment = segments.remove(idx);
+                if reverse {
+                    segment.reverse();
+                }
+                segment.pop(); // duplicate shared endpoint
+                segment.extend(current);
+                current = segment;
+                continue;
+            }
+
+            // No member continues this chain: it is an open ring. OSM does not
+            // permit us to invent an edge from the end back to the beginning.
+            return None;
+        }
+    }
+
+    Some(rings)
+}
+
+/// Build polygons from assembled outer and inner OSM rings.
+fn polygons_from_rings(
+    outer_rings: Vec<LineString<f64>>,
+    inner_rings: Vec<LineString<f64>>,
+) -> Option<Vec<Polygon<f64>>> {
+    if outer_rings.is_empty() {
+        return None;
+    }
+
+    let mut polygons: Vec<Polygon<f64>> = outer_rings
+        .into_iter()
+        .map(|outer| Polygon::new(outer, vec![]))
+        .collect();
+
+    for inner in inner_rings {
+        let sample = inner.0.first()?;
+        let point = Point::new(sample.x, sample.y);
+
+        let containing: Vec<usize> = polygons
+            .iter()
+            .enumerate()
+            .filter(|(_, polygon)| polygon.contains(&point))
+            .map(|(idx, _)| idx)
+            .collect();
+
+        // A valid inner ring belongs to exactly one outer ring.
+        if containing.len() != 1 {
+            return None;
+        }
+
+        let idx = containing[0];
+        let exterior = polygons[idx].exterior().clone();
+        let mut interiors = polygons[idx].interiors().to_vec();
+        interiors.push(inner);
+        polygons[idx] = Polygon::new(exterior, interiors);
+    }
+
+    Some(polygons)
 }
 
 /// Merge disconnected rings into closed polygons
@@ -320,15 +518,12 @@ pub fn merge_rings_to_polygons(rings: Vec<Vec<Coord<f64>>>) -> Vec<Polygon<f64>>
             }
         }
 
-        // Close the ring if possible
-        if current.len() >= 3 {
-            if current.first() != current.last() {
-                current.push(current[0]);
-            }
-            if current.len() >= 4 {
-                let line_string = LineString::new(current);
-                result.push(Polygon::new(line_string, vec![]));
-            }
+        // Only accept a ring that actually closes. Never synthesize the
+        // final edge: doing so can turn a clipped country boundary into a huge
+        // false polygon that contains neighbouring cities.
+        if current.first() == current.last() && current.len() >= 4 {
+            let line_string = LineString::new(current);
+            result.push(Polygon::new(line_string, vec![]));
         }
     }
 
@@ -338,7 +533,7 @@ pub fn merge_rings_to_polygons(rings: Vec<Vec<Coord<f64>>>) -> Vec<Polygon<f64>>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use geo::{Coord, LineString};
+    use geo::{Contains, Coord, LineString, Point};
 
     #[test]
     fn test_merge_simple_ring() {
@@ -385,6 +580,63 @@ mod tests {
         // Pass in s2 then s1
         let polygons = merge_rings_to_polygons(vec![s2, s1]);
         assert_eq!(polygons.len(), 1);
+    }
+
+    #[test]
+    fn test_open_chain_is_not_force_closed() {
+        let p1 = Coord { x: 0.0, y: 0.0 };
+        let p2 = Coord { x: 1.0, y: 0.0 };
+        let p3 = Coord { x: 1.0, y: 1.0 };
+        let p4 = Coord { x: 0.0, y: 1.0 };
+
+        // This used to become p1 -> p2 -> p3 -> p4 -> p1 by inventing
+        // the final edge. An open OSM ring must be rejected instead.
+        let polygons = merge_rings_to_polygons(vec![vec![p1, p2, p3, p4]]);
+        assert!(polygons.is_empty());
+    }
+
+    #[test]
+    fn test_node_id_ring_assembly_succeeds() {
+        let a = NodeId(1);
+        let b = NodeId(2);
+        let c = NodeId(3);
+        let d = NodeId(4);
+
+        let rings = merge_way_segments_to_rings(vec![vec![a, b, c], vec![c, d, a]]).unwrap();
+        assert_eq!(rings, vec![vec![a, b, c, d, a]]);
+    }
+
+    #[test]
+    fn test_node_id_ring_assembly_rejects_gap() {
+        let a = NodeId(1);
+        let b = NodeId(2);
+        let c = NodeId(3);
+        let d = NodeId(4);
+
+        assert!(merge_way_segments_to_rings(vec![vec![a, b, c], vec![d, a]]).is_none());
+    }
+
+    #[test]
+    fn test_inner_ring_becomes_hole() {
+        let outer = LineString::new(vec![
+            Coord { x: 0.0, y: 0.0 },
+            Coord { x: 10.0, y: 0.0 },
+            Coord { x: 10.0, y: 10.0 },
+            Coord { x: 0.0, y: 10.0 },
+            Coord { x: 0.0, y: 0.0 },
+        ]);
+        let inner = LineString::new(vec![
+            Coord { x: 4.0, y: 4.0 },
+            Coord { x: 6.0, y: 4.0 },
+            Coord { x: 6.0, y: 6.0 },
+            Coord { x: 4.0, y: 6.0 },
+            Coord { x: 4.0, y: 4.0 },
+        ]);
+
+        let polygons = polygons_from_rings(vec![outer], vec![inner]).unwrap();
+        assert_eq!(polygons.len(), 1);
+        assert!(polygons[0].contains(&Point::new(2.0, 2.0)));
+        assert!(!polygons[0].contains(&Point::new(5.0, 5.0)));
     }
 
     #[test]
