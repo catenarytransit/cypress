@@ -1,4 +1,6 @@
 use anyhow::Result;
+use fst::automaton::Str;
+use fst::{Automaton, IntoStreamer, Map, Streamer};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -169,11 +171,94 @@ fn tokenize_query(query: &str) -> Vec<&[u8]> {
         .collect()
 }
 
+struct QueryPhrase {
+    bytes: Vec<u8>,
+    mask: u8,
+    // Sorted by area ID. The score is the best score among multilingual
+    // admin aliases whose key starts with this query phrase.
+    admin_prefix_scores: Vec<(u32, f32)>,
+}
+
+fn load_fst_map(bytes: &[u8]) -> Option<Map<&[u8]>> {
+    if bytes.is_empty() {
+        None
+    } else {
+        Map::new(bytes).ok()
+    }
+}
+
+fn collect_prefix_string_ids(prefix_fst: &Map<&[u8]>, prefix: &str, out: &mut Vec<u32>) {
+    if prefix.chars().count() < 2 {
+        return;
+    }
+    let automaton = Str::new(prefix).starts_with();
+    let mut stream = prefix_fst.search(automaton).into_stream();
+    while let Some((_key, string_id)) = stream.next() {
+        if string_id <= u32::MAX as u64 {
+            out.push(string_id as u32);
+        }
+    }
+}
+
+fn resolve_admin_prefix_scores(
+    db: &cypress::models::memdb::ArchivedCypressMemDb,
+    admin_alias_fst: Option<&Map<&[u8]>>,
+    phrase: &[u8],
+) -> Vec<(u32, f32)> {
+    let Some(admin_alias_fst) = admin_alias_fst else {
+        return Vec::new();
+    };
+    let Ok(prefix) = std::str::from_utf8(phrase) else {
+        return Vec::new();
+    };
+    if prefix.chars().count() < 2 {
+        return Vec::new();
+    }
+
+    let automaton = Str::new(prefix).starts_with();
+    let mut stream = admin_alias_fst.search(automaton).into_stream();
+    let mut area_scores = Vec::<(u32, f32)>::new();
+
+    while let Some((alias, group_idx)) = stream.next() {
+        let group_idx = group_idx as usize;
+        if group_idx + 1 >= db.admin_alias_area_offsets.len() {
+            continue;
+        }
+        let start = db.admin_alias_area_offsets[group_idx] as usize;
+        let end = db.admin_alias_area_offsets[group_idx + 1] as usize;
+        if start > end || end > db.admin_alias_area_data.len() {
+            continue;
+        }
+
+        let mut offsets = Vec::new();
+        let score = cypress::models::scoring::get_match_score(alias, phrase, &mut offsets);
+        if score == cypress::models::scoring::NO_MATCH {
+            continue;
+        }
+        for i in start..end {
+            area_scores.push((db.admin_alias_area_data[i], score));
+        }
+    }
+
+    area_scores.sort_unstable_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then(a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    let mut best_by_area = Vec::<(u32, f32)>::with_capacity(area_scores.len());
+    for (area_id, score) in area_scores {
+        if best_by_area.last().map(|last| last.0) == Some(area_id) {
+            continue; // sorted by score within each area, so the first is best
+        }
+        best_by_area.push((area_id, score));
+    }
+    best_by_area
+}
+
 /// Try to match unmatched query tokens against area names for a place.
 fn score_area_matches(
     db: &cypress::models::memdb::ArchivedCypressMemDb,
     area_set_idx: usize,
-    phrases: &[(Vec<u8>, u8)],
+    phrases: &[QueryPhrase],
     matched_mask: u8,
     offset_arr: &mut Vec<cypress::models::sift4::SiftOffset>,
 ) -> (f32, u8) {
@@ -208,15 +293,25 @@ fn score_area_matches(
         let mut best_phrase_score = cypress::models::scoring::NO_MATCH;
         let mut best_phrase_mask = 0u8;
 
-        for (phrase, mask) in phrases {
-            if (*mask & current_mask) != 0 {
+        for phrase in phrases {
+            if (phrase.mask & current_mask) != 0 {
                 continue;
             }
-            let score =
-                cypress::models::scoring::get_area_match_score(area_name, phrase, offset_arr);
+
+            let score = match phrase
+                .admin_prefix_scores
+                .binary_search_by_key(&(area_idx as u32), |(area_id, _)| *area_id)
+            {
+                Ok(pos) => phrase.admin_prefix_scores[pos].1,
+                Err(_) => cypress::models::scoring::get_area_match_score(
+                    area_name,
+                    &phrase.bytes,
+                    offset_arr,
+                ),
+            };
             if score != cypress::models::scoring::NO_MATCH && score < best_phrase_score {
                 best_phrase_score = score;
-                best_phrase_mask = *mask;
+                best_phrase_mask = phrase.mask;
             }
         }
 
@@ -287,11 +382,14 @@ pub fn search_place_ids(
     let place_count = db.place_latitudes.len();
     let safe_focus_weight = focus_weight.max(0.001);
 
+    let prefix_fst = load_fst_map(&db.prefix_fst_bytes[..]);
+    let admin_alias_fst = load_fst_map(&db.admin_alias_fst_bytes[..]);
+
     let query_tokens = tokenize_query(&query);
     let is_multi_token = query_tokens.len() > 1;
 
     let max_tokens = query_tokens.len().min(8);
-    let mut phrases: Vec<(Vec<u8>, u8)> = Vec::new();
+    let mut phrases: Vec<QueryPhrase> = Vec::new();
     if is_multi_token {
         for i in 0..max_tokens {
             let mut phrase = Vec::new();
@@ -302,17 +400,56 @@ pub fn search_place_ids(
                 }
                 phrase.extend_from_slice(query_tokens[j]);
                 mask |= 1 << j;
-                phrases.push((phrase.clone(), mask));
+                let bytes = phrase.clone();
+                phrases.push(QueryPhrase {
+                    admin_prefix_scores: resolve_admin_prefix_scores(
+                        db,
+                        admin_alias_fst.as_ref(),
+                        &bytes,
+                    ),
+                    bytes,
+                    mask,
+                });
             }
         }
     }
+
+    // Prefix candidates are additive. They bypass the cosine candidate cap but
+    // still pass through the same SIFT/place/admin/geographic ranker. This keeps
+    // typo recovery in the bigram path while guaranteeing that exact prefixes
+    // such as "zuri" can reach the final ranker for aliases such as "zurich".
+    let prefix_phase_started = Instant::now();
+    let mut prefix_string_ids = Vec::<u32>::new();
+    if let Some(prefix_fst) = prefix_fst.as_ref() {
+        collect_prefix_string_ids(prefix_fst, &query, &mut prefix_string_ids);
+        if prefix_string_ids.is_empty() && is_multi_token {
+            for token in query_tokens.iter().take(8) {
+                if let Ok(token) = std::str::from_utf8(token) {
+                    collect_prefix_string_ids(prefix_fst, token, &mut prefix_string_ids);
+                }
+            }
+        }
+    }
+    prefix_string_ids.sort_unstable();
+    prefix_string_ids.dedup();
+    log_phase_timing(
+        "search_place_ids",
+        "prefix_fst_lookup",
+        prefix_phase_started,
+    );
+    debug!(
+        target: "cypress::query::timing",
+        op = "search_place_ids",
+        prefix_candidate_count = prefix_string_ids.len(),
+        "prefix FST candidates ready"
+    );
 
     let mut results = Vec::<(u32, f64)>::new();
 
     GUESS_CONTEXT.with(|cell| {
         let phase_started = Instant::now();
         let mut ctx = cell.borrow_mut();
-        ctx.clear(string_count, place_count);
+        ctx.clear(string_count, place_count, &memdb_data.version);
 
         let needed_area_sets = db.area_set_offsets.len();
         if ctx.area_match_cache.len() < needed_area_sets {
@@ -348,7 +485,7 @@ pub fn search_place_ids(
             .query_cache
             .get_closest_ref(&query_bigrams, &mut missing_bigrams);
         if let Some(cached) = cached_counts {
-            ctx.string_match_counts.copy_from_slice(&cached);
+            ctx.restore_sparse_counts(&cached);
         }
         let missing_bigram_count = missing_bigrams.len();
         log_phase_timing("search_place_ids", "cache_lookup_restore", phase_started);
@@ -369,12 +506,7 @@ pub fn search_place_ids(
             if let Some(bigrams) = db.bigram_data.get(start..end) {
                 for &string_idx in bigrams {
                     let string_idx = string_idx as usize;
-
-                    // SAFETY: The memdb builder guarantees string_idx is always < string_count.
-                    unsafe {
-                        let count = ctx.string_match_counts.get_unchecked_mut(string_idx);
-                        *count = count.saturating_add(1);
-                    }
+                    ctx.increment_string_match(string_idx);
                 }
             }
         }
@@ -382,18 +514,16 @@ pub fn search_place_ids(
 
         let phase_started = Instant::now();
         if !ctx.query_cache.has_exact(&query_bigrams) {
-            let clones = Arc::new(ctx.string_match_counts.clone());
+            let clones = Arc::new(ctx.snapshot_sparse_counts());
             ctx.query_cache.put(&query_bigrams, clones);
         }
         log_phase_timing("search_place_ids", "cache_store_counts", phase_started);
 
         let phase_started = Instant::now();
-        // Since we may have used a cached dense array, we must collect all non-zero matches
-        // by iterating the full dense array if touched_string_indices is big (bulk cleared).
-        // Otherwise, iterate just the touched indices.
         let mut string_matches = Vec::new();
-        for i in 0..string_count {
-            let match_count = ctx.string_match_counts[i];
+        for touched_idx in 0..ctx.touched_string_indices.len() {
+            let i = ctx.touched_string_indices[touched_idx] as usize;
+            let match_count = ctx.string_match_count(i);
             if (match_count as u16) < min_match_count {
                 continue;
             }
@@ -440,6 +570,24 @@ pub fn search_place_ids(
         );
 
         let phase_started = Instant::now();
+        if !prefix_string_ids.is_empty() {
+            ctx.string_matches.reserve(prefix_string_ids.len());
+            for &string_idx in &prefix_string_ids {
+                if (string_idx as usize) < string_count {
+                    ctx.string_matches.push(CosSimMatch {
+                        string_idx,
+                        cos_sim: 0.0,
+                    });
+                }
+            }
+            // Prefix IDs can overlap fuzzy candidates. Cosine is no longer used
+            // after this point, so deduplicate by ID before expensive scoring.
+            ctx.string_matches.sort_unstable_by_key(|m| m.string_idx);
+            ctx.string_matches.dedup_by_key(|m| m.string_idx);
+        }
+        log_phase_timing("search_place_ids", "union_prefix_candidates", phase_started);
+
+        let phase_started = Instant::now();
         let query_epoch = ctx.query_epoch;
 
         let match_snapshot: Vec<(u32, f32)> = ctx
@@ -462,27 +610,20 @@ pub fn search_place_ids(
                 continue;
             };
 
+            let prepared = cypress::models::scoring::PreparedMatchCandidate::new(string_name);
             let (match_score, matched_mask) = if is_multi_token {
                 let mut best_score = cypress::models::scoring::NO_MATCH;
                 let mut best_mask = 0u8;
-                for (phrase_bytes, mask) in &phrases {
-                    let s = cypress::models::scoring::get_match_score(
-                        string_name,
-                        phrase_bytes,
-                        &mut ctx.sift4_offset_arr,
-                    );
+                for phrase in &phrases {
+                    let s = prepared.score(&phrase.bytes, &mut ctx.sift4_offset_arr);
                     if s != cypress::models::scoring::NO_MATCH && s < best_score {
                         best_score = s;
-                        best_mask = *mask;
+                        best_mask = phrase.mask;
                     }
                 }
                 (best_score, best_mask)
             } else {
-                let s = cypress::models::scoring::get_match_score(
-                    string_name,
-                    query_tokens[0],
-                    &mut ctx.sift4_offset_arr,
-                );
+                let s = prepared.score(query_tokens[0], &mut ctx.sift4_offset_arr);
                 let mask = if s != cypress::models::scoring::NO_MATCH {
                     1u8
                 } else {

@@ -18,6 +18,25 @@ pub struct CosSimMatch {
 }
 
 const QUERY_CACHE_MAX_ENTRIES: usize = 128;
+const QUERY_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Sparse cached ScanCount state. The old cache stored one byte for every
+/// searchable string per entry, even when only a small fraction of IDs had
+/// been touched. These parallel arrays use approximately five payload bytes
+/// per touched string and can be restored without scanning the corpus.
+pub struct SparseNgramCounts {
+    pub string_ids: Vec<u32>,
+    pub counts: Vec<u8>,
+}
+
+impl SparseNgramCounts {
+    fn approx_bytes(&self) -> usize {
+        self.string_ids
+            .len()
+            .saturating_mul(std::mem::size_of::<u32>())
+            .saturating_add(self.counts.len())
+    }
+}
 
 fn is_subset(subset: &[u16], superset: &[u16]) -> bool {
     if subset.len() > superset.len() {
@@ -71,14 +90,18 @@ fn missing_elements(subset: &[u16], superset: &[u16], out: &mut Vec<u16>) {
 
 pub struct QueryNgramCache {
     max_entries: usize,
+    max_bytes: usize,
+    bytes: usize,
     insert_order: VecDeque<Vec<u16>>,
-    entries: HashMap<Vec<u16>, Arc<Vec<u8>>>,
+    entries: HashMap<Vec<u16>, Arc<SparseNgramCounts>>,
 }
 
 impl QueryNgramCache {
-    pub fn new(max_entries: usize) -> Self {
+    pub fn new(max_entries: usize, max_bytes: usize) -> Self {
         Self {
             max_entries,
+            max_bytes,
+            bytes: 0,
             insert_order: VecDeque::new(),
             entries: HashMap::new(),
         }
@@ -88,7 +111,11 @@ impl QueryNgramCache {
         self.entries.contains_key(key)
     }
 
-    pub fn get_closest_ref(&self, key: &[u16], missing: &mut Vec<u16>) -> Option<Arc<Vec<u8>>> {
+    pub fn get_closest_ref(
+        &self,
+        key: &[u16],
+        missing: &mut Vec<u16>,
+    ) -> Option<Arc<SparseNgramCounts>> {
         if let Some(exact) = self.entries.get(key) {
             missing.clear();
             return Some(exact.clone());
@@ -115,29 +142,46 @@ impl QueryNgramCache {
         None
     }
 
-    pub fn put(&mut self, key: &[u16], counts: Arc<Vec<u8>>) {
-        if self.max_entries == 0 || self.entries.contains_key(key) {
+    pub fn put(&mut self, key: &[u16], counts: Arc<SparseNgramCounts>) {
+        let entry_bytes = counts.approx_bytes();
+        if self.max_entries == 0
+            || self.max_bytes == 0
+            || entry_bytes > self.max_bytes
+            || self.entries.contains_key(key)
+        {
             return;
         }
 
         let owned_key = key.to_vec();
         self.insert_order.push_back(owned_key.clone());
         self.entries.insert(owned_key, counts);
+        self.bytes = self.bytes.saturating_add(entry_bytes);
 
-        while self.entries.len() > self.max_entries {
+        while self.entries.len() > self.max_entries || self.bytes > self.max_bytes {
             let Some(oldest) = self.insert_order.pop_front() else {
                 break;
             };
-            self.entries.remove(&oldest);
+            if let Some(removed) = self.entries.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(removed.approx_bytes());
+            }
         }
+    }
+
+    pub fn clear(&mut self) {
+        self.insert_order.clear();
+        self.entries.clear();
+        self.bytes = 0;
     }
 }
 
 pub struct GuessContext {
     pub string_match_counts: Vec<u8>,
+    pub string_match_epochs: Vec<u32>,
+    pub touched_string_indices: Vec<u32>,
     pub string_matches: Vec<CosSimMatch>,
     pub query_bigrams: Vec<u16>,
     pub query_cache: QueryNgramCache,
+    pub query_cache_version: String,
     pub query_epoch: u32,
     pub area_match_cache: Vec<(f32, u8, u8, u32)>,
     pub sift4_offset_arr: Vec<cypress::models::sift4::SiftOffset>,
@@ -146,13 +190,14 @@ pub struct GuessContext {
 
 impl GuessContext {
     pub fn new(string_count: usize, _place_count: usize) -> Self {
-        let mut string_match_counts = Vec::new();
-        string_match_counts.resize(string_count, 0);
         Self {
-            string_match_counts,
+            string_match_counts: vec![0; string_count],
+            string_match_epochs: vec![0; string_count],
+            touched_string_indices: Vec::with_capacity(16_384),
             string_matches: Vec::with_capacity(6000),
             query_bigrams: Vec::with_capacity(64),
-            query_cache: QueryNgramCache::new(QUERY_CACHE_MAX_ENTRIES),
+            query_cache: QueryNgramCache::new(QUERY_CACHE_MAX_ENTRIES, QUERY_CACHE_MAX_BYTES),
+            query_cache_version: String::new(),
             query_epoch: 1,
             area_match_cache: Vec::new(),
             sift4_offset_arr: Vec::new(),
@@ -160,28 +205,86 @@ impl GuessContext {
         }
     }
 
-    pub fn clear(&mut self, needed_string_count: usize, _needed_place_count: usize) {
-        if self.string_match_counts.len() != needed_string_count {
-            self.string_match_counts.resize(needed_string_count, 0);
-        } else {
-            self.string_match_counts.fill(0);
+    pub fn clear(
+        &mut self,
+        needed_string_count: usize,
+        _needed_place_count: usize,
+        index_version: &str,
+    ) {
+        if self.query_cache_version != index_version {
+            self.query_cache.clear();
+            self.query_cache_version.clear();
+            self.query_cache_version.push_str(index_version);
         }
 
+        if self.string_match_counts.len() != needed_string_count {
+            self.string_match_counts.resize(needed_string_count, 0);
+            self.string_match_epochs.resize(needed_string_count, 0);
+        }
+
+        self.touched_string_indices.clear();
         self.string_matches.clear();
         self.query_bigrams.clear();
         self.place_scores.clear();
-
-        self.area_match_cache.clear();
         self.sift4_offset_arr.clear();
-
-        if self.area_match_cache.is_empty() {
-            // Will be sized in search.rs
-        }
 
         self.query_epoch = self.query_epoch.wrapping_add(1);
         if self.query_epoch == 0 {
+            // Epoch zero means "never touched". A wrap is extraordinarily rare,
+            // but reset stamp-backed caches so stale entries cannot become visible.
+            self.string_match_epochs.fill(0);
+            self.area_match_cache.fill((0.0, 0, 0, 0));
             self.query_epoch = 1;
         }
+    }
+
+    #[inline]
+    pub fn increment_string_match(&mut self, string_idx: usize) {
+        if self.string_match_epochs[string_idx] != self.query_epoch {
+            self.string_match_epochs[string_idx] = self.query_epoch;
+            self.string_match_counts[string_idx] = 1;
+            self.touched_string_indices.push(string_idx as u32);
+        } else {
+            self.string_match_counts[string_idx] =
+                self.string_match_counts[string_idx].saturating_add(1);
+        }
+    }
+
+    #[inline]
+    pub fn string_match_count(&self, string_idx: usize) -> u8 {
+        if self.string_match_epochs[string_idx] == self.query_epoch {
+            self.string_match_counts[string_idx]
+        } else {
+            0
+        }
+    }
+
+    pub fn restore_sparse_counts(&mut self, cached: &SparseNgramCounts) {
+        let len = cached.string_ids.len().min(cached.counts.len());
+        for i in 0..len {
+            let string_idx = cached.string_ids[i] as usize;
+            let count = cached.counts[i];
+            if string_idx >= self.string_match_counts.len() || count == 0 {
+                continue;
+            }
+            self.string_match_epochs[string_idx] = self.query_epoch;
+            self.string_match_counts[string_idx] = count;
+            self.touched_string_indices.push(string_idx as u32);
+        }
+    }
+
+    pub fn snapshot_sparse_counts(&self) -> SparseNgramCounts {
+        let mut string_ids = Vec::with_capacity(self.touched_string_indices.len());
+        let mut counts = Vec::with_capacity(self.touched_string_indices.len());
+        for &string_id in &self.touched_string_indices {
+            let string_idx = string_id as usize;
+            let count = self.string_match_count(string_idx);
+            if count != 0 {
+                string_ids.push(string_id);
+                counts.push(count);
+            }
+        }
+        SparseNgramCounts { string_ids, counts }
     }
 }
 

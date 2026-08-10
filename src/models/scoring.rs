@@ -43,21 +43,33 @@ fn tokenize_bytes<'a>(s: &'a [u8], out: &mut Vec<&'a [u8]>) {
     }
 }
 
-fn get_token_match_score(
+#[inline]
+pub fn get_exact_match_score(query_len: usize) -> f32 {
+    -2.0 - query_len as f32 * 0.75
+}
+
+/// Score a prefix match whose prefix relationship is already known by the
+/// caller (for example, by an FST traversal). This is exactly the score that
+/// `get_token_match_score` produces without invoking SIFT4.
+pub fn get_known_prefix_match_score(dataset_token: &[u8], query: &[u8]) -> f32 {
+    if dataset_token.is_empty() || query.is_empty() || !dataset_token.starts_with(query) {
+        return NO_MATCH;
+    }
+    if dataset_token == query {
+        return get_exact_match_score(query.len());
+    }
+    let cut = &dataset_token[..query.len()];
+    finish_token_match_score(dataset_token, query, cut, 0)
+}
+
+fn finish_token_match_score(
     dataset_token: &[u8],
     query: &[u8],
-    offset_arr: &mut Vec<SiftOffset>,
+    cut: &[u8],
+    dist: usize,
 ) -> f32 {
-    if dataset_token == query {
-        return -2.0 - query.len() as f32 * 0.75;
-    }
-
-    let cut_len = dataset_token.len().min(query.len());
-    let cut = &dataset_token[..cut_len];
-    let max_dist = cut_len / 2 + 2;
-    let dist = sift4(cut, query, 3, max_dist, offset_arr);
-
-    if dist >= cut_len {
+    let cut_len = cut.len();
+    if cut_len == 0 || dist >= cut_len {
         return NO_MATCH;
     }
 
@@ -100,98 +112,173 @@ fn get_token_match_score(
     }
 }
 
-/// Scores a dataset name against a single query input.
-/// The dataset name is split into tokens and all contiguous sub-phrases
-/// (up to 4 tokens) are checked. Returns the best score, or `NO_MATCH`.
-pub fn get_match_score(dataset_name: &[u8], query: &[u8], offset_arr: &mut Vec<SiftOffset>) -> f32 {
-    if dataset_name.is_empty() || query.is_empty() {
+fn get_token_match_score(
+    dataset_token: &[u8],
+    query: &[u8],
+    offset_arr: &mut Vec<SiftOffset>,
+) -> f32 {
+    if dataset_token.is_empty() || query.is_empty() {
         return NO_MATCH;
     }
 
-    let mut s_tokens = Vec::new();
-    tokenize_bytes(dataset_name, &mut s_tokens);
-
-    let fallback = get_token_match_score(dataset_name, query, offset_arr);
-
-    if s_tokens.len() <= 1 {
-        return fallback;
+    if dataset_token == query {
+        return get_exact_match_score(query.len());
     }
 
-    let max_tokens = s_tokens.len().min(8);
-    let s_tokens = &s_tokens[..max_tokens];
+    let cut_len = dataset_token.len().min(query.len());
+    let cut = &dataset_token[..cut_len];
 
-    let mut best_score = NO_MATCH;
-    let mut best_token_bits: u8 = 0;
+    // Autocomplete fast path. When the stored alias starts with the query,
+    // `cut` is byte-for-byte equal to `query`, so SIFT4's distance is provably
+    // zero. Feed that exact distance into the existing score formula.
+    if dataset_token.starts_with(query) {
+        return get_known_prefix_match_score(dataset_token, query);
+    }
 
-    // Try all contiguous sub-phrases up to length 4
-    for from in 0..s_tokens.len() {
-        for len in 1..=4.min(s_tokens.len() - from) {
-            let to = from + len;
+    let max_dist = cut_len / 2 + 2;
+    let dist = sift4(cut, query, 3, max_dist, offset_arr);
+    finish_token_match_score(dataset_token, query, cut, dist)
+}
 
-            let token_bits: u8 = ((1u16 << to) - (1u16 << from)) as u8;
+/// Token boundaries prepared once per candidate string and then reused for
+/// every query phrase. This preserves get_match_score's scoring semantics while
+/// removing repeated delimiter scans and token-vector allocations.
+pub struct PreparedMatchCandidate<'a> {
+    dataset_name: &'a [u8],
+    token_ranges: [(usize, usize); 8],
+    token_count: usize,
+}
 
-            // Build phrase by concatenating tokens with spaces
-            let mut buf_storage = [0u8; 256];
-            let score = if len == 1 {
-                get_token_match_score(s_tokens[from], query, offset_arr)
-            } else {
-                let total_len: usize =
-                    s_tokens[from..to].iter().map(|t| t.len()).sum::<usize>() + len - 1;
+impl<'a> PreparedMatchCandidate<'a> {
+    pub fn new(dataset_name: &'a [u8]) -> Self {
+        let mut token_ranges = [(0usize, 0usize); 8];
+        let mut token_count = 0usize;
+        let mut i = 0usize;
 
-                if total_len <= buf_storage.len() {
-                    let mut buf_len = 0;
-                    for (i, t) in s_tokens[from..to].iter().enumerate() {
-                        if i > 0 {
-                            buf_storage[buf_len] = b' ';
-                            buf_len += 1;
-                        }
-                        buf_storage[buf_len..buf_len + t.len()].copy_from_slice(t);
-                        buf_len += t.len();
-                    }
-                    get_token_match_score(&buf_storage[..buf_len], query, offset_arr)
+        while i < dataset_name.len() && token_count < token_ranges.len() {
+            while i < dataset_name.len() && is_delimiter(dataset_name[i]) {
+                i += 1;
+            }
+            if i >= dataset_name.len() {
+                break;
+            }
+
+            let start = i;
+            while i < dataset_name.len() && !is_delimiter(dataset_name[i]) {
+                i += 1;
+            }
+            token_ranges[token_count] = (start, i);
+            token_count += 1;
+        }
+
+        Self {
+            dataset_name,
+            token_ranges,
+            token_count,
+        }
+    }
+
+    #[inline]
+    fn token(&self, idx: usize) -> &'a [u8] {
+        let (start, end) = self.token_ranges[idx];
+        &self.dataset_name[start..end]
+    }
+
+    /// Scores this prepared dataset name against one query phrase.
+    pub fn score(&self, query: &[u8], offset_arr: &mut Vec<SiftOffset>) -> f32 {
+        if self.dataset_name.is_empty() || query.is_empty() {
+            return NO_MATCH;
+        }
+
+        let fallback = get_token_match_score(self.dataset_name, query, offset_arr);
+
+        if self.token_count <= 1 {
+            return fallback;
+        }
+
+        let mut best_score = NO_MATCH;
+        let mut best_token_bits: u8 = 0;
+
+        // Try all contiguous sub-phrases up to length 4. The same stack buffer
+        // behavior as get_match_score is retained; only tokenization is reused.
+        for from in 0..self.token_count {
+            for len in 1..=4.min(self.token_count - from) {
+                let to = from + len;
+                let token_bits: u8 = ((1u16 << to) - (1u16 << from)) as u8;
+
+                let mut buf_storage = [0u8; 256];
+                let score = if len == 1 {
+                    get_token_match_score(self.token(from), query, offset_arr)
                 } else {
-                    let mut fallback = Vec::with_capacity(total_len);
-                    for (i, t) in s_tokens[from..to].iter().enumerate() {
-                        if i > 0 {
-                            fallback.push(b' ');
+                    let total_len: usize = (from..to)
+                        .map(|idx| self.token(idx).len())
+                        .sum::<usize>()
+                        + len
+                        - 1;
+
+                    if total_len <= buf_storage.len() {
+                        let mut buf_len = 0;
+                        for idx in from..to {
+                            if idx != from {
+                                buf_storage[buf_len] = b' ';
+                                buf_len += 1;
+                            }
+                            let token = self.token(idx);
+                            buf_storage[buf_len..buf_len + token.len()].copy_from_slice(token);
+                            buf_len += token.len();
                         }
-                        fallback.extend_from_slice(t);
+                        get_token_match_score(&buf_storage[..buf_len], query, offset_arr)
+                    } else {
+                        let mut phrase = Vec::with_capacity(total_len);
+                        for idx in from..to {
+                            if idx != from {
+                                phrase.push(b' ');
+                            }
+                            phrase.extend_from_slice(self.token(idx));
+                        }
+                        get_token_match_score(&phrase, query, offset_arr)
                     }
-                    get_token_match_score(&fallback, query, offset_arr)
+                };
+
+                if score < best_score {
+                    best_score = score;
+                    best_token_bits = token_bits;
                 }
-            };
-            if score < best_score {
-                best_score = score;
-                best_token_bits = token_bits;
             }
         }
-    }
 
-    if best_score == NO_MATCH {
-        return NO_MATCH;
-    }
+        if best_score == NO_MATCH {
+            return NO_MATCH;
+        }
 
-    let mut sum = best_score;
-    let mut n_not_matched = 0u32;
-    for (s_idx, token) in s_tokens.iter().enumerate() {
-        if (best_token_bits & (1 << s_idx)) == 0 {
-            n_not_matched += 1;
-            let penalty = (token.len() as f32 / 4.0).clamp(0.75, 3.0);
-            sum += penalty;
+        let mut sum = best_score;
+        let mut n_not_matched = 0u32;
+        for s_idx in 0..self.token_count {
+            if (best_token_bits & (1 << s_idx)) == 0 {
+                n_not_matched += 1;
+                let penalty = (self.token(s_idx).len() as f32 / 4.0).clamp(0.75, 3.0);
+                sum += penalty;
+            }
+        }
+
+        if n_not_matched as usize == self.token_count {
+            return NO_MATCH;
+        }
+
+        let max = (self.dataset_name.len().min(query.len()) as f32 / 2.0).ceil();
+        let score = fallback.min(sum);
+        if score >= max {
+            NO_MATCH
+        } else {
+            score
         }
     }
+}
 
-    if n_not_matched as usize == s_tokens.len() {
-        return NO_MATCH;
-    }
-
-    let max = (dataset_name.len().min(query.len()) as f32 / 2.0).ceil();
-    let score = fallback.min(sum);
-    if score >= max {
-        NO_MATCH
-    } else {
-        score
-    }
+/// Scores a dataset name against a single query input.
+/// Kept as a compatibility wrapper for existing callers and tests.
+pub fn get_match_score(dataset_name: &[u8], query: &[u8], offset_arr: &mut Vec<SiftOffset>) -> f32 {
+    PreparedMatchCandidate::new(dataset_name).score(query, offset_arr)
 }
 
 /// ADR-style category bonus for place types based on layer rank.

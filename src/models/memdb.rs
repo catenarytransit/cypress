@@ -106,6 +106,10 @@ pub struct CypressMemDb {
     pub string_name_offsets: Vec<u32>,
     pub string_name_bytes: Vec<u8>,
 
+    // Minimal FST: normalized multilingual place alias -> string ID.
+    // Stored as bytes so the query process can borrow it directly from the mmap.
+    pub prefix_fst_bytes: Vec<u8>,
+
     // ==== Area-Set Hierarchy (ADR-aligned) ====
     // Area name bytes: area_name_bytes[area_name_offsets[i]..area_name_offsets[i+1]]
     pub area_name_offsets: Vec<u32>,
@@ -113,6 +117,13 @@ pub struct CypressMemDb {
 
     pub area_admin_levels: Vec<u8>,
     pub area_populations: Vec<u32>,
+
+    // Minimal FST: normalized multilingual admin alias -> alias-group index.
+    // An alias can name multiple administrative areas (for example, "georgia"),
+    // so the FST value indexes the flattened alias -> area-ID arrays below.
+    pub admin_alias_fst_bytes: Vec<u8>,
+    pub admin_alias_area_offsets: Vec<u32>,
+    pub admin_alias_area_data: Vec<u32>,
 
     // Area sets (deduplicated): area_set_data[area_set_offsets[i]..area_set_offsets[i+1]]
     pub area_set_offsets: Vec<u32>,

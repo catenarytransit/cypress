@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
+use fst::MapBuilder;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use memmap2::MmapOptions;
 use std::collections::HashMap;
@@ -665,7 +666,7 @@ async fn main() -> Result<()> {
     let all_area_ids_vec: Vec<String> = all_area_ids.into_iter().collect();
 
     // Process in batches (ScyllaDB IN clause has limits)
-    let mut admin_area_data: HashMap<String, (String, u32)> = HashMap::new();
+    let mut admin_area_data: HashMap<String, (String, Vec<String>, u32)> = HashMap::new();
     let batch_size = 10;
 
     for chunk in all_area_ids_vec.chunks(batch_size) {
@@ -680,18 +681,37 @@ async fn main() -> Result<()> {
                         serde_json::from_str::<cypress::models::admin::AdminEntryScylla>(&json_data)
                     {
                         let admin_entry = cypress::models::admin::AdminEntry::from_scylla(entry);
-                        let name = admin_entry
+                        let primary_name = admin_entry
                             .name
-                            .clone()
-                            .or_else(|| admin_entry.names.get("default").cloned())
-                            .or_else(|| admin_entry.names.values().next().cloned())
+                            .as_deref()
+                            .or_else(|| admin_entry.names.get("default").map(String::as_str))
+                            .or_else(|| admin_entry.names.values().next().map(String::as_str))
                             .unwrap_or_default()
                             .trim()
                             .to_lowercase();
+
+                        let mut aliases = HashSet::new();
+                        for alias in admin_entry
+                            .names
+                            .values()
+                            .chain(admin_entry.name.iter())
+                            .chain(admin_entry.abbr.iter())
+                        {
+                            let alias = alias.trim().to_lowercase();
+                            if !alias.is_empty() {
+                                aliases.insert(alias);
+                            }
+                        }
+                        if !primary_name.is_empty() {
+                            aliases.insert(primary_name.clone());
+                        }
+                        let mut aliases: Vec<String> = aliases.into_iter().collect();
+                        aliases.sort();
+
                         let population = decompress_population(compressed_population)
                             .or(admin_entry.population)
                             .unwrap_or(0);
-                        admin_area_data.insert(id, (name, population));
+                        admin_area_data.insert(id, (primary_name, aliases, population));
                     }
                 }
             }
@@ -720,7 +740,7 @@ async fn main() -> Result<()> {
     sorted_area_ids.sort();
 
     for area_id in &sorted_area_ids {
-        let (name, population) = admin_area_data.get(area_id).unwrap();
+        let (name, _aliases, population) = admin_area_data.get(area_id).unwrap();
         let area_idx = area_id_to_idx.len() as u32;
         area_id_to_idx.insert(area_id.clone(), area_idx);
 
@@ -733,6 +753,48 @@ async fn main() -> Result<()> {
     }
 
     info!("Built {} area entries", area_id_to_idx.len());
+
+    // Build a multilingual admin-alias FST. FST values point to groups because
+    // an alias may resolve to multiple administrative areas.
+    info!("Building multilingual admin alias FST");
+    let mut alias_to_areas: HashMap<String, Vec<u32>> = HashMap::new();
+    for area_id in &sorted_area_ids {
+        let Some(&area_idx) = area_id_to_idx.get(area_id) else {
+            continue;
+        };
+        let Some((_name, aliases, _population)) = admin_area_data.get(area_id) else {
+            continue;
+        };
+        for alias in aliases {
+            alias_to_areas
+                .entry(alias.clone())
+                .or_default()
+                .push(area_idx);
+        }
+    }
+
+    let mut admin_aliases: Vec<(String, Vec<u32>)> = alias_to_areas.into_iter().collect();
+    admin_aliases.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+    let mut admin_alias_area_offsets = Vec::with_capacity(admin_aliases.len() + 1);
+    let mut admin_alias_area_data = Vec::new();
+    let mut admin_alias_builder = MapBuilder::memory();
+    admin_alias_area_offsets.push(0);
+
+    for (group_idx, (alias, mut area_ids)) in admin_aliases.into_iter().enumerate() {
+        area_ids.sort_unstable();
+        area_ids.dedup();
+        admin_alias_builder.insert(alias.as_bytes(), group_idx as u64)?;
+        admin_alias_area_data.extend_from_slice(&area_ids);
+        admin_alias_area_offsets.push(admin_alias_area_data.len() as u32);
+    }
+    let admin_alias_fst_bytes = admin_alias_builder.into_inner()?;
+
+    info!(
+        "Built multilingual admin alias FST ({} bytes, {} alias groups)",
+        admin_alias_fst_bytes.len(),
+        admin_alias_area_offsets.len().saturating_sub(1)
+    );
 
     // === Pass 1.5b: Spill compact (global_place_id, area_idx) pairs ===
     info!(
@@ -1034,6 +1096,36 @@ async fn main() -> Result<()> {
 
     string_to_places_offsets.push(string_to_places_data.len() as u32);
 
+    // Build a minimal FST over every searchable place alias. The term spill
+    // already contains every place.name language variant plus place.phrase, so
+    // this is multilingual without selecting a canonical language. Sort only
+    // u32 IDs here; the strings remain in the compact string_name byte arena.
+    info!("Building multilingual place-prefix FST");
+    let mut prefix_string_ids: Vec<u32> = (0..next_string_id).collect();
+    prefix_string_ids.sort_unstable_by(|&a, &b| {
+        let a = a as usize;
+        let b = b as usize;
+        let a_start = string_name_offsets[a] as usize;
+        let a_end = string_name_offsets[a + 1] as usize;
+        let b_start = string_name_offsets[b] as usize;
+        let b_end = string_name_offsets[b + 1] as usize;
+        string_name_bytes[a_start..a_end].cmp(&string_name_bytes[b_start..b_end])
+    });
+
+    let mut prefix_builder = MapBuilder::memory();
+    for string_id in prefix_string_ids {
+        let sid = string_id as usize;
+        let start = string_name_offsets[sid] as usize;
+        let end = string_name_offsets[sid + 1] as usize;
+        prefix_builder.insert(&string_name_bytes[start..end], string_id as u64)?;
+    }
+    let prefix_fst_bytes = prefix_builder.into_inner()?;
+    info!(
+        "Built multilingual place-prefix FST ({} bytes, {} aliases)",
+        prefix_fst_bytes.len(),
+        next_string_id
+    );
+
     for writer in bigram_shard_writers.values_mut() {
         writer.flush()?;
     }
@@ -1131,10 +1223,14 @@ async fn main() -> Result<()> {
         place_populations,
         string_name_offsets,
         string_name_bytes,
+        prefix_fst_bytes,
         area_name_offsets,
         area_name_bytes,
         area_admin_levels,
         area_populations,
+        admin_alias_fst_bytes,
+        admin_alias_area_offsets,
+        admin_alias_area_data,
         area_set_offsets,
         area_set_data,
         place_area_sets,
