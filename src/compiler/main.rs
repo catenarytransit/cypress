@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
-use fst::MapBuilder;
+use fst::{Map, MapBuilder};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use memmap2::MmapOptions;
 use std::collections::HashMap;
@@ -18,6 +18,7 @@ use xxhash_rust::xxh64::xxh64;
 
 use cypress::models::memdb::{CypressMemDb, PlaceRecord, PLACE_RECORD_DISK_BYTES};
 use cypress::models::normalized::NormalizedPlace;
+use cypress::models::place::Address;
 use cypress::models::population::decompress_population;
 use cypress::scylla::ScyllaClient;
 use rkyv::ser::{
@@ -26,8 +27,10 @@ use rkyv::ser::{
 };
 
 const TERM_BUCKETS: usize = 128;
+const ADDRESS_BUCKETS: usize = 512;
 const BIGRAM_SHARDS: usize = 256;
 const HIERARCHY_PAIR_BUCKETS: usize = 512;
+const STRING_ONLY_TERM_PLACE_ID: u32 = u32::MAX;
 
 #[derive(Parser, Debug)]
 #[command(name = "compiler")]
@@ -92,7 +95,36 @@ struct WorkerSpill {
     place_file: PathBuf,
     term_file: PathBuf,
     parent_file: PathBuf,
+    address_file: PathBuf,
     place_count: u32,
+}
+
+#[derive(Debug)]
+struct AddressBucketEntry {
+    place_id: u32,
+    area_set: u32,
+    anchor: String,
+    house_number: String,
+    postcode: String,
+}
+
+fn address_anchor(address: &Address) -> Option<&str> {
+    address.street.as_deref().or(address.place.as_deref())
+}
+
+fn address_display_name(address: &Address) -> Option<String> {
+    let anchor = address_anchor(address)?.trim();
+    if anchor.is_empty() {
+        return None;
+    }
+    match address.housenumber.as_deref().map(str::trim) {
+        Some(house) if !house.is_empty() => Some(format!("{} {}", house, anchor)),
+        _ => Some(anchor.to_string()),
+    }
+}
+
+fn normalize_address_component(value: &str) -> String {
+    value.trim().to_lowercase()
 }
 
 fn read_exact_or_eof<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<bool> {
@@ -157,6 +189,91 @@ fn read_term_entry<R: Read>(reader: &mut R) -> Result<Option<(u32, String)>> {
 
     let phrase = String::from_utf8(phrase_bytes).context("Invalid UTF-8 in term spill")?;
     Ok(Some((place_id, phrase)))
+}
+
+fn write_len_prefixed_string<W: Write>(writer: &mut W, value: &str) -> Result<()> {
+    let bytes = value.as_bytes();
+    writer.write_all(&(bytes.len() as u32).to_le_bytes())?;
+    writer.write_all(bytes)?;
+    Ok(())
+}
+
+fn read_len_prefixed_string<R: Read>(reader: &mut R) -> Result<String> {
+    let mut len_buf = [0u8; 4];
+    if !read_exact_or_eof(reader, &mut len_buf)? {
+        return Err(anyhow!("Unexpected EOF reading address string length"));
+    }
+    let len = u32::from_le_bytes(len_buf) as usize;
+    let mut bytes = vec![0u8; len];
+    if len > 0 && !read_exact_or_eof(reader, &mut bytes)? {
+        return Err(anyhow!("Unexpected EOF reading address string bytes"));
+    }
+    String::from_utf8(bytes).context("Invalid UTF-8 in address spill")
+}
+
+fn write_worker_address_entry<W: Write>(
+    writer: &mut W,
+    local_place_id: u32,
+    anchor: &str,
+    house_number: &str,
+    postcode: &str,
+) -> Result<()> {
+    writer.write_all(&local_place_id.to_le_bytes())?;
+    write_len_prefixed_string(writer, anchor)?;
+    write_len_prefixed_string(writer, house_number)?;
+    write_len_prefixed_string(writer, postcode)?;
+    Ok(())
+}
+
+fn read_worker_address_entry<R: Read>(
+    reader: &mut R,
+) -> Result<Option<(u32, String, String, String)>> {
+    let mut place_buf = [0u8; 4];
+    if !read_exact_or_eof(reader, &mut place_buf)? {
+        return Ok(None);
+    }
+    Ok(Some((
+        u32::from_le_bytes(place_buf),
+        read_len_prefixed_string(reader)?,
+        read_len_prefixed_string(reader)?,
+        read_len_prefixed_string(reader)?,
+    )))
+}
+
+fn write_address_bucket_entry<W: Write>(
+    writer: &mut W,
+    place_id: u32,
+    area_set: u32,
+    anchor: &str,
+    house_number: &str,
+    postcode: &str,
+) -> Result<()> {
+    writer.write_all(&place_id.to_le_bytes())?;
+    writer.write_all(&area_set.to_le_bytes())?;
+    write_len_prefixed_string(writer, anchor)?;
+    write_len_prefixed_string(writer, house_number)?;
+    write_len_prefixed_string(writer, postcode)?;
+    Ok(())
+}
+
+fn read_address_bucket_entry<R: Read>(reader: &mut R) -> Result<Option<AddressBucketEntry>> {
+    let mut place_buf = [0u8; 4];
+    if !read_exact_or_eof(reader, &mut place_buf)? {
+        return Ok(None);
+    }
+
+    let mut area_buf = [0u8; 4];
+    if !read_exact_or_eof(reader, &mut area_buf)? {
+        return Err(anyhow!("Unexpected EOF reading address area set"));
+    }
+
+    Ok(Some(AddressBucketEntry {
+        place_id: u32::from_le_bytes(place_buf),
+        area_set: u32::from_le_bytes(area_buf),
+        anchor: read_len_prefixed_string(reader)?,
+        house_number: read_len_prefixed_string(reader)?,
+        postcode: read_len_prefixed_string(reader)?,
+    }))
 }
 
 fn write_bigram_pair<W: Write>(writer: &mut W, bigram: u16, string_id: u32) -> Result<()> {
@@ -275,6 +392,7 @@ async fn fetch_range_to_spill(
     place_file: &Path,
     term_file: &Path,
     parent_file: &Path,
+    address_file: &Path,
 ) -> Result<u32> {
     let query = format!(
         "SELECT data, population FROM cypress.places WHERE token(id) >= {} AND token(id) < {}",
@@ -295,6 +413,12 @@ async fn fetch_range_to_spill(
         format!(
             "Failed to create parent spill file: {}",
             parent_file.display()
+        )
+    })?);
+    let mut address_writer = BufWriter::new(File::create(address_file).with_context(|| {
+        format!(
+            "Failed to create address spill file: {}",
+            address_file.display()
         )
     })?);
 
@@ -322,6 +446,7 @@ async fn fetch_range_to_spill(
             .clone()
             .or_else(|| place.name.get("default").cloned())
             .or_else(|| place.name.values().next().cloned())
+            .or_else(|| place.address.as_ref().and_then(address_display_name))
             .unwrap_or_default();
 
         let mut record = PlaceRecord {
@@ -351,6 +476,27 @@ async fn fetch_range_to_spill(
         record.name_len = name_len as u8;
 
         write_place_record(&mut place_writer, &record)?;
+
+        // Keep the address relation structured. Only the street/address-anchor
+        // enters the global string dictionary later; house numbers and
+        // postcodes remain local to the street group.
+        if let Some(address) = place.address.as_ref() {
+            if let (Some(anchor), Some(house_number)) =
+                (address_anchor(address), address.housenumber.as_deref())
+            {
+                let anchor = anchor.trim();
+                let house_number = house_number.trim();
+                if !anchor.is_empty() && !house_number.is_empty() {
+                    write_worker_address_entry(
+                        &mut address_writer,
+                        local_place_id,
+                        anchor,
+                        house_number,
+                        address.postcode.as_deref().unwrap_or(""),
+                    )?;
+                }
+            }
+        }
 
         let mut phrases = HashSet::new();
         for p in place.name.values().chain(place.phrase.iter()) {
@@ -390,6 +536,7 @@ async fn fetch_range_to_spill(
     place_writer.flush()?;
     term_writer.flush()?;
     parent_writer.flush()?;
+    address_writer.flush()?;
     Ok(local_place_id)
 }
 
@@ -464,6 +611,8 @@ async fn main() -> Result<()> {
                 let place_file = run_tmp_dir.join(format!("worker_{:08}.places.bin", worker_id));
                 let term_file = run_tmp_dir.join(format!("worker_{:08}.terms.bin", worker_id));
                 let parent_file = run_tmp_dir.join(format!("worker_{:08}.parents.bin", worker_id));
+                let address_file =
+                    run_tmp_dir.join(format!("worker_{:08}.addresses.bin", worker_id));
 
                 let mut attempt = 0u32;
                 let place_count = loop {
@@ -475,6 +624,7 @@ async fn main() -> Result<()> {
                         &place_file,
                         &term_file,
                         &parent_file,
+                        &address_file,
                     )
                     .await
                     {
@@ -508,6 +658,7 @@ async fn main() -> Result<()> {
                     place_file,
                     term_file,
                     parent_file,
+                    address_file,
                     place_count,
                 });
 
@@ -960,6 +1111,14 @@ async fn main() -> Result<()> {
     fs::create_dir_all(&term_bucket_dir)?;
     let mut term_bucket_writers: HashMap<usize, BufWriter<File>> = HashMap::new();
 
+    info!(
+        "Distributing structured addresses into {} street-group buckets",
+        ADDRESS_BUCKETS
+    );
+    let address_bucket_dir = run_tmp_dir.join("address_buckets");
+    fs::create_dir_all(&address_bucket_dir)?;
+    let mut address_bucket_writers: HashMap<usize, BufWriter<File>> = HashMap::new();
+
     for (spill, global_offset) in &worker_offsets {
         let mut reader = BufReader::new(File::open(&spill.term_file).with_context(|| {
             format!(
@@ -986,7 +1145,75 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Address anchors are string-only terms: they participate in the same FST
+    // and bigram dictionary as place aliases, but do not directly expand to all
+    // houses on that street. Instead they point to compact street groups built
+    // below, which prevents common street names from exploding place postings.
+    for (spill, global_offset) in &worker_offsets {
+        if !spill.address_file.exists() || fs::metadata(&spill.address_file)?.len() == 0 {
+            continue;
+        }
+
+        let mut reader = BufReader::new(File::open(&spill.address_file).with_context(|| {
+            format!(
+                "Failed to open address spill file: {}",
+                spill.address_file.display()
+            )
+        })?);
+
+        while let Some((local_place_id, anchor, house_number, postcode)) =
+            read_worker_address_entry(&mut reader)?
+        {
+            if local_place_id >= spill.place_count {
+                return Err(anyhow!(
+                    "Corrupt address spill {}: local place id {} >= {}",
+                    spill.address_file.display(),
+                    local_place_id,
+                    spill.place_count
+                ));
+            }
+
+            let global_place_id = global_offset + local_place_id;
+            let area_set = place_area_sets[global_place_id as usize];
+            let anchor = normalize_address_component(&anchor);
+            let house_number = normalize_address_component(&house_number);
+            let postcode = normalize_address_component(&postcode);
+            if anchor.is_empty() || house_number.is_empty() {
+                continue;
+            }
+
+            let term_bucket = (xxh64(anchor.as_bytes(), 0) as usize) % TERM_BUCKETS;
+            let term_writer = get_or_create_writer(
+                &mut term_bucket_writers,
+                &term_bucket_dir,
+                "terms",
+                term_bucket,
+            )?;
+            write_term_entry(term_writer, STRING_ONLY_TERM_PLACE_ID, &anchor)?;
+
+            let address_hash = xxh64(&area_set.to_le_bytes(), xxh64(anchor.as_bytes(), 0));
+            let address_bucket = (address_hash as usize) % ADDRESS_BUCKETS;
+            let address_writer = get_or_create_writer(
+                &mut address_bucket_writers,
+                &address_bucket_dir,
+                "addresses",
+                address_bucket,
+            )?;
+            write_address_bucket_entry(
+                address_writer,
+                global_place_id,
+                area_set,
+                &anchor,
+                &house_number,
+                &postcode,
+            )?;
+        }
+    }
+
     for writer in term_bucket_writers.values_mut() {
+        writer.flush()?;
+    }
+    for writer in address_bucket_writers.values_mut() {
         writer.flush()?;
     }
 
@@ -1036,6 +1263,10 @@ async fn main() -> Result<()> {
             let mut last_place = None::<u32>;
             while i < entries.len() && entries[i].0 == phrase {
                 let place_id = entries[i].1;
+                if place_id == STRING_ONLY_TERM_PLACE_ID {
+                    i += 1;
+                    continue;
+                }
                 if last_place != Some(place_id) {
                     let lat2 = place_latitudes[place_id as usize];
                     let lon2 = place_longitudes[place_id as usize];
@@ -1126,6 +1357,135 @@ async fn main() -> Result<()> {
         next_string_id
     );
 
+    // === Pass 2a.5: Build structured street -> house index ===
+    // Each address bucket contains complete (anchor, area_set) groups, so only
+    // one bucket must be resident at a time. This keeps compiler memory bounded
+    // by the largest hash bucket rather than by the number of addresses.
+    info!("Building structured address index");
+    let prefix_map = Map::new(prefix_fst_bytes.as_slice())
+        .context("Failed to reopen place/street prefix FST")?;
+
+    let mut street_name_string_ids = Vec::<u32>::new();
+    let mut street_area_sets = Vec::<u32>::new();
+    let mut street_house_offsets = Vec::<u32>::new();
+    let mut house_street_groups = Vec::<u32>::new();
+    let mut house_number_offsets = Vec::<u32>::new();
+    let mut house_number_bytes = Vec::<u8>::new();
+    let mut house_postcode_offsets = Vec::<u32>::new();
+    let mut house_postcode_bytes = Vec::<u8>::new();
+    let mut house_place_ids = Vec::<u32>::new();
+    let mut place_address_house_indices = vec![u32::MAX; total_places as usize];
+    let mut string_to_street_pairs = Vec::<(u32, u32)>::new();
+
+    street_house_offsets.push(0);
+    house_number_offsets.push(0);
+    house_postcode_offsets.push(0);
+
+    for bucket in 0..ADDRESS_BUCKETS {
+        let bucket_path = address_bucket_dir.join(format!("addresses_{:03}.bin", bucket));
+        if !bucket_path.exists() || fs::metadata(&bucket_path)?.len() == 0 {
+            continue;
+        }
+
+        let mut reader = BufReader::new(File::open(&bucket_path).with_context(|| {
+            format!("Failed to open address bucket: {}", bucket_path.display())
+        })?);
+        let mut entries = Vec::<AddressBucketEntry>::new();
+        while let Some(entry) = read_address_bucket_entry(&mut reader)? {
+            entries.push(entry);
+        }
+
+        entries.sort_unstable_by(|a, b| {
+            a.anchor
+                .cmp(&b.anchor)
+                .then(a.area_set.cmp(&b.area_set))
+                .then(a.house_number.cmp(&b.house_number))
+                .then(a.postcode.cmp(&b.postcode))
+                .then(a.place_id.cmp(&b.place_id))
+        });
+
+        let mut i = 0usize;
+        while i < entries.len() {
+            let anchor = entries[i].anchor.clone();
+            let area_set = entries[i].area_set;
+            let string_id = prefix_map.get(anchor.as_bytes()).ok_or_else(|| {
+                anyhow!(
+                    "Address anchor {:?} missing from compiled string dictionary",
+                    anchor
+                )
+            })? as u32;
+
+            let street_group_id = street_name_string_ids.len() as u32;
+            street_name_string_ids.push(string_id);
+            street_area_sets.push(area_set);
+            string_to_street_pairs.push((string_id, street_group_id));
+
+            while i < entries.len()
+                && entries[i].anchor == anchor
+                && entries[i].area_set == area_set
+            {
+                let entry = &entries[i];
+                if entry.place_id >= total_places {
+                    return Err(anyhow!(
+                        "Corrupt address bucket {}: place id {} >= {}",
+                        bucket_path.display(),
+                        entry.place_id,
+                        total_places
+                    ));
+                }
+
+                let house_idx = house_place_ids.len() as u32;
+                house_street_groups.push(street_group_id);
+                house_place_ids.push(entry.place_id);
+
+                house_number_bytes.extend_from_slice(entry.house_number.as_bytes());
+                house_number_offsets.push(house_number_bytes.len() as u32);
+
+                house_postcode_bytes.extend_from_slice(entry.postcode.as_bytes());
+                house_postcode_offsets.push(house_postcode_bytes.len() as u32);
+
+                let reverse_slot = &mut place_address_house_indices[entry.place_id as usize];
+                if *reverse_slot == u32::MAX {
+                    *reverse_slot = house_idx;
+                }
+
+                i += 1;
+            }
+
+            street_house_offsets.push(house_place_ids.len() as u32);
+        }
+    }
+    drop(prefix_map);
+
+    string_to_street_pairs.sort_unstable();
+    string_to_street_pairs.dedup();
+
+    let mut string_to_street_offsets = Vec::with_capacity(next_string_id as usize + 1);
+    let mut string_to_street_data = Vec::<u32>::with_capacity(string_to_street_pairs.len());
+    let mut pair_idx = 0usize;
+    for string_id in 0..next_string_id {
+        string_to_street_offsets.push(string_to_street_data.len() as u32);
+        while pair_idx < string_to_street_pairs.len()
+            && string_to_street_pairs[pair_idx].0 == string_id
+        {
+            string_to_street_data.push(string_to_street_pairs[pair_idx].1);
+            pair_idx += 1;
+        }
+    }
+    string_to_street_offsets.push(string_to_street_data.len() as u32);
+
+    if pair_idx != string_to_street_pairs.len() {
+        return Err(anyhow!(
+            "Address string mapping contains out-of-range string IDs"
+        ));
+    }
+
+    info!(
+        "Built {} street groups containing {} houses",
+        street_name_string_ids.len(),
+        house_place_ids.len()
+    );
+
     for writer in bigram_shard_writers.values_mut() {
         writer.flush()?;
     }
@@ -1214,6 +1574,8 @@ async fn main() -> Result<()> {
         bigram_data,
         string_to_places_offsets,
         string_to_places_data,
+        string_to_street_offsets,
+        string_to_street_data,
         place_latitudes,
         place_longitudes,
         place_importances,
@@ -1234,6 +1596,16 @@ async fn main() -> Result<()> {
         area_set_offsets,
         area_set_data,
         place_area_sets,
+        street_name_string_ids,
+        street_area_sets,
+        street_house_offsets,
+        house_street_groups,
+        house_number_offsets,
+        house_number_bytes,
+        house_postcode_offsets,
+        house_postcode_bytes,
+        house_place_ids,
+        place_address_house_indices,
         active_cells,
         cell_offsets,
         cell_places,

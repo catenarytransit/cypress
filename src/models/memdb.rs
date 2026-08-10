@@ -90,6 +90,12 @@ pub struct CypressMemDb {
     pub string_to_places_offsets: Vec<u32>,
     pub string_to_places_data: Vec<u32>,
 
+    // string ID -> geographically scoped street/address-anchor group IDs.
+    // Street names share the same multilingual/fuzzy string dictionary as
+    // place names, but house numbers never enter the global fuzzy index.
+    pub string_to_street_offsets: Vec<u32>,
+    pub string_to_street_data: Vec<u32>,
+
     // ==== Structure of Arrays (SoA) for Places ====
     pub place_latitudes: Vec<f32>,
     pub place_longitudes: Vec<f32>,
@@ -131,6 +137,39 @@ pub struct CypressMemDb {
 
     // place_idx → area_set_idx
     pub place_area_sets: Vec<u32>,
+
+    // ==== Structured Address Index ====
+    // A street group is keyed at compile time by
+    // (normalized address anchor, place area-set). This keeps common names such
+    // as "main street" from becoming a single world-wide linear house list.
+    //
+    // street_group -> string ID in string_name_*
+    pub street_name_string_ids: Vec<u32>,
+    // street_group -> area_set_idx
+    pub street_area_sets: Vec<u32>,
+    // street_group -> range in house_* arrays. len = street_count + 1.
+    pub street_house_offsets: Vec<u32>,
+
+    // house_idx -> owning street_group
+    pub house_street_groups: Vec<u32>,
+    // Lexicographically sorted normalized house numbers within each street
+    // group. This supports O(log H_s) exact lookup for a street containing H_s
+    // houses.
+    pub house_number_offsets: Vec<u32>,
+    pub house_number_bytes: Vec<u8>,
+
+    // Normalized postcode for structural ranking. Empty slice means unknown.
+    pub house_postcode_offsets: Vec<u32>,
+    pub house_postcode_bytes: Vec<u8>,
+
+    // house_idx -> existing Cypress place ID. Coordinates, source ID, POI name,
+    // categories and hierarchy are therefore not duplicated by the address
+    // index.
+    pub house_place_ids: Vec<u32>,
+
+    // Dense O(1) reverse link used by the query planner so a name/POI candidate
+    // can also be scored against its address. u32::MAX means no indexed house.
+    pub place_address_house_indices: Vec<u32>,
 
     // ==== Sparse Spatial Grid ====
     // Sorted array of cell IDs that contain at least one place

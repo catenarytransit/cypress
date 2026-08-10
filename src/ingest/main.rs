@@ -918,6 +918,8 @@ fn extract_tags(place: &mut Place, tags: &osmpbfreader::Tags) {
             place.address.get_or_insert_with(Address::default).street = Some(value.to_string());
         } else if key_str == "addr:postcode" {
             place.address.get_or_insert_with(Address::default).postcode = Some(value.to_string());
+        } else if key_str == "addr:place" {
+            place.address.get_or_insert_with(Address::default).place = Some(value.to_string());
         } else if key_str == "addr:city" {
             place.address.get_or_insert_with(Address::default).city = Some(value.to_string());
         }
@@ -991,15 +993,22 @@ fn determine_layer(tags: &osmpbfreader::Tags) -> Option<Layer> {
             None
         }
     } else {
-        // Venues/Addresses
-        if tags.contains_key("addr:housenumber") && tags.contains_key("addr:street") {
-            Some(Layer::Address)
-        } else if tags.contains_key("amenity")
+        // Preserve POI identity even when the object also carries a complete
+        // address. The structured address index is independent of Layer, so a
+        // restaurant/hotel/shop can be found both by name and by address while
+        // still behaving as a Venue for existing POI clients.
+        let is_venue = tags.contains_key("amenity")
             || tags.contains_key("shop")
             || tags.contains_key("tourism")
-            || tags.contains_key("leisure")
-        {
+            || tags.contains_key("leisure");
+
+        let has_address_anchor = tags.contains_key("addr:street") || tags.contains_key("addr:place");
+        let is_address = tags.contains_key("addr:housenumber") && has_address_anchor;
+
+        if is_venue {
             Some(Layer::Venue)
+        } else if is_address {
+            Some(Layer::Address)
         } else {
             None
         }
@@ -1064,4 +1073,49 @@ async fn upsert_admin_areas(place: &Place, scylla: &ScyllaClient) -> Result<()> 
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod address_tests {
+    use super::*;
+
+    #[test]
+    fn addr_place_without_street_is_an_address() {
+        let mut tags = osmpbfreader::Tags::new();
+        tags.insert("addr:housenumber".into(), "12".into());
+        tags.insert("addr:place".into(), "zh.k. Mladost".into());
+
+        assert_eq!(determine_layer(&tags), Some(Layer::Address));
+    }
+
+    #[test]
+    fn poi_with_address_remains_a_venue() {
+        let mut tags = osmpbfreader::Tags::new();
+        tags.insert("amenity".into(), "restaurant".into());
+        tags.insert("addr:housenumber".into(), "10".into());
+        tags.insert("addr:street".into(), "Main Street".into());
+
+        assert_eq!(determine_layer(&tags), Some(Layer::Venue));
+    }
+
+    #[test]
+    fn extract_tags_preserves_addr_place() {
+        let mut tags = osmpbfreader::Tags::new();
+        tags.insert("addr:housenumber".into(), "5".into());
+        tags.insert("addr:place".into(), "Old Town".into());
+
+        let mut place = Place::new(
+            OsmType::Node,
+            1,
+            Layer::Address,
+            GeoPoint { lat: 0.0, lon: 0.0 },
+            "test.osm.pbf",
+        );
+        extract_tags(&mut place, &tags);
+
+        let address = place.address.expect("address should be present");
+        assert_eq!(address.housenumber.as_deref(), Some("5"));
+        assert_eq!(address.place.as_deref(), Some("Old Town"));
+        assert_eq!(address.street, None);
+    }
 }

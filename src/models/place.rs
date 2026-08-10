@@ -107,6 +107,10 @@ pub struct Address {
     pub postcode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub city: Option<String>,
+    /// Named address anchor used by addressing systems that do not use a
+    /// street, for example OSM addr:place.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub place: Option<String>,
 }
 
 /// Main place document indexed into Elasticsearch.
