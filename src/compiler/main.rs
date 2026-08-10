@@ -1002,6 +1002,8 @@ async fn main() -> Result<()> {
         writer.flush()?;
     }
 
+    drop(hierarchy_bucket_writers);
+
     info!(
         "Pass 1.5b complete: spilled {} place-area pairs",
         hierarchy_pair_count
@@ -1216,6 +1218,9 @@ async fn main() -> Result<()> {
     for writer in address_bucket_writers.values_mut() {
         writer.flush()?;
     }
+
+    drop(term_bucket_writers);
+    drop(address_bucket_writers);
 
     info!("Pass 2a: merge-sorting term buckets and generating string index");
 
