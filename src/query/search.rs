@@ -186,6 +186,54 @@ fn collect_query_bigrams(query: &str, out: &mut Vec<u16>) {
     out.dedup();
 }
 
+/// ADR's split_ngrams() counts bigram *occurrences*, even when an
+/// occurrence repeats. Its posting-list accumulator, by contrast, visits
+/// each distinct bigram only once. Unlike Cypress's unique query gram count,
+/// this value is used for both ADR's minimum count and cosine denominator.
+fn adr_query_bigram_occurrences(query: &str) -> usize {
+    query
+        .as_bytes()
+        .windows(2)
+        .filter(|w| w[0] != b' ' && w[1] != b' ')
+        .count()
+}
+
+/// ADR's n_bigrams_[string] is min(255, normalized_byte_len - 1), not
+/// the count of unique bigrams in that string. This shadow comparison uses
+/// the existing Cypress-normalized stored string length; differences between
+/// Cypress and ADR UTF-8 normalization remain a separate parity question.
+fn adr_cosine_score(
+    matching_unique_bigrams: u8,
+    stored_string_byte_len: usize,
+    query_bigram_occurrences: usize,
+) -> Option<f32> {
+    let string_denominator = stored_string_byte_len
+        .saturating_sub(1)
+        .min(u8::MAX as usize);
+    if string_denominator == 0 || query_bigram_occurrences == 0 {
+        return None;
+    }
+    let shared = matching_unique_bigrams as f32;
+    Some(shared * shared / (string_denominator * query_bigram_occurrences) as f32)
+}
+
+/// Both input slices must be sorted and contain unique string IDs.
+fn sorted_string_id_overlap(a: &[u32], b: &[u32]) -> usize {
+    let (mut i, mut j, mut common) = (0usize, 0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                common += 1;
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    common
+}
+
 /// Tokenize a query string into words.
 fn tokenize_query(query: &str) -> Vec<&[u8]> {
     query
@@ -1017,25 +1065,89 @@ pub fn search_place_ids(
         }
         log_phase_timing("search_place_ids", "cache_store_counts", phase_started);
 
+        // Shadow experiment only: ADR counts repeated query bigrams in its
+        // denominator and min-match threshold, but uses deduplicated posting
+        // lists for the numerator. ADR's split_ngrams() caps at 128 entries.
+        // When the input exceeds that limit the current Cypress accumulator
+        // includes extra grams, so skip comparison rather than mislabel it ADR.
+        let adr_query_bigram_count = if detailed_metrics {
+            adr_query_bigram_occurrences(&query)
+        } else {
+            0
+        };
+        let adr_shadow_valid = detailed_metrics && (1..=128).contains(&adr_query_bigram_count);
+        let adr_min_match_count = if adr_shadow_valid {
+            let n = adr_query_bigram_count as u32;
+            (2 + n / (4 + n / 10)) as u16
+        } else {
+            u16::MAX
+        };
+
         let phase_started = Instant::now();
         let mut string_matches = Vec::new();
+        let mut adr_shadow_matches = Vec::<CosSimMatch>::new();
+        let mut both_above_cutoff = 0usize;
+        let mut cypress_only_above_cutoff = 0usize;
+        let mut adr_only_above_cutoff = 0usize;
         for touched_idx in 0..ctx.touched_string_indices.len() {
             let i = ctx.touched_string_indices[touched_idx] as usize;
             let match_count = ctx.string_match_count(i);
-            if (match_count as u16) < min_match_count {
+            let shared = match_count as u16;
+            if shared < min_match_count && (!adr_shadow_valid || shared < adr_min_match_count) {
                 continue;
             }
-            let str_bigram_count = db.string_bigram_counts[i] as f32;
-            if str_bigram_count == 0.0 {
-                continue;
+
+            // Keep the *production* Cypress test and cosine arithmetic intact.
+            let mut cypress_pass = false;
+            if shared >= min_match_count {
+                let str_bigram_count = db.string_bigram_counts[i] as f32;
+                if str_bigram_count != 0.0 {
+                    let cos_sim = (match_count as f32 * match_count as f32)
+                        / (str_bigram_count * query_bigram_count_u32 as f32);
+                    if cos_sim >= COS_SIM_CUTOFF {
+                        cypress_pass = true;
+                        string_matches.push(CosSimMatch {
+                            string_idx: i as u32,
+                            cos_sim,
+                        });
+                    }
+                }
             }
-            let cos_sim = (match_count as f32 * match_count as f32)
-                / (str_bigram_count * query_bigram_count_u32 as f32);
-            if cos_sim >= COS_SIM_CUTOFF {
-                string_matches.push(CosSimMatch {
-                    string_idx: i as u32,
-                    cos_sim,
-                });
+
+            if adr_shadow_valid {
+                // The compiled dataset stores normalized string bytes and
+                // adjacent offsets; this computes ADR's byte-length denominator
+                // without changing the index or doing string allocations.
+                let adr_score = if shared >= adr_min_match_count {
+                    match (
+                        db.string_name_offsets.get(i).copied(),
+                        db.string_name_offsets.get(i + 1).copied(),
+                    ) {
+                        (Some(start), Some(end)) if end >= start => {
+                            adr_cosine_score(
+                                match_count,
+                                (end - start) as usize,
+                                adr_query_bigram_count,
+                            )
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let adr_pass = adr_score.is_some_and(|score| score >= COS_SIM_CUTOFF);
+                if adr_pass {
+                    adr_shadow_matches.push(CosSimMatch {
+                        string_idx: i as u32,
+                        cos_sim: adr_score.unwrap(),
+                    });
+                }
+                match (cypress_pass, adr_pass) {
+                    (true, true) => both_above_cutoff += 1,
+                    (true, false) => cypress_only_above_cutoff += 1,
+                    (false, true) => adr_only_above_cutoff += 1,
+                    (false, false) => {}
+                }
             }
         }
         let fuzzy_matches_before_cap = string_matches.len();
@@ -1067,6 +1179,59 @@ pub fn search_place_ids(
             "restrict_sort_string_matches",
             phase_started,
         );
+
+        // Compare the two fuzzy top-6000 lists before the additive prefix
+        // candidates are merged. This never affects production candidates.
+        if detailed_metrics {
+            if adr_shadow_valid {
+                let adr_matches_before_cap = adr_shadow_matches.len();
+                if adr_shadow_matches.len() > MAX_STRING_MATCHES {
+                    adr_shadow_matches.select_nth_unstable_by(MAX_STRING_MATCHES, |a, b| {
+                        b.cos_sim
+                            .partial_cmp(&a.cos_sim)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    adr_shadow_matches.truncate(MAX_STRING_MATCHES);
+                }
+                let mut adr_top_ids: Vec<u32> = adr_shadow_matches
+                    .iter()
+                    .map(|m| m.string_idx)
+                    .collect();
+                let mut cypress_top_ids: Vec<u32> = ctx.string_matches
+                    .iter()
+                    .map(|m| m.string_idx)
+                    .collect();
+                adr_top_ids.sort_unstable();
+                cypress_top_ids.sort_unstable();
+                let top_6000_overlap = sorted_string_id_overlap(&adr_top_ids, &cypress_top_ids);
+                debug!(
+                    target: "cypress::query::timing",
+                    op = "search_place_ids",
+                    adr_query_bigram_occurrences = adr_query_bigram_count,
+                    cypress_query_unique_bigrams = query_bigram_count,
+                    adr_min_match_count,
+                    cypress_min_match_count = min_match_count,
+                    cypress_above_cutoff = fuzzy_matches_before_cap,
+                    adr_above_cutoff = adr_matches_before_cap,
+                    both_above_cutoff,
+                    cypress_only_above_cutoff,
+                    adr_only_above_cutoff,
+                    cypress_top_6000_count = cypress_top_ids.len(),
+                    adr_top_6000_count = adr_top_ids.len(),
+                    top_6000_overlap,
+                    cypress_top_6000_only = cypress_top_ids.len().saturating_sub(top_6000_overlap),
+                    adr_top_6000_only = adr_top_ids.len().saturating_sub(top_6000_overlap),
+                    "ADR cosine shadow comparison (same indexed bytes, fuzzy only; production unchanged)"
+                );
+            } else {
+                debug!(
+                    target: "cypress::query::timing",
+                    op = "search_place_ids",
+                    adr_query_bigram_occurrences = adr_query_bigram_count,
+                    "ADR cosine shadow skipped (query has zero or more than 128 non-space bigrams)"
+                );
+            }
+        }
 
         let phase_started = Instant::now();
         if !prefix_string_ids.is_empty() {
@@ -2318,6 +2483,27 @@ mod tests {
     use cypress::models::normalized::{AdminHierarchyIds, NormalizedPlace};
     use cypress::models::place::{Address, GeoPoint, Layer, OsmType};
     use std::collections::HashMap;
+
+    #[test]
+    fn adr_cosine_query_counts_repeated_bigrams() {
+        let mut unique = Vec::new();
+        collect_query_bigrams("aaaa a", &mut unique);
+        assert_eq!(unique.len(), 1); // The only bigram is "aa".
+        assert_eq!(adr_query_bigram_occurrences("aaaa a"), 3);
+        // ADR's stored-string denominator for "aaaa" is 4 - 1 = 3,
+        // rather than Cypress's unique-bigram denominator of 1.
+        let score = adr_cosine_score(1, 4, 3).unwrap();
+        assert!((score - 1.0 / 9.0).abs() < 0.00001);
+    }
+
+    #[test]
+    fn adr_cosine_guards_empty_denominators_and_caps_byte_length() {
+        assert_eq!(adr_cosine_score(1, 0, 2), None);
+        assert_eq!(adr_cosine_score(1, 1, 2), None);
+        assert_eq!(adr_cosine_score(1, 20, 0), None);
+        assert_eq!(adr_cosine_score(2, 300, 2), Some(4.0 / (255.0 * 2.0)));
+        assert_eq!(sorted_string_id_overlap(&[1, 3, 8], &[2, 3, 8, 10]), 2);
+    }
 
     #[test]
     fn component_dp_finds_global_optimum_instead_of_greedy_choice() {
