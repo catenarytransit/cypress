@@ -183,6 +183,81 @@ fn active_cosine_mode() -> CosineMode {
     })
 }
 
+/// Prefix candidates are additive, but bounded mode refuses broad FST
+/// subtrees rather than arbitrarily taking their lexicographically first IDs.
+const EXTRA_PREFIX_STRING_BUDGET: usize = 2048;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrefixMode {
+    Bounded,
+    Legacy,
+}
+
+impl PrefixMode {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "bounded" => Some(Self::Bounded),
+            "legacy" => Some(Self::Legacy),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Bounded => "bounded",
+            Self::Legacy => "legacy",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CacheAdmissionMode {
+    TwoHit,
+    Legacy,
+}
+
+impl CacheAdmissionMode {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "two-hit" | "two_hit" => Some(Self::TwoHit),
+            "legacy" => Some(Self::Legacy),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TwoHit => "two-hit",
+            Self::Legacy => "legacy",
+        }
+    }
+}
+
+static PREFIX_MODE: std::sync::OnceLock<PrefixMode> = std::sync::OnceLock::new();
+static NGRAM_CACHE_MODE: std::sync::OnceLock<CacheAdmissionMode> = std::sync::OnceLock::new();
+
+fn active_prefix_mode() -> PrefixMode {
+    *PREFIX_MODE.get_or_init(|| match std::env::var("CYPRESS_PREFIX_MODE") {
+        Ok(value) => PrefixMode::parse(&value).unwrap_or_else(|| {
+            warn!(target: "cypress::query::timing", %value,
+                "invalid CYPRESS_PREFIX_MODE; using bounded (legacy rolls back)");
+            PrefixMode::Bounded
+        }),
+        Err(_) => PrefixMode::Bounded,
+    })
+}
+
+fn active_ngram_cache_mode() -> CacheAdmissionMode {
+    *NGRAM_CACHE_MODE.get_or_init(|| match std::env::var("CYPRESS_NGRAM_CACHE_MODE") {
+        Ok(value) => CacheAdmissionMode::parse(&value).unwrap_or_else(|| {
+            warn!(target: "cypress::query::timing", %value,
+                "invalid CYPRESS_NGRAM_CACHE_MODE; using two-hit (legacy rolls back)");
+            CacheAdmissionMode::TwoHit
+        }),
+        Err(_) => CacheAdmissionMode::TwoHit,
+    })
+}
+
 // Lifetime process counters allow aggregate hit rates across thread-local
 // query caches. The counters are updated once per query, not in hot loops.
 static NGRAM_QUERIES: AtomicU64 = AtomicU64::new(0);
@@ -720,6 +795,113 @@ fn collect_prefix_string_ids(prefix_fst: &Map<&[u8]>, prefix: &str, out: &mut Ve
     }
 }
 
+/// Return None if the prefix matches more than `limit` strings. In that case
+/// append *nothing*: the first strings returned by an FST are lexicographically
+/// ordered, not relevance-ranked. Scanning at most limit+1 entries bounds work.
+fn probe_bounded_prefix(
+    prefix_fst: &Map<&[u8]>,
+    prefix: &str,
+    limit: usize,
+    out: &mut Vec<u32>,
+) -> Option<usize> {
+    if prefix.chars().count() < 2 || limit == 0 {
+        return Some(0);
+    }
+    let automaton = Str::new(prefix).starts_with();
+    let mut stream = prefix_fst.search(automaton).into_stream();
+    let mut matches = Vec::new();
+    while let Some((_key, string_id)) = stream.next() {
+        if string_id > u32::MAX as u64 {
+            continue;
+        }
+        if matches.len() == limit {
+            return None;
+        }
+        matches.push(string_id as u32);
+    }
+    let accepted = matches.len();
+    out.extend(matches);
+    Some(accepted)
+}
+
+#[derive(Default)]
+struct PrefixPlanStats {
+    full_query_raw: usize,
+    multiword_prefix_raw: usize,
+    token_prefix_raw: Vec<usize>,
+    prefixes_probed: usize,
+    broad_prefixes_skipped: usize,
+    budget_used: usize,
+}
+
+/// Longest multiword anchors first; single tokens last. Exact phrase IDs are
+/// already present in `out` and do not consume the budget. This does not assume
+/// which words are a city or street, so all token roles remain eligible.
+fn collect_bounded_prefix_candidates(
+    prefix_fst: &Map<&[u8]>,
+    query: &str,
+    phrases: &[QueryPhrase],
+    query_tokens: &[&[u8]],
+    out: &mut Vec<u32>,
+) -> PrefixPlanStats {
+    let mut stats = PrefixPlanStats::default();
+    let mut remaining = EXTRA_PREFIX_STRING_BUDGET;
+
+    stats.prefixes_probed += 1;
+    match probe_bounded_prefix(prefix_fst, query, remaining, out) {
+        Some(count) => {
+            stats.full_query_raw = count;
+            remaining -= count;
+        }
+        None => stats.broad_prefixes_skipped += 1,
+    }
+
+    let mut multiword: Vec<&QueryPhrase> = phrases
+        .iter()
+        .filter(|p| p.mask.count_ones() > 1 && p.bytes.as_slice() != query.as_bytes())
+        .collect();
+    multiword.sort_unstable_by(|a, b| {
+        b.mask
+            .count_ones()
+            .cmp(&a.mask.count_ones())
+            .then(b.bytes.len().cmp(&a.bytes.len()))
+    });
+    for phrase in multiword {
+        if remaining == 0 {
+            break;
+        }
+        if let Ok(prefix) = std::str::from_utf8(&phrase.bytes) {
+            stats.prefixes_probed += 1;
+            match probe_bounded_prefix(prefix_fst, prefix, remaining, out) {
+                Some(count) => {
+                    stats.multiword_prefix_raw += count;
+                    remaining -= count;
+                }
+                None => stats.broad_prefixes_skipped += 1,
+            }
+        }
+    }
+
+    for token in query_tokens.iter().take(8) {
+        let mut count = 0;
+        if remaining > 0 {
+            if let Ok(prefix) = std::str::from_utf8(token) {
+                stats.prefixes_probed += 1;
+                match probe_bounded_prefix(prefix_fst, prefix, remaining, out) {
+                    Some(n) => {
+                        count = n;
+                        remaining -= n;
+                    }
+                    None => stats.broad_prefixes_skipped += 1,
+                }
+            }
+        }
+        stats.token_prefix_raw.push(count);
+    }
+    stats.budget_used = EXTRA_PREFIX_STRING_BUDGET - remaining;
+    stats
+}
+
 fn resolve_admin_prefix_scores(
     db: &cypress::models::memdb::ArchivedCypressMemDb,
     admin_alias_fst: Option<&Map<&[u8]>>,
@@ -938,10 +1120,19 @@ pub fn search_place_ids(
     }
 
     let cosine_mode = active_cosine_mode();
+    let prefix_mode = active_prefix_mode();
+    let cache_mode = active_ngram_cache_mode();
     debug!(
         target: "cypress::query::timing",
         cosine_mode = cosine_mode.as_str(),
         "active production cosine mode (set CYPRESS_COSINE_MODE=cypress to roll back)"
+    );
+    debug!(
+        target: "cypress::query::timing",
+        prefix_mode = prefix_mode.as_str(),
+        cache_admission_mode = cache_mode.as_str(),
+        extra_prefix_budget = EXTRA_PREFIX_STRING_BUDGET,
+        "search retrieval experiment modes (set each mode to legacy to roll back)"
     );
     let detailed_metrics =
         tracing::enabled!(target: "cypress::query::timing", tracing::Level::DEBUG);
@@ -996,6 +1187,7 @@ pub fn search_place_ids(
     let mut exact_multiword_phrases = 0usize;
     let mut full_query_prefix_raw = 0usize;
     let mut fallback_token_prefix_raw = Vec::<usize>::new();
+    let mut bounded_stats = PrefixPlanStats::default();
     if let Some(prefix_fst) = prefix_fst.as_ref() {
         collect_exact_phrase_string_ids(prefix_fst, &phrases, &mut prefix_string_ids);
         exact_phrase_matches = prefix_string_ids.len();
@@ -1004,16 +1196,31 @@ pub fn search_place_ids(
             .filter(|phrase| phrase.mask.count_ones() > 1)
             .filter(|phrase| prefix_fst.get(&phrase.bytes).is_some())
             .count();
-        let before_full_prefix = prefix_string_ids.len();
-        collect_prefix_string_ids(prefix_fst, &query, &mut prefix_string_ids);
-        full_query_prefix_raw = prefix_string_ids.len() - before_full_prefix;
-        if prefix_string_ids.len() == before_full_prefix && is_multi_token {
-            for token in query_tokens.iter().take(8) {
-                let before_token = prefix_string_ids.len();
-                if let Ok(token) = std::str::from_utf8(token) {
-                    collect_prefix_string_ids(prefix_fst, token, &mut prefix_string_ids);
+        match prefix_mode {
+            PrefixMode::Legacy => {
+                let before_full_prefix = prefix_string_ids.len();
+                collect_prefix_string_ids(prefix_fst, &query, &mut prefix_string_ids);
+                full_query_prefix_raw = prefix_string_ids.len() - before_full_prefix;
+                if prefix_string_ids.len() == before_full_prefix && is_multi_token {
+                    for token in query_tokens.iter().take(8) {
+                        let before_token = prefix_string_ids.len();
+                        if let Ok(token) = std::str::from_utf8(token) {
+                            collect_prefix_string_ids(prefix_fst, token, &mut prefix_string_ids);
+                        }
+                        fallback_token_prefix_raw.push(prefix_string_ids.len() - before_token);
+                    }
                 }
-                fallback_token_prefix_raw.push(prefix_string_ids.len() - before_token);
+            }
+            PrefixMode::Bounded => {
+                bounded_stats = collect_bounded_prefix_candidates(
+                    prefix_fst,
+                    &query,
+                    &phrases,
+                    &query_tokens,
+                    &mut prefix_string_ids,
+                );
+                full_query_prefix_raw = bounded_stats.full_query_raw;
+                fallback_token_prefix_raw = bounded_stats.token_prefix_raw.clone();
             }
         }
     }
@@ -1028,9 +1235,14 @@ pub fn search_place_ids(
         target: "cypress::query::timing",
         op = "search_place_ids",
         prefix_candidate_count = prefix_string_ids.len(),
+        prefix_mode = prefix_mode.as_str(),
         exact_phrase_matches,
         exact_multiword_phrases,
         full_query_prefix_raw,
+        multiword_prefix_raw = bounded_stats.multiword_prefix_raw,
+        bounded_prefix_probes = bounded_stats.prefixes_probed,
+        bounded_broad_skips = bounded_stats.broad_prefixes_skipped,
+        bounded_budget_used = bounded_stats.budget_used,
         fallback_token_prefix_raw = ?fallback_token_prefix_raw,
         "prefix FST candidates ready (raw buckets overlap; final count is deduplicated)"
     );
@@ -1148,7 +1360,13 @@ pub fn search_place_ids(
         let phase_started = Instant::now();
         let mut cache_snapshot_entries = 0usize;
         let mut cache_snapshot_bytes = 0usize;
-        if !ctx.query_cache.has_exact(&query_bigrams) {
+        let cache_snapshot_eligible = !ctx.query_cache.has_exact(&query_bigrams);
+        let cache_snapshot_admitted = cache_snapshot_eligible
+            && match cache_mode {
+                CacheAdmissionMode::Legacy => true,
+                CacheAdmissionMode::TwoHit => ctx.query_cache.should_admit_two_hit(&query_bigrams),
+            };
+        if cache_snapshot_admitted {
             let snapshot = ctx.snapshot_sparse_counts();
             cache_snapshot_entries = snapshot.string_ids.len();
             cache_snapshot_bytes = snapshot.string_ids.len() * std::mem::size_of::<u32>()
@@ -1156,6 +1374,17 @@ pub fn search_place_ids(
             ctx.query_cache.put(&query_bigrams, Arc::new(snapshot));
         }
         log_phase_timing("search_place_ids", "cache_store_counts", phase_started);
+        debug!(
+            target: "cypress::query::timing",
+            op = "search_place_ids",
+            cache_admission_mode = cache_mode.as_str(),
+            cache_snapshot_eligible,
+            cache_snapshot_admitted,
+            cache_snapshot_skipped = cache_snapshot_eligible && !cache_snapshot_admitted,
+            cache_snapshot_entries,
+            cache_snapshot_bytes,
+            "bigram snapshot admission summary"
+        );
 
         // Calculate the selected production cosine and, at DEBUG level,
         // the alternate formula over the same posting counts. The alternate
@@ -2582,6 +2811,39 @@ mod tests {
     use cypress::models::normalized::{AdminHierarchyIds, NormalizedPlace};
     use cypress::models::place::{Address, GeoPoint, Layer, OsmType};
     use std::collections::HashMap;
+
+    #[test]
+    fn prefix_and_cache_modes_support_independent_rollback() {
+        assert_eq!(PrefixMode::parse("bounded"), Some(PrefixMode::Bounded));
+        assert_eq!(PrefixMode::parse(" LEGACY "), Some(PrefixMode::Legacy));
+        assert_eq!(PrefixMode::parse("invalid"), None);
+        assert_eq!(
+            CacheAdmissionMode::parse("two-hit"),
+            Some(CacheAdmissionMode::TwoHit)
+        );
+        assert_eq!(
+            CacheAdmissionMode::parse("legacy"),
+            Some(CacheAdmissionMode::Legacy)
+        );
+    }
+
+    #[test]
+    fn broad_prefix_is_not_arbitrarily_truncated() {
+        let mut bytes = Vec::new();
+        {
+            let mut builder = fst::MapBuilder::new(&mut bytes).unwrap();
+            for (i, s) in ["aa", "aaa", "aab", "aac", "abc"].iter().enumerate() {
+                builder.insert(*s, i as u64).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        let fst = Map::new(bytes.as_slice()).unwrap();
+        let mut ids = vec![0]; // exact `aa` survives an overbroad prefix.
+        assert!(probe_bounded_prefix(&fst, "aa", 2, &mut ids).is_none());
+        assert_eq!(ids, vec![0]);
+        assert_eq!(probe_bounded_prefix(&fst, "abc", 2, &mut ids), Some(1));
+        assert_eq!(ids, vec![0, 4]);
+    }
 
     #[test]
     fn cosine_mode_ab_defaults_to_adr_and_supports_explicit_rollback() {
