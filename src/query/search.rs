@@ -3,6 +3,7 @@ use fst::automaton::Str;
 use fst::{Automaton, IntoStreamer, Map, Streamer};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, warn};
@@ -10,6 +11,7 @@ use tracing::{debug, warn};
 use cypress::models::memdb::CypressMemDb;
 use cypress::models::normalized::NormalizedPlace;
 use cypress::models::place::Layer;
+use cypress::models::sift4::Sift4CountGuard;
 use cypress::models::AdminEntry;
 use cypress::scylla::ScyllaClient;
 
@@ -131,6 +133,28 @@ const FOCUS_RESCORE_MULTIPLIER: usize = 5;
 const FOCUS_RESCORE_FLOOR: usize = 50;
 const SLOW_PHASE_WARN_MS: u128 = 250;
 const SLOW_SEARCH_WARN_MS: u128 = 1000;
+
+// Lifetime process counters allow aggregate hit rates across thread-local
+// query caches. The counters are updated once per query, not in hot loops.
+static NGRAM_QUERIES: AtomicU64 = AtomicU64::new(0);
+static NGRAM_EXACT_HITS: AtomicU64 = AtomicU64::new(0);
+static NGRAM_SUBSET_HITS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Default)]
+struct SearchWorkStats {
+    enabled: bool,
+    first_pass_scorer_calls: u64,
+    first_pass_strings_scored: u64,
+    local_street_scorer_calls: u64,
+    local_house_scorer_calls: u64,
+    local_postcode_scorer_calls: u64,
+    dp_candidates: u64,
+    dp_fallbacks: u64,
+    dp_component_steps: u64,
+    dp_reachable_states: u64,
+    dp_option_checks: u64,
+    dp_legal_transitions: u64,
+}
 
 fn log_phase_timing(op: &str, phase: &str, phase_started: Instant) {
     let elapsed_ms = phase_started.elapsed().as_millis();
@@ -358,9 +382,17 @@ fn place_prior_bonus(db: &cypress::models::memdb::ArchivedCypressMemDb, place_id
 /// globally minimum-cost assignment. For T <= 8 query tokens the state space
 /// is at most 2^T = 256; runtime is O(C * 2^T * P) for C components and at
 /// most P retained phrase options per component, with O(2^T) scratch memory.
-fn advance_component_dp(dp: &mut [f32; 256], options: &[ComponentMatchOption], all_mask: u8) {
+fn advance_component_dp(
+    dp: &mut [f32; 256],
+    options: &[ComponentMatchOption],
+    all_mask: u8,
+    work: &mut SearchWorkStats,
+) {
     if options.is_empty() {
         return;
+    }
+    if work.enabled {
+        work.dp_component_steps += 1;
     }
 
     let previous = *dp;
@@ -370,9 +402,16 @@ fn advance_component_dp(dp: &mut [f32; 256], options: &[ComponentMatchOption], a
         if !base.is_finite() {
             continue;
         }
+        if work.enabled {
+            work.dp_reachable_states += 1;
+            work.dp_option_checks += options.len() as u64;
+        }
         for option in options {
             if (mask as u8 & option.mask) != 0 {
                 continue;
+            }
+            if work.enabled {
+                work.dp_legal_transitions += 1;
             }
             let new_mask = mask | option.mask as usize;
             next[new_mask] = next[new_mask].min(base + option.cost);
@@ -454,6 +493,7 @@ fn score_structured_candidate(
     area_components: &[Vec<ComponentMatchOption>],
     scratch: &mut Vec<ComponentMatchOption>,
     offset_arr: &mut Vec<cypress::models::sift4::SiftOffset>,
+    work: &mut SearchWorkStats,
 ) -> Option<f32> {
     let token_count = query_tokens.len().min(8);
     if token_count == 0 {
@@ -469,7 +509,7 @@ fn score_structured_candidate(
         mask: e.mask,
         cost: e.cost,
     }));
-    advance_component_dp(&mut dp, scratch, all_mask);
+    advance_component_dp(&mut dp, scratch, all_mask, work);
 
     let house_idx = db
         .place_address_house_indices
@@ -487,8 +527,11 @@ fn score_structured_candidate(
         {
             if let Some(street_name) = get_street_name(db, street_group_idx) {
                 let prepared = cypress::models::scoring::PreparedMatchCandidate::new(street_name);
+                if work.enabled {
+                    work.local_street_scorer_calls += phrases.len() as u64;
+                }
                 collect_component_match_options(&prepared, phrases, offset_arr, scratch);
-                advance_component_dp(&mut dp, scratch, all_mask);
+                advance_component_dp(&mut dp, scratch, all_mask, work);
             }
         }
 
@@ -496,6 +539,9 @@ fn score_structured_candidate(
             let prepared = cypress::models::scoring::PreparedMatchCandidate::new(house_number);
             scratch.clear();
             for phrase in phrases.iter().filter(|p| is_house_number_phrase(p)) {
+                if work.enabled {
+                    work.local_house_scorer_calls += 1;
+                }
                 let score = prepared.score(&phrase.bytes, offset_arr);
                 if score != cypress::models::scoring::NO_MATCH {
                     scratch.push(ComponentMatchOption {
@@ -504,18 +550,21 @@ fn score_structured_candidate(
                     });
                 }
             }
-            advance_component_dp(&mut dp, scratch, all_mask);
+            advance_component_dp(&mut dp, scratch, all_mask, work);
         }
 
         if let Some(postcode) = get_house_postcode(db, house_idx).filter(|p| !p.is_empty()) {
             let prepared = cypress::models::scoring::PreparedMatchCandidate::new(postcode);
+            if work.enabled {
+                work.local_postcode_scorer_calls += phrases.len() as u64;
+            }
             collect_component_match_options(&prepared, phrases, offset_arr, scratch);
-            advance_component_dp(&mut dp, scratch, all_mask);
+            advance_component_dp(&mut dp, scratch, all_mask, work);
         }
     }
 
     for options in area_components {
-        advance_component_dp(&mut dp, options, all_mask);
+        advance_component_dp(&mut dp, options, all_mask, work);
     }
 
     let mut best = f32::INFINITY;
@@ -773,6 +822,10 @@ pub fn search_place_ids(
         return Vec::new();
     }
 
+    let detailed_metrics =
+        tracing::enabled!(target: "cypress::query::timing", tracing::Level::DEBUG);
+    let sift4_guard = Sift4CountGuard::new(detailed_metrics);
+    let phrases_started = Instant::now();
     let max_tokens = query_tokens.len().min(8);
     let mut phrases: Vec<QueryPhrase> = Vec::new();
     for i in 0..max_tokens {
@@ -796,6 +849,21 @@ pub fn search_place_ids(
             });
         }
     }
+    let admin_alias_candidates: usize = phrases.iter().map(|p| p.admin_prefix_scores.len()).sum();
+    debug!(
+        target: "cypress::query::timing",
+        op = "search_place_ids",
+        query_tokens = max_tokens,
+        query_phrases = phrases.len(),
+        admin_alias_candidates,
+        sift4_calls = sift4_guard.count(),
+        "query phrase generation summary"
+    );
+    log_phase_timing(
+        "search_place_ids",
+        "generate_query_phrases",
+        phrases_started,
+    );
 
     // Prefix candidates are additive. They bypass the cosine candidate cap but
     // still pass through the same SIFT/place/admin/geographic ranker. This keeps
@@ -803,15 +871,28 @@ pub fn search_place_ids(
     // such as "zuri" can reach the final ranker for aliases such as "zurich".
     let prefix_phase_started = Instant::now();
     let mut prefix_string_ids = Vec::<u32>::new();
+    let mut exact_phrase_matches = 0usize;
+    let mut exact_multiword_phrases = 0usize;
+    let mut full_query_prefix_raw = 0usize;
+    let mut fallback_token_prefix_raw = Vec::<usize>::new();
     if let Some(prefix_fst) = prefix_fst.as_ref() {
         collect_exact_phrase_string_ids(prefix_fst, &phrases, &mut prefix_string_ids);
+        exact_phrase_matches = prefix_string_ids.len();
+        exact_multiword_phrases = phrases
+            .iter()
+            .filter(|phrase| phrase.mask.count_ones() > 1)
+            .filter(|phrase| prefix_fst.get(&phrase.bytes).is_some())
+            .count();
         let before_full_prefix = prefix_string_ids.len();
         collect_prefix_string_ids(prefix_fst, &query, &mut prefix_string_ids);
+        full_query_prefix_raw = prefix_string_ids.len() - before_full_prefix;
         if prefix_string_ids.len() == before_full_prefix && is_multi_token {
             for token in query_tokens.iter().take(8) {
+                let before_token = prefix_string_ids.len();
                 if let Ok(token) = std::str::from_utf8(token) {
                     collect_prefix_string_ids(prefix_fst, token, &mut prefix_string_ids);
                 }
+                fallback_token_prefix_raw.push(prefix_string_ids.len() - before_token);
             }
         }
     }
@@ -826,7 +907,11 @@ pub fn search_place_ids(
         target: "cypress::query::timing",
         op = "search_place_ids",
         prefix_candidate_count = prefix_string_ids.len(),
-        "prefix FST candidates ready"
+        exact_phrase_matches,
+        exact_multiword_phrases,
+        full_query_prefix_raw,
+        fallback_token_prefix_raw = ?fallback_token_prefix_raw,
+        "prefix FST candidates ready (raw buckets overlap; final count is deduplicated)"
     );
 
     let mut results = Vec::<(u32, f64)>::new();
@@ -844,6 +929,10 @@ pub fn search_place_ids(
         }
         ctx.area_phrase_scores
             .begin_query(db.area_name_offsets.len().saturating_sub(1));
+        let mut work = SearchWorkStats {
+            enabled: detailed_metrics,
+            ..Default::default()
+        };
 
         log_phase_timing("search_place_ids", "clear_context", phase_started);
 
@@ -872,26 +961,42 @@ pub fn search_place_ids(
         let cached_counts = ctx
             .query_cache
             .get_closest_ref(&query_bigrams, &mut missing_bigrams);
+        let cache_base_reused = cached_counts.is_some();
         if let Some(cached) = cached_counts {
             ctx.restore_sparse_counts(&cached);
         }
         let missing_bigram_count = missing_bigrams.len();
+        let cache_exact_hit = cache_base_reused && missing_bigram_count == 0;
+        let cache_subset_hit = cache_base_reused && !cache_exact_hit;
+        NGRAM_QUERIES.fetch_add(1, Ordering::Relaxed);
+        if cache_exact_hit {
+            NGRAM_EXACT_HITS.fetch_add(1, Ordering::Relaxed);
+        } else if cache_subset_hit {
+            NGRAM_SUBSET_HITS.fetch_add(1, Ordering::Relaxed);
+        }
         log_phase_timing("search_place_ids", "cache_lookup_restore", phase_started);
         debug!(
             target: "cypress::query::timing",
             op = "search_place_ids",
-            cache_hit = missing_bigram_count == 0,
+            cache_hit = cache_exact_hit,
+            cache_subset_hit,
             missing_bigram_count,
             "cache lookup summary"
         );
 
         let phase_started = Instant::now();
+        let mut posting_lists_read = 0usize;
+        let mut posting_entries_visited = 0usize;
         for missing_idx in missing_bigrams.into_iter() {
             let start = db.bigram_offsets[missing_idx as usize] as usize;
             let end = db.bigram_offsets[(missing_idx + 1) as usize] as usize;
 
             // Use a slice iterator to eliminate bounds checks on bigram_data
             if let Some(bigrams) = db.bigram_data.get(start..end) {
+                if detailed_metrics {
+                    posting_lists_read += 1;
+                    posting_entries_visited += bigrams.len();
+                }
                 for &string_idx in bigrams {
                     let string_idx = string_idx as usize;
                     ctx.increment_string_match(string_idx);
@@ -901,9 +1006,14 @@ pub fn search_place_ids(
         log_phase_timing("search_place_ids", "expand_missing_bigrams", phase_started);
 
         let phase_started = Instant::now();
+        let mut cache_snapshot_entries = 0usize;
+        let mut cache_snapshot_bytes = 0usize;
         if !ctx.query_cache.has_exact(&query_bigrams) {
-            let clones = Arc::new(ctx.snapshot_sparse_counts());
-            ctx.query_cache.put(&query_bigrams, clones);
+            let snapshot = ctx.snapshot_sparse_counts();
+            cache_snapshot_entries = snapshot.string_ids.len();
+            cache_snapshot_bytes = snapshot.string_ids.len() * std::mem::size_of::<u32>()
+                + snapshot.counts.len() * std::mem::size_of::<u8>();
+            ctx.query_cache.put(&query_bigrams, Arc::new(snapshot));
         }
         log_phase_timing("search_place_ids", "cache_store_counts", phase_started);
 
@@ -928,6 +1038,7 @@ pub fn search_place_ids(
                 });
             }
         }
+        let fuzzy_matches_before_cap = string_matches.len();
         ctx.string_matches.extend(string_matches);
         log_phase_timing(
             "search_place_ids",
@@ -974,8 +1085,28 @@ pub fn search_place_ids(
             ctx.string_matches.dedup_by_key(|m| m.string_idx);
         }
         log_phase_timing("search_place_ids", "union_prefix_candidates", phase_started);
+        let (ngram_cache_entries, ngram_cache_bytes) = ctx.query_cache.residency();
+        debug!(
+            target: "cypress::query::timing",
+            op = "search_place_ids",
+            posting_lists_read,
+            posting_entries_visited,
+            touched_string_count = ctx.touched_string_indices.len(),
+            fuzzy_matches_before_cap,
+            fuzzy_matches_after_cap = max_matches,
+            string_matches_after_prefix_union = ctx.string_matches.len(),
+            cache_snapshot_entries,
+            cache_snapshot_bytes,
+            ngram_cache_entries,
+            ngram_cache_bytes,
+            process_ngram_queries = NGRAM_QUERIES.load(Ordering::Relaxed),
+            process_ngram_exact_hits = NGRAM_EXACT_HITS.load(Ordering::Relaxed),
+            process_ngram_subset_hits = NGRAM_SUBSET_HITS.load(Ordering::Relaxed),
+            "bigram retrieval work summary"
+        );
 
         let phase_started = Instant::now();
+        let sift4_first_pass_before = sift4_guard.count();
         let query_epoch = ctx.query_epoch;
 
         let match_snapshot: Vec<(u32, f32)> = ctx
@@ -1003,6 +1134,10 @@ pub fn search_place_ids(
             };
 
             let prepared = cypress::models::scoring::PreparedMatchCandidate::new(string_name);
+            if work.enabled {
+                work.first_pass_strings_scored += 1;
+                work.first_pass_scorer_calls += phrases.len() as u64;
+            }
             collect_component_match_options(
                 &prepared,
                 &phrases,
@@ -1121,6 +1256,9 @@ pub fn search_place_ids(
             }
         }
         log_phase_timing("search_place_ids", "sift4_rescore_places", phase_started);
+        let first_pass_sift4_calls = sift4_guard.count() - sift4_first_pass_before;
+        let raw_name_evidence = name_evidence.len();
+        let raw_street_evidence = street_evidence.len();
 
         // Canonicalize evidence before address seeding and final DP. For the
         // same semantic component and token mask, keeping the cheapest alias is
@@ -1145,12 +1283,28 @@ pub fn search_place_ids(
                 )
         });
         street_evidence.dedup_by(|a, b| a.street_group_id == b.street_group_id && a.mask == b.mask);
+        debug!(
+            target: "cypress::query::timing",
+            op = "search_place_ids",
+            strings_scored = work.first_pass_strings_scored,
+            name_scorer_invocations = work.first_pass_scorer_calls,
+            first_pass_sift4_calls,
+            raw_name_evidence,
+            dedup_name_evidence = name_evidence.len(),
+            raw_street_evidence,
+            dedup_street_evidence = street_evidence.len(),
+            "first-pass matching and evidence summary"
+        );
 
         // Structured address candidate generation. A global fuzzy hit only
         // resolves a street group. House lookup then happens locally with two
         // binary searches, never by expanding every house into the global
         // string postings.
         let phase_started = Instant::now();
+        let sift4_address_before = sift4_guard.count();
+        let mut house_number_lookups = 0usize;
+        let mut house_number_lookup_hits = 0usize;
+        let mut address_candidates_seeded = 0usize;
         let mut evidence_pos = 0usize;
         while evidence_pos < street_evidence.len() {
             let street_group_id = street_evidence[evidence_pos].street_group_id;
@@ -1179,11 +1333,13 @@ pub fn search_place_ids(
                     continue;
                 };
 
+                house_number_lookups += 1;
                 let Some((house_start, house_end)) =
                     find_exact_house_range(db, group_idx, &house_phrase.bytes)
                 else {
                     continue;
                 };
+                house_number_lookup_hits += 1;
 
                 let matched_mask = best_street.mask | house_phrase.mask;
                 let area_set_idx = db.street_area_sets[group_idx] as usize;
@@ -1260,10 +1416,20 @@ pub fn search_place_ids(
 
                     let score = -structural_cost + place_prior_bonus(db, place_idx);
                     ctx.place_scores.push((place_id, score));
+                    address_candidates_seeded += 1;
                 }
             }
         }
         log_phase_timing("search_place_ids", "structured_address_seed", phase_started);
+        debug!(
+            target: "cypress::query::timing",
+            op = "search_place_ids",
+            house_number_lookups,
+            house_number_lookup_hits,
+            address_candidates_seeded,
+            address_seed_sift4_calls = sift4_guard.count() - sift4_address_before,
+            "structured address retrieval summary"
+        );
 
         let phase_started = Instant::now();
         ctx.place_scores.sort_unstable_by(|a, b| {
@@ -1271,6 +1437,7 @@ pub fn search_place_ids(
                 .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
         });
         ctx.place_scores.dedup_by(|a, b| a.0 == b.0);
+        let unique_base_places = ctx.place_scores.len();
 
         results = ctx
             .place_scores
@@ -1283,6 +1450,14 @@ pub fn search_place_ids(
             });
             results.truncate(MAX_SCORED_MATCHES);
         }
+        debug!(
+            target: "cypress::query::timing",
+            op = "search_place_ids",
+            unique_base_places,
+            rerank_candidates = results.len(),
+            capped_by_preliminary_rank = unique_base_places.saturating_sub(results.len()),
+            "place candidate fanout summary"
+        );
         log_phase_timing(
             "search_place_ids",
             "truncate_base_candidates",
@@ -1290,6 +1465,7 @@ pub fn search_place_ids(
         );
 
         let phase_started = Instant::now();
+        let sift4_rerank_before = sift4_guard.count();
         let mut area_component_cache = HashMap::<u32, Vec<Vec<ComponentMatchOption>>>::new();
         let mut planner_scratch = Vec::<ComponentMatchOption>::with_capacity(36);
         let mut rescored = Vec::with_capacity(results.len());
@@ -1328,7 +1504,10 @@ pub fn search_place_ids(
             // components. With at most eight query tokens there are only 256
             // token masks, so order-independent optimal assignment is bounded
             // and deterministic rather than heuristic/greedy.
-            let mut score = score_structured_candidate(
+            if work.enabled {
+                work.dp_candidates += 1;
+            }
+            let exact_cost = score_structured_candidate(
                 db,
                 place_idx,
                 &phrases,
@@ -1337,9 +1516,14 @@ pub fn search_place_ids(
                 area_components,
                 &mut planner_scratch,
                 &mut ctx.sift4_offset_arr,
-            )
-            .map(|cost| (-cost + place_prior_bonus(db, place_idx)) as f64)
-            .unwrap_or(base_score);
+                &mut work,
+            );
+            if work.enabled && exact_cost.is_none() {
+                work.dp_fallbacks += 1;
+            }
+            let mut score = exact_cost
+                .map(|cost| (-cost + place_prior_bonus(db, place_idx)) as f64)
+                .unwrap_or(base_score);
 
             let lat = db.place_latitudes[place_idx] as f64;
             let lon = db.place_longitudes[place_idx] as f64;
@@ -1374,6 +1558,23 @@ pub fn search_place_ids(
             phase_started,
         );
         let (area_cache_hits, area_cache_misses) = ctx.area_phrase_scores.stats();
+        debug!(
+            target: "cypress::query::timing",
+            op = "search_place_ids",
+            reranked_places = work.dp_candidates,
+            dp_fallbacks = work.dp_fallbacks,
+            distinct_area_sets = area_component_cache.len(),
+            dp_component_steps = work.dp_component_steps,
+            dp_reachable_state_visits = work.dp_reachable_states,
+            dp_option_checks = work.dp_option_checks,
+            dp_legal_transitions = work.dp_legal_transitions,
+            local_street_scorer_invocations = work.local_street_scorer_calls,
+            local_house_scorer_invocations = work.local_house_scorer_calls,
+            local_postcode_scorer_invocations = work.local_postcode_scorer_calls,
+            rerank_sift4_calls = sift4_guard.count() - sift4_rerank_before,
+            total_sift4_calls = sift4_guard.count(),
+            "structured DP work summary"
+        );
         debug!(
             target: "cypress::query::timing",
             op = "search_place_ids",

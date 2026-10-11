@@ -1,7 +1,46 @@
 /// SIFT4 approximate string distance — ported from adr/sift4.h.
 /// Returns a fast approximate edit distance between two byte strings,
 /// accounting for transpositions, with early termination at `max_distance`.
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+
+// Exact Sift4 invocation counts for the synchronous query path. Disabled by
+// default: profiling is only enabled when cypress::query::timing is DEBUG.
+thread_local! {
+    static QUERY_SIFT4_CALLS: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+/// RAII ensures a request cannot leave counters enabled on its worker thread.
+/// The synchronous scorer does not yield, so the thread-local counter cannot
+/// accidentally include another async request between awaits.
+pub struct Sift4CountGuard {
+    enabled: bool,
+}
+
+impl Sift4CountGuard {
+    pub fn new(enabled: bool) -> Self {
+        if enabled {
+            QUERY_SIFT4_CALLS.with(|calls| calls.set(Some(0)));
+        }
+        Self { enabled }
+    }
+
+    #[inline]
+    pub fn count(&self) -> u64 {
+        if self.enabled {
+            QUERY_SIFT4_CALLS.with(|calls| calls.get().unwrap_or(0))
+        } else {
+            0
+        }
+    }
+}
+
+impl Drop for Sift4CountGuard {
+    fn drop(&mut self) {
+        if self.enabled {
+            QUERY_SIFT4_CALLS.with(|calls| calls.set(None));
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 pub struct SiftOffset {
@@ -17,6 +56,11 @@ pub fn sift4(
     max_distance: usize,
     offset_arr: &mut Vec<SiftOffset>,
 ) -> usize {
+    QUERY_SIFT4_CALLS.with(|calls| {
+        if let Some(count) = calls.get() {
+            calls.set(Some(count.saturating_add(1)));
+        }
+    });
     offset_arr.clear();
 
     if s1.is_empty() {

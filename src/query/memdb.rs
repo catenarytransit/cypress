@@ -174,6 +174,12 @@ impl QueryNgramCache {
         self.entries.clear();
         self.bytes = 0;
     }
+
+    /// Cache residency, not hit counts. Query-level lookup outcomes are logged
+    /// separately so they can be aggregated across worker threads.
+    pub fn residency(&self) -> (usize, usize) {
+        (self.entries.len(), self.bytes)
+    }
 }
 
 /// ADR-style area/phrase scores: an area is activated once per query. A dense
