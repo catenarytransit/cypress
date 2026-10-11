@@ -243,29 +243,40 @@ mod area_phrase_cache_tests {
         cache.begin_query(4);
         let mut builds = 0;
         assert_eq!(
-            cache.get_or_compute(2, 12, |row| {
-                builds += 1;
-                row[0] = -3.5;
-                row[35] = 2.0;
-            }).unwrap()[35],
+            cache
+                .get_or_compute(2, 12, |row| {
+                    builds += 1;
+                    row[0] = -3.5;
+                    row[35] = 2.0;
+                })
+                .unwrap()[35],
             2.0
         );
-        assert_eq!(cache.get_or_compute(2, 12, |_| panic!("recomputed"))
-            .unwrap()[0], -3.5);
+        assert_eq!(
+            cache
+                .get_or_compute(2, 12, |_| panic!("recomputed"))
+                .unwrap()[0],
+            -3.5
+        );
         assert_eq!(builds, 1);
         assert_eq!(cache.stats(), (1, 1));
-        assert!(cache.get_or_compute(9, 12, |_| panic!("invalid area"))
+        assert!(cache
+            .get_or_compute(9, 12, |_| panic!("invalid area"))
             .is_none());
 
         cache.begin_query(4);
-        assert_eq!(cache.get_or_compute(2, 13, |row| row[0] = 5.0)
-            .unwrap()[0], 5.0);
+        assert_eq!(
+            cache.get_or_compute(2, 13, |row| row[0] = 5.0).unwrap()[0],
+            5.0
+        );
         assert_eq!(cache.stats(), (0, 1));
 
         cache.invalidate_on_epoch_wrap();
         cache.begin_query(4);
-        assert_eq!(cache.get_or_compute(2, 1, |row| row[0] = 7.0)
-            .unwrap()[0], 7.0);
+        assert_eq!(
+            cache.get_or_compute(2, 1, |row| row[0] = 7.0).unwrap()[0],
+            7.0
+        );
     }
 }
 

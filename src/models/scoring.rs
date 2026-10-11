@@ -62,12 +62,7 @@ pub fn get_known_prefix_match_score(dataset_token: &[u8], query: &[u8]) -> f32 {
     finish_token_match_score(dataset_token, query, cut, 0)
 }
 
-fn finish_token_match_score(
-    dataset_token: &[u8],
-    query: &[u8],
-    cut: &[u8],
-    dist: usize,
-) -> f32 {
+fn finish_token_match_score(dataset_token: &[u8], query: &[u8], cut: &[u8], dist: usize) -> f32 {
     let cut_len = cut.len();
     if cut_len == 0 || dist >= cut_len {
         return NO_MATCH;
@@ -210,11 +205,8 @@ impl<'a> PreparedMatchCandidate<'a> {
                 let score = if len == 1 {
                     get_token_match_score(self.token(from), query, offset_arr)
                 } else {
-                    let total_len: usize = (from..to)
-                        .map(|idx| self.token(idx).len())
-                        .sum::<usize>()
-                        + len
-                        - 1;
+                    let total_len: usize =
+                        (from..to).map(|idx| self.token(idx).len()).sum::<usize>() + len - 1;
 
                     if total_len <= buf_storage.len() {
                         let mut buf_len = 0;

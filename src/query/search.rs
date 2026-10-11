@@ -13,7 +13,7 @@ use cypress::models::place::Layer;
 use cypress::models::AdminEntry;
 use cypress::scylla::ScyllaClient;
 
-use super::memdb::{AreaPhraseScoreCache, CosSimMatch, Memdb, MAX_QUERY_PHRASES, GUESS_CONTEXT};
+use super::memdb::{AreaPhraseScoreCache, CosSimMatch, Memdb, GUESS_CONTEXT, MAX_QUERY_PHRASES};
 
 #[derive(Clone)]
 pub struct SearchParams {
@@ -233,9 +233,11 @@ fn collect_component_match_options(
     // For one semantic component, two options consuming the same query tokens
     // are interchangeable; retaining only the cheapest one is lossless.
     out.sort_unstable_by(|a, b| {
-        a.mask
-            .cmp(&b.mask)
-            .then(a.cost.partial_cmp(&b.cost).unwrap_or(std::cmp::Ordering::Equal))
+        a.mask.cmp(&b.mask).then(
+            a.cost
+                .partial_cmp(&b.cost)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
     });
     out.dedup_by(|a, b| a.mask == b.mask);
 }
@@ -336,10 +338,7 @@ fn find_exact_house_range(
     Some((first, lo))
 }
 
-fn place_prior_bonus(
-    db: &cypress::models::memdb::ArchivedCypressMemDb,
-    place_idx: usize,
-) -> f32 {
+fn place_prior_bonus(db: &cypress::models::memdb::ArchivedCypressMemDb, place_idx: usize) -> f32 {
     let layer_rank = db.place_layer_ranks[place_idx];
     let population = db.place_populations[place_idx] as f32;
     let layer_bonus = cypress::models::scoring::get_layer_score_bonus(layer_rank);
@@ -359,11 +358,7 @@ fn place_prior_bonus(
 /// globally minimum-cost assignment. For T <= 8 query tokens the state space
 /// is at most 2^T = 256; runtime is O(C * 2^T * P) for C components and at
 /// most P retained phrase options per component, with O(2^T) scratch memory.
-fn advance_component_dp(
-    dp: &mut [f32; 256],
-    options: &[ComponentMatchOption],
-    all_mask: u8,
-) {
+fn advance_component_dp(dp: &mut [f32; 256], options: &[ComponentMatchOption], all_mask: u8) {
     if options.is_empty() {
         return;
     }
@@ -412,7 +407,12 @@ fn build_area_component_options(
     for pos in start..end {
         let area_idx = db.area_set_data[pos] as usize;
         let Some(scores) = cached_area_phrase_scores(
-            db, area_idx, phrases, query_epoch, area_phrase_scores, offset_arr,
+            db,
+            area_idx,
+            phrases,
+            query_epoch,
+            area_phrase_scores,
+            offset_arr,
         ) else {
             continue;
         };
@@ -431,9 +431,11 @@ fn build_area_component_options(
         }
 
         options.sort_unstable_by(|a, b| {
-            a.mask
-                .cmp(&b.mask)
-                .then(a.cost.partial_cmp(&b.cost).unwrap_or(std::cmp::Ordering::Equal))
+            a.mask.cmp(&b.mask).then(
+                a.cost
+                    .partial_cmp(&b.cost)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
         });
         options.dedup_by(|a, b| a.mask == b.mask);
         if !options.is_empty() {
@@ -633,7 +635,9 @@ fn cached_area_phrase_scores<'a>(
             {
                 Ok(pos) => phrase.admin_prefix_scores[pos].1,
                 Err(_) => cypress::models::scoring::get_area_match_score(
-                    area_name, &phrase.bytes, offset_arr,
+                    area_name,
+                    &phrase.bytes,
+                    offset_arr,
                 ),
             };
         }
@@ -668,7 +672,12 @@ fn score_area_matches(
     for ai in as_start..as_end {
         let area_idx = db.area_set_data[ai] as usize;
         let Some(scores) = cached_area_phrase_scores(
-            db, area_idx, phrases, query_epoch, area_phrase_scores, offset_arr,
+            db,
+            area_idx,
+            phrases,
+            query_epoch,
+            area_phrase_scores,
+            offset_arr,
         ) else {
             continue;
         };
@@ -824,7 +833,8 @@ pub fn search_place_ids(
 
     GUESS_CONTEXT.with(|cell| {
         let phase_started = Instant::now();
-        let mut ctx = cell.borrow_mut();
+        let mut ctx_guard = cell.borrow_mut();
+        let ctx = &mut *ctx_guard;
         ctx.clear(string_count, place_count, &memdb_data.version);
 
         let needed_area_sets = db.area_set_offsets.len();
@@ -832,7 +842,8 @@ pub fn search_place_ids(
             ctx.area_match_cache
                 .resize(needed_area_sets, (0.0, 0, 0, 0));
         }
-        ctx.area_phrase_scores.begin_query(db.area_name_offsets.len().saturating_sub(1));
+        ctx.area_phrase_scores
+            .begin_query(db.area_name_offsets.len().saturating_sub(1));
 
         log_phase_timing("search_place_ids", "clear_context", phase_started);
 
@@ -999,7 +1010,9 @@ pub fn search_place_ids(
                 &mut component_options,
             );
             let Some(best_option) = component_options.iter().min_by(|a, b| {
-                a.cost.partial_cmp(&b.cost).unwrap_or(std::cmp::Ordering::Equal)
+                a.cost
+                    .partial_cmp(&b.cost)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             }) else {
                 continue;
             };
@@ -1113,10 +1126,11 @@ pub fn search_place_ids(
         // same semantic component and token mask, keeping the cheapest alias is
         // lossless.
         name_evidence.sort_unstable_by(|a, b| {
-            a.place_id
-                .cmp(&b.place_id)
-                .then(a.mask.cmp(&b.mask))
-                .then(a.cost.partial_cmp(&b.cost).unwrap_or(std::cmp::Ordering::Equal))
+            a.place_id.cmp(&b.place_id).then(a.mask.cmp(&b.mask)).then(
+                a.cost
+                    .partial_cmp(&b.cost)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
         });
         name_evidence.dedup_by(|a, b| a.place_id == b.place_id && a.mask == b.mask);
 
@@ -1124,10 +1138,13 @@ pub fn search_place_ids(
             a.street_group_id
                 .cmp(&b.street_group_id)
                 .then(a.mask.cmp(&b.mask))
-                .then(a.cost.partial_cmp(&b.cost).unwrap_or(std::cmp::Ordering::Equal))
+                .then(
+                    a.cost
+                        .partial_cmp(&b.cost)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
         });
-        street_evidence
-            .dedup_by(|a, b| a.street_group_id == b.street_group_id && a.mask == b.mask);
+        street_evidence.dedup_by(|a, b| a.street_group_id == b.street_group_id && a.mask == b.mask);
 
         // Structured address candidate generation. A global fuzzy hit only
         // resolves a street group. House lookup then happens locally with two
@@ -1154,7 +1171,9 @@ pub fn search_place_ids(
                     .iter()
                     .filter(|option| option.mask & house_phrase.mask == 0)
                     .min_by(|a, b| {
-                        a.cost.partial_cmp(&b.cost).unwrap_or(std::cmp::Ordering::Equal)
+                        a.cost
+                            .partial_cmp(&b.cost)
+                            .unwrap_or(std::cmp::Ordering::Equal)
                     })
                 else {
                     continue;
@@ -1209,7 +1228,9 @@ pub fn search_place_ids(
                     // before the exact component planner gets to run.
                     let mut structural_cost = base_structural_cost;
                     let mut house_mask = final_mask;
-                    if let Some(postcode) = get_house_postcode(db, house_idx).filter(|p| !p.is_empty()) {
+                    if let Some(postcode) =
+                        get_house_postcode(db, house_idx).filter(|p| !p.is_empty())
+                    {
                         let prepared =
                             cypress::models::scoring::PreparedMatchCandidate::new(postcode);
                         let mut best_postcode = cypress::models::scoring::NO_MATCH;
@@ -1218,12 +1239,8 @@ pub fn search_place_ids(
                             if phrase.mask & house_mask != 0 {
                                 continue;
                             }
-                            let score = prepared.score(
-                                &phrase.bytes,
-                                &mut ctx.sift4_offset_arr,
-                            );
-                            if score != cypress::models::scoring::NO_MATCH
-                                && score < best_postcode
+                            let score = prepared.score(&phrase.bytes, &mut ctx.sift4_offset_arr);
+                            if score != cypress::models::scoring::NO_MATCH && score < best_postcode
                             {
                                 best_postcode = score;
                                 best_postcode_mask = phrase.mask;
@@ -2137,17 +2154,26 @@ mod tests {
             dp[0] = 0.0;
             advance_component_dp(
                 &mut dp,
-                &[ComponentMatchOption { mask: street_mask, cost: -8.0 }],
+                &[ComponentMatchOption {
+                    mask: street_mask,
+                    cost: -8.0,
+                }],
                 0b111,
             );
             advance_component_dp(
                 &mut dp,
-                &[ComponentMatchOption { mask: house_mask, cost: -3.0 }],
+                &[ComponentMatchOption {
+                    mask: house_mask,
+                    cost: -3.0,
+                }],
                 0b111,
             );
             advance_component_dp(
                 &mut dp,
-                &[ComponentMatchOption { mask: admin_mask, cost: -6.0 }],
+                &[ComponentMatchOption {
+                    mask: admin_mask,
+                    cost: -6.0,
+                }],
                 0b111,
             );
             dp[0b111]

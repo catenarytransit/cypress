@@ -1002,7 +1002,8 @@ fn determine_layer(tags: &osmpbfreader::Tags) -> Option<Layer> {
             || tags.contains_key("tourism")
             || tags.contains_key("leisure");
 
-        let has_address_anchor = tags.contains_key("addr:street") || tags.contains_key("addr:place");
+        let has_address_anchor =
+            tags.contains_key("addr:street") || tags.contains_key("addr:place");
         let is_address = tags.contains_key("addr:housenumber") && has_address_anchor;
 
         if is_venue {
