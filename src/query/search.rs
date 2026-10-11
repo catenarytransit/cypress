@@ -13,7 +13,7 @@ use cypress::models::place::Layer;
 use cypress::models::AdminEntry;
 use cypress::scylla::ScyllaClient;
 
-use super::memdb::{CosSimMatch, Memdb, GUESS_CONTEXT};
+use super::memdb::{AreaPhraseScoreCache, CosSimMatch, Memdb, MAX_QUERY_PHRASES, GUESS_CONTEXT};
 
 #[derive(Clone)]
 pub struct SearchParams {
@@ -390,6 +390,8 @@ fn build_area_component_options(
     db: &cypress::models::memdb::ArchivedCypressMemDb,
     area_set_idx: u32,
     phrases: &[QueryPhrase],
+    query_epoch: u32,
+    area_phrase_scores: &mut AreaPhraseScoreCache,
     offset_arr: &mut Vec<cypress::models::sift4::SiftOffset>,
 ) -> Vec<Vec<ComponentMatchOption>> {
     if area_set_idx == u32::MAX {
@@ -409,31 +411,17 @@ fn build_area_component_options(
     let mut components = Vec::new();
     for pos in start..end {
         let area_idx = db.area_set_data[pos] as usize;
-        if area_idx + 1 >= db.area_name_offsets.len() {
+        let Some(scores) = cached_area_phrase_scores(
+            db, area_idx, phrases, query_epoch, area_phrase_scores, offset_arr,
+        ) else {
             continue;
-        }
-        let name_start = db.area_name_offsets[area_idx] as usize;
-        let name_end = db.area_name_offsets[area_idx + 1] as usize;
-        if name_start > name_end || name_end > db.area_name_bytes.len() {
-            continue;
-        }
-        let area_name = &db.area_name_bytes[name_start..name_end];
+        };
         let area_pop = db.area_populations.get(area_idx).copied().unwrap_or(0) as f32;
         let area_bonus = 2.0 + (area_pop / 10_000_000.0) * 2.0;
 
         let mut options = Vec::new();
-        for phrase in phrases {
-            let score = match phrase
-                .admin_prefix_scores
-                .binary_search_by_key(&(area_idx as u32), |(area_id, _)| *area_id)
-            {
-                Ok(prefix_pos) => phrase.admin_prefix_scores[prefix_pos].1,
-                Err(_) => cypress::models::scoring::get_area_match_score(
-                    area_name,
-                    &phrase.bytes,
-                    offset_arr,
-                ),
-            };
+        for (phrase_idx, phrase) in phrases.iter().enumerate() {
+            let score = scores[phrase_idx];
             if score != cypress::models::scoring::NO_MATCH {
                 options.push(ComponentMatchOption {
                     mask: phrase.mask,
@@ -620,12 +608,46 @@ fn resolve_admin_prefix_scores(
     best_by_area
 }
 
+/// Evaluate all phrase variants for an administrative area only once per
+/// query, as in ADR's activate_areas(). First-pass matching, address seeding,
+/// and exact final reranking must use the identical cached lexical scores.
+fn cached_area_phrase_scores<'a>(
+    db: &cypress::models::memdb::ArchivedCypressMemDb,
+    area_idx: usize,
+    phrases: &[QueryPhrase],
+    query_epoch: u32,
+    cache: &'a mut AreaPhraseScoreCache,
+    offset_arr: &mut Vec<cypress::models::sift4::SiftOffset>,
+) -> Option<&'a [f32; MAX_QUERY_PHRASES]> {
+    debug_assert!(phrases.len() <= MAX_QUERY_PHRASES);
+    let name_start = *db.area_name_offsets.get(area_idx)? as usize;
+    let name_end = *db.area_name_offsets.get(area_idx.checked_add(1)?)? as usize;
+    let area_name = db.area_name_bytes.get(name_start..name_end)?;
+
+    cache.get_or_compute(area_idx, query_epoch, |scores| {
+        for (phrase_idx, phrase) in phrases.iter().enumerate() {
+            // This preserves the existing alias-prefix preference exactly.
+            scores[phrase_idx] = match phrase
+                .admin_prefix_scores
+                .binary_search_by_key(&(area_idx as u32), |(id, _)| *id)
+            {
+                Ok(pos) => phrase.admin_prefix_scores[pos].1,
+                Err(_) => cypress::models::scoring::get_area_match_score(
+                    area_name, &phrase.bytes, offset_arr,
+                ),
+            };
+        }
+    })
+}
+
 /// Try to match unmatched query tokens against area names for a place.
 fn score_area_matches(
     db: &cypress::models::memdb::ArchivedCypressMemDb,
     area_set_idx: usize,
     phrases: &[QueryPhrase],
     matched_mask: u8,
+    query_epoch: u32,
+    area_phrase_scores: &mut AreaPhraseScoreCache,
     offset_arr: &mut Vec<cypress::models::sift4::SiftOffset>,
 ) -> (f32, u8) {
     if area_set_idx as u32 == u32::MAX {
@@ -645,36 +667,20 @@ fn score_area_matches(
 
     for ai in as_start..as_end {
         let area_idx = db.area_set_data[ai] as usize;
-        if area_idx >= db.area_name_offsets.len().saturating_sub(1) {
+        let Some(scores) = cached_area_phrase_scores(
+            db, area_idx, phrases, query_epoch, area_phrase_scores, offset_arr,
+        ) else {
             continue;
-        }
-
-        let name_start = db.area_name_offsets[area_idx] as usize;
-        let name_end = db.area_name_offsets[area_idx + 1] as usize;
-        if name_start > name_end || name_end > db.area_name_bytes.len() {
-            continue;
-        }
-
-        let area_name = &db.area_name_bytes[name_start..name_end];
+        };
         let mut best_phrase_score = cypress::models::scoring::NO_MATCH;
         let mut best_phrase_mask = 0u8;
 
-        for phrase in phrases {
+        for (phrase_idx, phrase) in phrases.iter().enumerate() {
             if (phrase.mask & current_mask) != 0 {
                 continue;
             }
 
-            let score = match phrase
-                .admin_prefix_scores
-                .binary_search_by_key(&(area_idx as u32), |(area_id, _)| *area_id)
-            {
-                Ok(pos) => phrase.admin_prefix_scores[pos].1,
-                Err(_) => cypress::models::scoring::get_area_match_score(
-                    area_name,
-                    &phrase.bytes,
-                    offset_arr,
-                ),
-            };
+            let score = scores[phrase_idx];
             if score != cypress::models::scoring::NO_MATCH && score < best_phrase_score {
                 best_phrase_score = score;
                 best_phrase_mask = phrase.mask;
@@ -826,6 +832,7 @@ pub fn search_place_ids(
             ctx.area_match_cache
                 .resize(needed_area_sets, (0.0, 0, 0, 0));
         }
+        ctx.area_phrase_scores.begin_query(db.area_name_offsets.len().saturating_sub(1));
 
         log_phase_timing("search_place_ids", "clear_context", phase_started);
 
@@ -1048,6 +1055,8 @@ pub fn search_place_ids(
                                 area_set_idx,
                                 &phrases,
                                 matched_mask,
+                                query_epoch,
+                                &mut ctx.area_phrase_scores,
                                 &mut ctx.sift4_offset_arr,
                             );
                             ctx.area_match_cache[area_set_idx] =
@@ -1172,6 +1181,8 @@ pub fn search_place_ids(
                             area_set_idx,
                             &phrases,
                             matched_mask,
+                            query_epoch,
+                            &mut ctx.area_phrase_scores,
                             &mut ctx.sift4_offset_arr,
                         );
                         ctx.area_match_cache[area_set_idx] =
@@ -1285,6 +1296,8 @@ pub fn search_place_ids(
                     db,
                     area_set,
                     &phrases,
+                    query_epoch,
+                    &mut ctx.area_phrase_scores,
                     &mut ctx.sift4_offset_arr,
                 );
                 area_component_cache.insert(area_set, components);
@@ -1342,6 +1355,14 @@ pub fn search_place_ids(
             "search_place_ids",
             "apply_geographic_scoring",
             phase_started,
+        );
+        let (area_cache_hits, area_cache_misses) = ctx.area_phrase_scores.stats();
+        debug!(
+            target: "cypress::query::timing",
+            op = "search_place_ids",
+            area_cache_hits,
+            area_cache_misses,
+            "ADR-style administrative area phrase cache summary"
         );
 
         let phase_started = Instant::now();

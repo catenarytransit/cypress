@@ -19,6 +19,8 @@ pub struct CosSimMatch {
 
 const QUERY_CACHE_MAX_ENTRIES: usize = 128;
 const QUERY_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+// Eight query tokens yield at most 8 * 9 / 2 contiguous phrases.
+pub const MAX_QUERY_PHRASES: usize = 36;
 
 /// Sparse cached ScanCount state. The old cache stored one byte for every
 /// searchable string per entry, even when only a small fraction of IDs had
@@ -174,6 +176,99 @@ impl QueryNgramCache {
     }
 }
 
+/// ADR-style area/phrase scores: an area is activated once per query. A dense
+/// area-id -> epoch/slot directory avoids hashing on the hot path, while only
+/// areas actually visited by the query occupy a 36-score row. All three ranking
+/// paths share this table. Scores are not persisted in the compiled dataset.
+#[derive(Default)]
+pub struct AreaPhraseScoreCache {
+    area_epochs: Vec<u32>,
+    area_slots: Vec<u32>,
+    rows: Vec<[f32; MAX_QUERY_PHRASES]>,
+    hits: usize,
+    misses: usize,
+}
+
+impl AreaPhraseScoreCache {
+    pub fn begin_query(&mut self, area_count: usize) {
+        self.area_epochs.resize(area_count, 0);
+        self.area_slots.resize(area_count, 0);
+        // Keep the allocation across requests, but never retain query scores.
+        self.rows.clear();
+        self.hits = 0;
+        self.misses = 0;
+    }
+
+    pub fn invalidate_on_epoch_wrap(&mut self) {
+        self.area_epochs.fill(0);
+        self.rows.clear();
+    }
+
+    /// The key is (query epoch, administrative area id, phrase id). `build`
+    /// fills the entire current-query row only on first access to an area.
+    pub fn get_or_compute(
+        &mut self,
+        area_idx: usize,
+        epoch: u32,
+        build: impl FnOnce(&mut [f32; MAX_QUERY_PHRASES]),
+    ) -> Option<&[f32; MAX_QUERY_PHRASES]> {
+        if area_idx >= self.area_epochs.len() {
+            return None;
+        }
+        if self.area_epochs[area_idx] != epoch {
+            let slot = u32::try_from(self.rows.len()).ok()?;
+            self.rows.push([f32::MAX; MAX_QUERY_PHRASES]);
+            build(&mut self.rows[slot as usize]);
+            self.area_slots[area_idx] = slot;
+            self.area_epochs[area_idx] = epoch;
+            self.misses += 1;
+        } else {
+            self.hits += 1;
+        }
+        Some(&self.rows[self.area_slots[area_idx] as usize])
+    }
+
+    pub fn stats(&self) -> (usize, usize) {
+        (self.hits, self.misses)
+    }
+}
+
+#[cfg(test)]
+mod area_phrase_cache_tests {
+    use super::AreaPhraseScoreCache;
+
+    #[test]
+    fn area_phrase_scores_are_computed_once_per_epoch() {
+        let mut cache = AreaPhraseScoreCache::default();
+        cache.begin_query(4);
+        let mut builds = 0;
+        assert_eq!(
+            cache.get_or_compute(2, 12, |row| {
+                builds += 1;
+                row[0] = -3.5;
+                row[35] = 2.0;
+            }).unwrap()[35],
+            2.0
+        );
+        assert_eq!(cache.get_or_compute(2, 12, |_| panic!("recomputed"))
+            .unwrap()[0], -3.5);
+        assert_eq!(builds, 1);
+        assert_eq!(cache.stats(), (1, 1));
+        assert!(cache.get_or_compute(9, 12, |_| panic!("invalid area"))
+            .is_none());
+
+        cache.begin_query(4);
+        assert_eq!(cache.get_or_compute(2, 13, |row| row[0] = 5.0)
+            .unwrap()[0], 5.0);
+        assert_eq!(cache.stats(), (0, 1));
+
+        cache.invalidate_on_epoch_wrap();
+        cache.begin_query(4);
+        assert_eq!(cache.get_or_compute(2, 1, |row| row[0] = 7.0)
+            .unwrap()[0], 7.0);
+    }
+}
+
 pub struct GuessContext {
     pub string_match_counts: Vec<u8>,
     pub string_match_epochs: Vec<u32>,
@@ -184,6 +279,7 @@ pub struct GuessContext {
     pub query_cache_version: String,
     pub query_epoch: u32,
     pub area_match_cache: Vec<(f32, u8, u8, u32)>,
+    pub area_phrase_scores: AreaPhraseScoreCache,
     pub sift4_offset_arr: Vec<cypress::models::sift4::SiftOffset>,
     pub place_scores: Vec<(u32, f32)>,
 }
@@ -200,6 +296,7 @@ impl GuessContext {
             query_cache_version: String::new(),
             query_epoch: 1,
             area_match_cache: Vec::new(),
+            area_phrase_scores: AreaPhraseScoreCache::default(),
             sift4_offset_arr: Vec::new(),
             place_scores: Vec::new(),
         }
@@ -234,6 +331,7 @@ impl GuessContext {
             // but reset stamp-backed caches so stale entries cannot become visible.
             self.string_match_epochs.fill(0);
             self.area_match_cache.fill((0.0, 0, 0, 0));
+            self.area_phrase_scores.invalidate_on_epoch_wrap();
             self.query_epoch = 1;
         }
     }
