@@ -251,10 +251,10 @@ fn active_ngram_cache_mode() -> CacheAdmissionMode {
     *NGRAM_CACHE_MODE.get_or_init(|| match std::env::var("CYPRESS_NGRAM_CACHE_MODE") {
         Ok(value) => CacheAdmissionMode::parse(&value).unwrap_or_else(|| {
             warn!(target: "cypress::query::timing", %value,
-                "invalid CYPRESS_NGRAM_CACHE_MODE; using two-hit (legacy rolls back)");
-            CacheAdmissionMode::TwoHit
+                "invalid CYPRESS_NGRAM_CACHE_MODE; using legacy (set two-hit to opt in)");
+            CacheAdmissionMode::Legacy
         }),
-        Err(_) => CacheAdmissionMode::TwoHit,
+        Err(_) => CacheAdmissionMode::Legacy,
     })
 }
 
