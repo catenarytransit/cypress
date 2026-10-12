@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use memmap2::Mmap;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,8 +19,6 @@ pub struct CosSimMatch {
 
 const QUERY_CACHE_MAX_ENTRIES: usize = 128;
 const QUERY_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
-// The admission sketch holds only gram-set keys (not millions of counts).
-const QUERY_CACHE_ADMISSION_HISTORY: usize = 512;
 // Eight query tokens yield at most 8 * 9 / 2 contiguous phrases.
 pub const MAX_QUERY_PHRASES: usize = 36;
 
@@ -98,10 +96,6 @@ pub struct QueryNgramCache {
     bytes: usize,
     insert_order: VecDeque<Vec<u16>>,
     entries: HashMap<Vec<u16>, Arc<SparseNgramCounts>>,
-    // Cheap, bounded two-hit admission history. Full count snapshots are
-    // constructed only after a gram set is seen twice on this worker.
-    admission_seen: HashSet<Vec<u16>>,
-    admission_order: VecDeque<Vec<u16>>,
 }
 
 impl QueryNgramCache {
@@ -112,8 +106,6 @@ impl QueryNgramCache {
             bytes: 0,
             insert_order: VecDeque::new(),
             entries: HashMap::new(),
-            admission_seen: HashSet::new(),
-            admission_order: VecDeque::new(),
         }
     }
 
@@ -152,27 +144,6 @@ impl QueryNgramCache {
         None
     }
 
-    /// First observation records a small key; second observation admits the
-    /// snapshot. This method does not touch the query accumulator, so changing
-    /// admission policy cannot change cosine scores or search results.
-    pub fn should_admit_two_hit(&mut self, key: &[u16]) -> bool {
-        if self.admission_seen.contains(key) {
-            return true;
-        }
-        if QUERY_CACHE_ADMISSION_HISTORY == 0 {
-            return false;
-        }
-        let owned = key.to_vec();
-        self.admission_seen.insert(owned.clone());
-        self.admission_order.push_back(owned);
-        while self.admission_order.len() > QUERY_CACHE_ADMISSION_HISTORY {
-            if let Some(oldest) = self.admission_order.pop_front() {
-                self.admission_seen.remove(&oldest);
-            }
-        }
-        false
-    }
-
     pub fn put(&mut self, key: &[u16], counts: Arc<SparseNgramCounts>) {
         let entry_bytes = counts.approx_bytes();
         if self.max_entries == 0
@@ -201,8 +172,6 @@ impl QueryNgramCache {
     pub fn clear(&mut self) {
         self.insert_order.clear();
         self.entries.clear();
-        self.admission_seen.clear();
-        self.admission_order.clear();
         self.bytes = 0;
     }
 
@@ -210,21 +179,6 @@ impl QueryNgramCache {
     /// separately so they can be aggregated across worker threads.
     pub fn residency(&self) -> (usize, usize) {
         (self.entries.len(), self.bytes)
-    }
-}
-
-#[cfg(test)]
-mod ngram_admission_tests {
-    use super::*;
-
-    #[test]
-    fn two_hit_admits_only_after_a_repeat_and_resets_on_index_change() {
-        let mut cache = QueryNgramCache::new(3, 1024);
-        assert!(!cache.should_admit_two_hit(&[1, 2]));
-        assert!(!cache.should_admit_two_hit(&[1, 3]));
-        assert!(cache.should_admit_two_hit(&[1, 2]));
-        cache.clear();
-        assert!(!cache.should_admit_two_hit(&[1, 2]));
     }
 }
 

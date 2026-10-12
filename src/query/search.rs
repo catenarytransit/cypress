@@ -160,25 +160,6 @@ impl CosineMode {
 }
 
 static COSINE_MODE: std::sync::OnceLock<CosineMode> = std::sync::OnceLock::new();
-static COSINE_SHADOW_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-
-/// Comparisons between cosine implementations are a diagnostic experiment,
-/// not part of normal production search (even when DEBUG logging is enabled).
-fn parse_cosine_shadow_enabled(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
-}
-
-fn cosine_shadow_enabled() -> bool {
-    *COSINE_SHADOW_ENABLED.get_or_init(|| {
-        std::env::var("CYPRESS_COSINE_SHADOW")
-            .map(|value| parse_cosine_shadow_enabled(&value))
-            .unwrap_or(false)
-    })
-}
-
 fn active_cosine_mode() -> CosineMode {
     *COSINE_MODE.get_or_init(|| match std::env::var("CYPRESS_COSINE_MODE") {
         Ok(value) => CosineMode::parse(&value).unwrap_or_else(|| {
@@ -228,31 +209,7 @@ impl PrefixMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CacheAdmissionMode {
-    TwoHit,
-    Legacy,
-}
-
-impl CacheAdmissionMode {
-    fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "two-hit" | "two_hit" => Some(Self::TwoHit),
-            "legacy" => Some(Self::Legacy),
-            _ => None,
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::TwoHit => "two-hit",
-            Self::Legacy => "legacy",
-        }
-    }
-}
-
 static PREFIX_MODE: std::sync::OnceLock<PrefixMode> = std::sync::OnceLock::new();
-static NGRAM_CACHE_MODE: std::sync::OnceLock<CacheAdmissionMode> = std::sync::OnceLock::new();
 
 fn active_prefix_mode() -> PrefixMode {
     *PREFIX_MODE.get_or_init(|| match std::env::var("CYPRESS_PREFIX_MODE") {
@@ -262,17 +219,6 @@ fn active_prefix_mode() -> PrefixMode {
             PrefixMode::Bounded
         }),
         Err(_) => PrefixMode::Bounded,
-    })
-}
-
-fn active_ngram_cache_mode() -> CacheAdmissionMode {
-    *NGRAM_CACHE_MODE.get_or_init(|| match std::env::var("CYPRESS_NGRAM_CACHE_MODE") {
-        Ok(value) => CacheAdmissionMode::parse(&value).unwrap_or_else(|| {
-            warn!(target: "cypress::query::timing", %value,
-                "invalid CYPRESS_NGRAM_CACHE_MODE; using legacy (set two-hit to opt in)");
-            CacheAdmissionMode::Legacy
-        }),
-        Err(_) => CacheAdmissionMode::Legacy,
     })
 }
 
@@ -359,7 +305,7 @@ fn adr_query_bigram_occurrences(query: &str) -> usize {
 }
 
 /// ADR's n_bigrams_[string] is min(255, normalized_byte_len - 1), not
-/// the count of unique bigrams in that string. This shadow comparison uses
+/// the count of unique bigrams in that string. ADR scoring uses
 /// the existing Cypress-normalized stored string length; differences between
 /// Cypress and ADR UTF-8 normalization remain a separate parity question.
 fn adr_cosine_score(
@@ -375,23 +321,6 @@ fn adr_cosine_score(
     }
     let shared = matching_unique_bigrams as f32;
     Some(shared * shared / (string_denominator * query_bigram_occurrences) as f32)
-}
-
-/// Both input slices must be sorted and contain unique string IDs.
-fn sorted_string_id_overlap(a: &[u32], b: &[u32]) -> usize {
-    let (mut i, mut j, mut common) = (0usize, 0usize, 0usize);
-    while i < a.len() && j < b.len() {
-        match a[i].cmp(&b[j]) {
-            std::cmp::Ordering::Less => i += 1,
-            std::cmp::Ordering::Greater => j += 1,
-            std::cmp::Ordering::Equal => {
-                common += 1;
-                i += 1;
-                j += 1;
-            }
-        }
-    }
-    common
 }
 
 /// Tokenize a query string into words.
@@ -1139,12 +1068,6 @@ pub fn search_place_ids(
 
     let cosine_mode = active_cosine_mode();
     let prefix_mode = active_prefix_mode();
-    let cache_mode = active_ngram_cache_mode();
-    debug!(
-        target: "cypress::query::timing",
-        lexical_lower_bound = cypress::models::scoring::lexical_lower_bound_enabled(),
-        "experimental Sift4 lexical lower-bound rejection (opt-in)"
-    );
     debug!(
         target: "cypress::query::timing",
         cosine_mode = cosine_mode.as_str(),
@@ -1153,9 +1076,8 @@ pub fn search_place_ids(
     debug!(
         target: "cypress::query::timing",
         prefix_mode = prefix_mode.as_str(),
-        cache_admission_mode = cache_mode.as_str(),
         extra_prefix_budget = EXTRA_PREFIX_STRING_BUDGET,
-        "search retrieval experiment modes (set each mode to legacy to roll back)"
+        "active prefix candidate retrieval mode"
     );
     let detailed_metrics =
         tracing::enabled!(target: "cypress::query::timing", tracing::Level::DEBUG);
@@ -1322,15 +1244,6 @@ pub fn search_place_ids(
         } else {
             u16::MAX
         };
-        // The shadow scorer is OFF by default, independently of DEBUG logging.
-        // Only compare when explicitly opted in and both formulas use the
-        // same postings (ADR truncates at 128 bigram occurrences).
-        let compare_cosines = detailed_metrics
-            && cosine_shadow_enabled()
-            && (1..=128).contains(&adr_query_bigram_total);
-        let evaluate_cypress = cosine_mode == CosineMode::Cypress || compare_cosines;
-        let evaluate_adr = cosine_mode == CosineMode::Adr || compare_cosines;
-
         let query_bigrams = ctx.query_bigrams.clone();
         let mut missing_bigrams = Vec::new();
 
@@ -1385,13 +1298,8 @@ pub fn search_place_ids(
         let phase_started = Instant::now();
         let mut cache_snapshot_entries = 0usize;
         let mut cache_snapshot_bytes = 0usize;
-        let cache_snapshot_eligible = !ctx.query_cache.has_exact(&query_bigrams);
-        let cache_snapshot_admitted = cache_snapshot_eligible
-            && match cache_mode {
-                CacheAdmissionMode::Legacy => true,
-                CacheAdmissionMode::TwoHit => ctx.query_cache.should_admit_two_hit(&query_bigrams),
-            };
-        if cache_snapshot_admitted {
+        let cache_snapshot_needed = !ctx.query_cache.has_exact(&query_bigrams);
+        if cache_snapshot_needed {
             let snapshot = ctx.snapshot_sparse_counts();
             cache_snapshot_entries = snapshot.string_ids.len();
             cache_snapshot_bytes = snapshot.string_ids.len() * std::mem::size_of::<u32>()
@@ -1402,94 +1310,55 @@ pub fn search_place_ids(
         debug!(
             target: "cypress::query::timing",
             op = "search_place_ids",
-            cache_admission_mode = cache_mode.as_str(),
-            cache_snapshot_eligible,
-            cache_snapshot_admitted,
-            cache_snapshot_skipped = cache_snapshot_eligible && !cache_snapshot_admitted,
+            cache_snapshot_needed,
             cache_snapshot_entries,
             cache_snapshot_bytes,
             "bigram snapshot admission summary"
         );
 
-        // Compute only the selected cosine formula in production. The alternate
-        // formula runs exclusively with CYPRESS_COSINE_SHADOW=1 and DEBUG logs;
-        // it never influences place retrieval or ranking.
+        // Evaluate only the production cosine formula. Prefix FST candidates
+        // are added separately below and do not depend on this cutoff.
         let phase_started = Instant::now();
         let mut string_matches = Vec::<CosSimMatch>::new();
-        let mut alternate_matches = Vec::<CosSimMatch>::new();
-        let mut both_above_cutoff = 0usize;
-        let mut cypress_only_above_cutoff = 0usize;
-        let mut adr_only_above_cutoff = 0usize;
         for touched_idx in 0..ctx.touched_string_indices.len() {
             let i = ctx.touched_string_indices[touched_idx] as usize;
             let match_count = ctx.string_match_count(i);
             let shared = match_count as u16;
-            if (!evaluate_cypress || shared < cypress_min_match_count)
-                && (!evaluate_adr || shared < adr_min_match_count)
-            {
-                continue;
-            }
-
-            let cypress_score = if evaluate_cypress && shared >= cypress_min_match_count {
-                let stored_unique_grams = db.string_bigram_counts[i] as f32;
-                if stored_unique_grams > 0.0 {
-                    let count = match_count as f32;
-                    let similarity =
-                        count * count / (stored_unique_grams * query_bigram_count_u32 as f32);
-                    (similarity >= COS_SIM_CUTOFF).then_some(similarity)
-                } else {
-                    None
+            let score = match cosine_mode {
+                CosineMode::Adr if shared >= adr_min_match_count => {
+                    match (
+                        db.string_name_offsets.get(i).copied(),
+                        db.string_name_offsets.get(i + 1).copied(),
+                    ) {
+                        (Some(start), Some(end)) if end >= start => adr_cosine_score(
+                            match_count,
+                            (end - start) as usize,
+                            adr_query_bigram_count,
+                        )
+                        .filter(|&similarity| similarity >= COS_SIM_CUTOFF),
+                        _ => None,
+                    }
                 }
-            } else {
-                None
-            };
-
-            let adr_score = if evaluate_adr && shared >= adr_min_match_count {
-                match (
-                    db.string_name_offsets.get(i).copied(),
-                    db.string_name_offsets.get(i + 1).copied(),
-                ) {
-                    (Some(start), Some(end)) if end >= start => adr_cosine_score(
-                        match_count,
-                        (end - start) as usize,
-                        adr_query_bigram_count,
-                    )
-                    .filter(|&similarity| similarity >= COS_SIM_CUTOFF),
-                    _ => None,
+                CosineMode::Cypress if shared >= cypress_min_match_count => {
+                    let stored_unique_grams = db.string_bigram_counts[i] as f32;
+                    if stored_unique_grams > 0.0 {
+                        let count = match_count as f32;
+                        let similarity =
+                            count * count / (stored_unique_grams * query_bigram_count_u32 as f32);
+                        (similarity >= COS_SIM_CUTOFF).then_some(similarity)
+                    } else {
+                        None
+                    }
                 }
-            } else {
-                None
+                _ => None,
             };
-
-            if compare_cosines {
-                match (cypress_score.is_some(), adr_score.is_some()) {
-                    (true, true) => both_above_cutoff += 1,
-                    (true, false) => cypress_only_above_cutoff += 1,
-                    (false, true) => adr_only_above_cutoff += 1,
-                    (false, false) => {}
-                }
-            }
-
-            let (selected, alternate) = match cosine_mode {
-                CosineMode::Adr => (adr_score, cypress_score),
-                CosineMode::Cypress => (cypress_score, adr_score),
-            };
-            if let Some(cos_sim) = selected {
+            if let Some(cos_sim) = score {
                 string_matches.push(CosSimMatch {
                     string_idx: i as u32,
                     cos_sim,
                 });
             }
-            if compare_cosines {
-                if let Some(cos_sim) = alternate {
-                    alternate_matches.push(CosSimMatch {
-                        string_idx: i as u32,
-                        cos_sim,
-                    });
-                }
-            }
         }
-        let fuzzy_matches_before_cap = string_matches.len();
         ctx.string_matches.extend(string_matches);
         log_phase_timing(
             "search_place_ids",
@@ -1518,73 +1387,6 @@ pub fn search_place_ids(
             "restrict_sort_string_matches",
             phase_started,
         );
-
-        // Compare fuzzy-only shortlists, before additive FST prefix merging.
-        // The production mode alone controls ctx.string_matches.
-        if detailed_metrics {
-            if compare_cosines {
-                let alternate_before_cap = alternate_matches.len();
-                if alternate_matches.len() > MAX_STRING_MATCHES {
-                    alternate_matches.select_nth_unstable_by(MAX_STRING_MATCHES, |a, b| {
-                        b.cos_sim
-                            .partial_cmp(&a.cos_sim)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                    alternate_matches.truncate(MAX_STRING_MATCHES);
-                }
-                let mut selected_ids: Vec<u32> =
-                    ctx.string_matches.iter().map(|m| m.string_idx).collect();
-                let mut alternate_ids: Vec<u32> =
-                    alternate_matches.iter().map(|m| m.string_idx).collect();
-                selected_ids.sort_unstable();
-                alternate_ids.sort_unstable();
-                let top_6000_overlap = sorted_string_id_overlap(&selected_ids, &alternate_ids);
-                let (cypress_top_count, adr_top_count, cypress_above_cutoff, adr_above_cutoff) =
-                    match cosine_mode {
-                        CosineMode::Adr => (
-                            alternate_ids.len(),
-                            selected_ids.len(),
-                            alternate_before_cap,
-                            fuzzy_matches_before_cap,
-                        ),
-                        CosineMode::Cypress => (
-                            selected_ids.len(),
-                            alternate_ids.len(),
-                            fuzzy_matches_before_cap,
-                            alternate_before_cap,
-                        ),
-                    };
-                debug!(
-                    target: "cypress::query::timing",
-                    op = "search_place_ids",
-                    production_cosine_mode = cosine_mode.as_str(),
-                    adr_query_bigram_occurrences = adr_query_bigram_count,
-                    cypress_query_unique_bigrams = query_bigram_count,
-                    adr_min_match_count,
-                    cypress_min_match_count,
-                    cypress_above_cutoff,
-                    adr_above_cutoff,
-                    both_above_cutoff,
-                    cypress_only_above_cutoff,
-                    adr_only_above_cutoff,
-                    cypress_top_6000_count = cypress_top_count,
-                    adr_top_6000_count = adr_top_count,
-                    top_6000_overlap,
-                    cypress_top_6000_only = cypress_top_count.saturating_sub(top_6000_overlap),
-                    adr_top_6000_only = adr_top_count.saturating_sub(top_6000_overlap),
-                    "production cosine A/B comparison (same indexed bytes, fuzzy only)"
-                );
-            } else if cosine_shadow_enabled() {
-                debug!(
-                    target: "cypress::query::timing",
-                    op = "search_place_ids",
-                    production_cosine_mode = cosine_mode.as_str(),
-                    adr_query_bigram_occurrences_total = adr_query_bigram_total,
-                    adr_query_bigram_occurrences_used = adr_query_bigram_count,
-                    "cosine A/B comparison skipped: ADR is limited to 128 bigram occurrences"
-                );
-            }
-        }
 
         let phase_started = Instant::now();
         if !prefix_string_ids.is_empty() {
@@ -2838,18 +2640,10 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn prefix_and_cache_modes_support_independent_rollback() {
+    fn prefix_mode_supports_legacy_rollback() {
         assert_eq!(PrefixMode::parse("bounded"), Some(PrefixMode::Bounded));
         assert_eq!(PrefixMode::parse(" LEGACY "), Some(PrefixMode::Legacy));
         assert_eq!(PrefixMode::parse("invalid"), None);
-        assert_eq!(
-            CacheAdmissionMode::parse("two-hit"),
-            Some(CacheAdmissionMode::TwoHit)
-        );
-        assert_eq!(
-            CacheAdmissionMode::parse("legacy"),
-            Some(CacheAdmissionMode::Legacy)
-        );
     }
 
     #[test]
@@ -2877,17 +2671,6 @@ mod tests {
         assert_eq!(CosineMode::parse("cypress"), Some(CosineMode::Cypress));
         assert_eq!(CosineMode::parse("CYPRESS"), Some(CosineMode::Cypress));
         assert_eq!(CosineMode::parse("unexpected"), None);
-    }
-
-    #[test]
-    fn cosine_shadow_is_explicitly_opt_in() {
-        assert!(!parse_cosine_shadow_enabled(""));
-        assert!(!parse_cosine_shadow_enabled("0"));
-        assert!(!parse_cosine_shadow_enabled("false"));
-        assert!(!parse_cosine_shadow_enabled("unexpected"));
-        assert!(parse_cosine_shadow_enabled("1"));
-        assert!(parse_cosine_shadow_enabled("TRUE"));
-        assert!(parse_cosine_shadow_enabled(" on "));
     }
 
     #[test]
@@ -2932,7 +2715,6 @@ mod tests {
         assert_eq!(adr_cosine_score(1, 1, 2), None);
         assert_eq!(adr_cosine_score(1, 20, 0), None);
         assert_eq!(adr_cosine_score(2, 300, 2), Some(4.0 / (255.0 * 2.0)));
-        assert_eq!(sorted_string_id_overlap(&[1, 3, 8], &[2, 3, 8, 10]), 2);
     }
 
     #[test]

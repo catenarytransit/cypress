@@ -1,25 +1,8 @@
 /// ADR-style token match scoring — ported from adr/score.h.
 /// Lower scores are better; `NO_MATCH` (f32::MAX) means rejected.
 use super::sift4::{sift4, SiftOffset};
-use std::sync::OnceLock;
 
 pub const NO_MATCH: f32 = f32::MAX;
-
-/// Experimental lexical rejection; off by default. Read once per process.
-/// The query binary logs the selected mode; the compiled index is unchanged.
-static LEXICAL_LOWER_BOUND: OnceLock<bool> = OnceLock::new();
-
-fn parse_lexical_lower_bound(value: &str) -> bool {
-    matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes")
-}
-
-pub fn lexical_lower_bound_enabled() -> bool {
-    *LEXICAL_LOWER_BOUND.get_or_init(|| {
-        std::env::var("CYPRESS_LEXICAL_LOWER_BOUND")
-            .map(|value| parse_lexical_lower_bound(&value))
-            .unwrap_or(false)
-    })
-}
 
 const TOKEN_DELIMITERS: &[u8] = b" -,;/().";
 
@@ -124,37 +107,10 @@ fn finish_token_match_score(dataset_token: &[u8], query: &[u8], cut: &[u8], dist
     }
 }
 
-/// A zero-edit-distance optimistic lower bound on `finish_token_match_score`.
-/// All distance-dependent terms are nonnegative. The remaining terms are
-/// exact multiples of 0.25; calculate them in integer quarter-score units.
-/// Require a margin of >0.25 score points to conservatively accommodate
-/// floating-point addition order in the original scorer. For very long
-/// strings, retain the original path rather than depending on that margin.
-/// This function must be called only for nonempty tokens / slices.
-fn definitely_rejected_before_sift4(dataset_token: &[u8], query: &[u8], cut: &[u8]) -> bool {
-    let n = cut.len();
-    if n == 0 || n > 256 {
-        return false;
-    }
-    let common_prefix = cut.iter().zip(query.iter()).take_while(|(a, b)| a == b).count();
-    let overhang_quarters = dataset_token.len().saturating_sub(query.len()).min(16) as i32;
-    let first_quarters = if cut[0] != query[0] { 8 } else { -2 };
-    let second_quarters = if n > 1 && query.len() > 1 {
-        if cut[1] != query[1] { 4 } else { -1 }
-    } else {
-        -1
-    };
-    let optimistic_quarters = first_quarters + second_quarters
-        + overhang_quarters - common_prefix as i32;
-    let allowed_quarters = 4 * n.div_ceil(2) as i32;
-    optimistic_quarters > allowed_quarters + 1
-}
-
-fn get_token_match_score_with_mode(
+fn get_token_match_score(
     dataset_token: &[u8],
     query: &[u8],
     offset_arr: &mut Vec<SiftOffset>,
-    use_lower_bound: bool,
 ) -> f32 {
     if dataset_token.is_empty() || query.is_empty() {
         return NO_MATCH;
@@ -174,20 +130,9 @@ fn get_token_match_score_with_mode(
         return get_known_prefix_match_score(dataset_token, query);
     }
 
-    if use_lower_bound && definitely_rejected_before_sift4(dataset_token, query, cut) {
-        return NO_MATCH;
-    }
     let max_dist = cut_len / 2 + 2;
     let dist = sift4(cut, query, 3, max_dist, offset_arr);
     finish_token_match_score(dataset_token, query, cut, dist)
-}
-
-fn get_token_match_score(
-    dataset_token: &[u8],
-    query: &[u8],
-    offset_arr: &mut Vec<SiftOffset>,
-) -> f32 {
-    get_token_match_score_with_mode(dataset_token, query, offset_arr, false)
 }
 
 /// Token boundaries prepared once per candidate string and then reused for
@@ -197,15 +142,10 @@ pub struct PreparedMatchCandidate<'a> {
     dataset_name: &'a [u8],
     token_ranges: [(usize, usize); 8],
     token_count: usize,
-    use_lower_bound: bool,
 }
 
 impl<'a> PreparedMatchCandidate<'a> {
     pub fn new(dataset_name: &'a [u8]) -> Self {
-        Self::new_with_mode(dataset_name, lexical_lower_bound_enabled())
-    }
-
-    fn new_with_mode(dataset_name: &'a [u8], use_lower_bound: bool) -> Self {
         let mut token_ranges = [(0usize, 0usize); 8];
         let mut token_count = 0usize;
         let mut i = 0usize;
@@ -230,7 +170,6 @@ impl<'a> PreparedMatchCandidate<'a> {
             dataset_name,
             token_ranges,
             token_count,
-            use_lower_bound,
         }
     }
 
@@ -240,18 +179,13 @@ impl<'a> PreparedMatchCandidate<'a> {
         &self.dataset_name[start..end]
     }
 
-    #[inline]
-    fn token_score(&self, dataset_token: &[u8], query: &[u8], offset_arr: &mut Vec<SiftOffset>) -> f32 {
-        get_token_match_score_with_mode(dataset_token, query, offset_arr, self.use_lower_bound)
-    }
-
     /// Scores this prepared dataset name against one query phrase.
     pub fn score(&self, query: &[u8], offset_arr: &mut Vec<SiftOffset>) -> f32 {
         if self.dataset_name.is_empty() || query.is_empty() {
             return NO_MATCH;
         }
 
-        let fallback = self.token_score(self.dataset_name, query, offset_arr);
+        let fallback = get_token_match_score(self.dataset_name, query, offset_arr);
 
         if self.token_count <= 1 {
             return fallback;
@@ -269,7 +203,7 @@ impl<'a> PreparedMatchCandidate<'a> {
 
                 let mut buf_storage = [0u8; 256];
                 let score = if len == 1 {
-                    self.token_score(self.token(from), query, offset_arr)
+                    get_token_match_score(self.token(from), query, offset_arr)
                 } else {
                     let total_len: usize =
                         (from..to).map(|idx| self.token(idx).len()).sum::<usize>() + len - 1;
@@ -285,7 +219,7 @@ impl<'a> PreparedMatchCandidate<'a> {
                             buf_storage[buf_len..buf_len + token.len()].copy_from_slice(token);
                             buf_len += token.len();
                         }
-                        self.token_score(&buf_storage[..buf_len], query, offset_arr)
+                        get_token_match_score(&buf_storage[..buf_len], query, offset_arr)
                     } else {
                         let mut phrase = Vec::with_capacity(total_len);
                         for idx in from..to {
@@ -294,7 +228,7 @@ impl<'a> PreparedMatchCandidate<'a> {
                             }
                             phrase.extend_from_slice(self.token(idx));
                         }
-                        self.token_score(&phrase, query, offset_arr)
+                        get_token_match_score(&phrase, query, offset_arr)
                     }
                 };
 
@@ -358,70 +292,6 @@ pub fn get_layer_score_bonus(layer_rank: u8) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn lower_bound_is_opt_in() {
-        for value in ["", "0", "off", "false", "garbage"] {
-            assert!(!parse_lexical_lower_bound(value));
-        }
-        for value in ["1", "yes", "on", "TRUE", " On "] {
-            assert!(parse_lexical_lower_bound(value));
-        }
-    }
-
-    #[test]
-    fn optimistic_rejection_keeps_token_scores_bitwise_identical() {
-        let mut words = vec![Vec::new()];
-        for len in 1..=5 {
-            for number in 0..3usize.pow(len) {
-                let mut number = number;
-                let mut word = vec![0u8; len as usize];
-                for character in &mut word {
-                    *character = b'a' + (number % 3) as u8;
-                    number /= 3;
-                }
-                words.push(word);
-            }
-        }
-        let mut offsets = Vec::new();
-        for data in &words {
-            for query in &words {
-                let old = get_token_match_score_with_mode(data, query, &mut offsets, false);
-                let new = get_token_match_score_with_mode(data, query, &mut offsets, true);
-                assert_eq!(old.to_bits(), new.to_bits(), "{data:?} vs {query:?}");
-            }
-        }
-    }
-
-    #[test]
-    fn optimized_prepared_scorer_matches_scalar_on_address_and_poi_phrases() {
-        let names: &[&[u8]] = &[
-            b"4885 paseo de vega", b"santa monica pier", b"london eye",
-            b"uc irvine", b"university of california irvine",
-            b"pariser platz 1", b"avenue anatole france", b"brandenburger tor",
-            b"tokyo tower", b"hauptbahnhof", b"1604 primrose ave",
-            b"5 avenue des champs elysees", b"sydney opera house",
-            b"new york city", b"",
-        ];
-        let phrases: &[&[u8]] = &[
-            b"irvine", b"uc irvine", b"paseo de vega", b"4885",
-            b"santa monica pier california", b"pier", b"london eye",
-            b"paris", b"new york", b"brandenburger tor",
-            b"hbf", b"u", b"zz", b"a b", b"",
-        ];
-        let mut offsets = Vec::new();
-        for &data in names {
-            let old = PreparedMatchCandidate::new_with_mode(data, false);
-            let new = PreparedMatchCandidate::new_with_mode(data, true);
-            for &query in phrases {
-                assert_eq!(
-                    old.score(query, &mut offsets).to_bits(),
-                    new.score(query, &mut offsets).to_bits(),
-                    "name={data:?}, query={query:?}",
-                );
-            }
-        }
-    }
 
     #[test]
     fn exact_match_best_score() {
