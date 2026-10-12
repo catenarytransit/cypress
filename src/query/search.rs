@@ -1142,6 +1142,11 @@ pub fn search_place_ids(
     let cache_mode = active_ngram_cache_mode();
     debug!(
         target: "cypress::query::timing",
+        lexical_lower_bound = cypress::models::scoring::lexical_lower_bound_enabled(),
+        "experimental Sift4 lexical lower-bound rejection (opt-in)"
+    );
+    debug!(
+        target: "cypress::query::timing",
         cosine_mode = cosine_mode.as_str(),
         "active production cosine mode (set CYPRESS_COSINE_MODE=cypress to roll back)"
     );
