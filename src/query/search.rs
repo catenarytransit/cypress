@@ -1359,6 +1359,7 @@ pub fn search_place_ids(
                 });
             }
         }
+        let fuzzy_matches_before_cap = string_matches.len();
         ctx.string_matches.extend(string_matches);
         log_phase_timing(
             "search_place_ids",

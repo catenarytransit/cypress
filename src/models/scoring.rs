@@ -10,23 +10,6 @@ fn is_delimiter(c: u8) -> bool {
     TOKEN_DELIMITERS.contains(&c)
 }
 
-fn tokenize<'a>(s: &'a [u8], out: &mut Vec<&'a [u8]>) {
-    out.clear();
-    let mut start: Option<&[u8]> = None;
-    for (i, &c) in s.iter().enumerate() {
-        if is_delimiter(c) {
-            if let Some(s) = start.take() {
-                out.push(&s[..i - (s.as_ptr() as usize - s.as_ptr() as usize)]);
-            }
-        } else if start.is_none() {
-            start = Some(&s[i..]);
-        }
-    }
-    if let Some(s) = start {
-        out.push(s);
-    }
-}
-
 fn tokenize_bytes<'a>(s: &'a [u8], out: &mut Vec<&'a [u8]>) {
     out.clear();
     let mut i = 0;

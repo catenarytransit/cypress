@@ -1,7 +1,7 @@
 /// SIFT4 approximate string distance — ported from adr/sift4.h.
 /// Returns a fast approximate edit distance between two byte strings,
 /// accounting for transpositions, with early termination at `max_distance`.
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 
 // Exact Sift4 invocation counts for the synchronous query path. Disabled by
 // default: profiling is only enabled when cypress::query::timing is DEBUG.
