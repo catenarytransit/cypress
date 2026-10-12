@@ -160,6 +160,24 @@ impl CosineMode {
 }
 
 static COSINE_MODE: std::sync::OnceLock<CosineMode> = std::sync::OnceLock::new();
+static COSINE_SHADOW_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Comparisons between cosine implementations are a diagnostic experiment,
+/// not part of normal production search (even when DEBUG logging is enabled).
+fn parse_cosine_shadow_enabled(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn cosine_shadow_enabled() -> bool {
+    *COSINE_SHADOW_ENABLED.get_or_init(|| {
+        std::env::var("CYPRESS_COSINE_SHADOW")
+            .map(|value| parse_cosine_shadow_enabled(&value))
+            .unwrap_or(false)
+    })
+}
 
 fn active_cosine_mode() -> CosineMode {
     *COSINE_MODE.get_or_init(|| match std::env::var("CYPRESS_COSINE_MODE") {
@@ -1299,10 +1317,12 @@ pub fn search_place_ids(
         } else {
             u16::MAX
         };
-        // Both formulas can be compared only when both use identical postings.
-        // If ADR truncates at 128 occurrences, the Cypress rollback would use
-        // additional postings; run the selected mode but skip misleading A/B.
-        let compare_cosines = detailed_metrics && (1..=128).contains(&adr_query_bigram_total);
+        // The shadow scorer is OFF by default, independently of DEBUG logging.
+        // Only compare when explicitly opted in and both formulas use the
+        // same postings (ADR truncates at 128 bigram occurrences).
+        let compare_cosines = detailed_metrics
+            && cosine_shadow_enabled()
+            && (1..=128).contains(&adr_query_bigram_total);
         let evaluate_cypress = cosine_mode == CosineMode::Cypress || compare_cosines;
         let evaluate_adr = cosine_mode == CosineMode::Adr || compare_cosines;
 
@@ -1386,9 +1406,9 @@ pub fn search_place_ids(
             "bigram snapshot admission summary"
         );
 
-        // Calculate the selected production cosine and, at DEBUG level,
-        // the alternate formula over the same posting counts. The alternate
-        // never influences place retrieval or ranking.
+        // Compute only the selected cosine formula in production. The alternate
+        // formula runs exclusively with CYPRESS_COSINE_SHADOW=1 and DEBUG logs;
+        // it never influences place retrieval or ranking.
         let phase_started = Instant::now();
         let mut string_matches = Vec::<CosSimMatch>::new();
         let mut alternate_matches = Vec::<CosSimMatch>::new();
@@ -1549,7 +1569,7 @@ pub fn search_place_ids(
                     adr_top_6000_only = adr_top_count.saturating_sub(top_6000_overlap),
                     "production cosine A/B comparison (same indexed bytes, fuzzy only)"
                 );
-            } else {
+            } else if cosine_shadow_enabled() {
                 debug!(
                     target: "cypress::query::timing",
                     op = "search_place_ids",
@@ -2852,6 +2872,17 @@ mod tests {
         assert_eq!(CosineMode::parse("cypress"), Some(CosineMode::Cypress));
         assert_eq!(CosineMode::parse("CYPRESS"), Some(CosineMode::Cypress));
         assert_eq!(CosineMode::parse("unexpected"), None);
+    }
+
+    #[test]
+    fn cosine_shadow_is_explicitly_opt_in() {
+        assert!(!parse_cosine_shadow_enabled(""));
+        assert!(!parse_cosine_shadow_enabled("0"));
+        assert!(!parse_cosine_shadow_enabled("false"));
+        assert!(!parse_cosine_shadow_enabled("unexpected"));
+        assert!(parse_cosine_shadow_enabled("1"));
+        assert!(parse_cosine_shadow_enabled("TRUE"));
+        assert!(parse_cosine_shadow_enabled(" on "));
     }
 
     #[test]

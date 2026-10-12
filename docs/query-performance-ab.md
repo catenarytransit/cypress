@@ -8,6 +8,13 @@ Rebuild/restart the binary to deploy; **the compiled MemDB need not be rebuilt**
 | `CYPRESS_PREFIX_MODE` | `bounded` | `legacy` |
 | `CYPRESS_NGRAM_CACHE_MODE` | `legacy` | `two-hit` |
 | `CYPRESS_COSINE_MODE` (existing) | `adr` | `cypress` |
+| `CYPRESS_COSINE_SHADOW` | off (no alternate scorer) | `1` for A/B comparison |
+
+With the default settings, only ADR cosine runs, even with DEBUG logging enabled.
+Set `CYPRESS_COSINE_SHADOW=1` to re-enable the alternate scorer for
+diagnostic comparisons (requires DEBUG logging and a service restart).
+The shadow scorer never selects results. The separate
+`CYPRESS_COSINE_MODE=cypress` rollback still selects the legacy formula.
 
 `bounded` preserves every exact phrase ID, probes the full query, then longest
 multiword prefixes, then individual tokens. At most 2,048 additional raw FST
