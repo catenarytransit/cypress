@@ -2,20 +2,22 @@ use anyhow::Result;
 use fst::automaton::Str;
 use fst::{Automaton, IntoStreamer, Map, Streamer};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Instant;
 use tracing::{debug, warn};
 
-use cypress::models::memdb::CypressMemDb;
+use cypress::models::memdb::{ArchivedCypressMemDb, CypressMemDb};
 use cypress::models::normalized::NormalizedPlace;
 use cypress::models::place::Layer;
 use cypress::models::sift4::Sift4CountGuard;
 use cypress::models::AdminEntry;
 use cypress::scylla::ScyllaClient;
 
-use super::memdb::{AreaPhraseScoreCache, CosSimMatch, Memdb, GUESS_CONTEXT, MAX_QUERY_PHRASES};
+use super::memdb::{AreaPhraseScoreCache, CosSimMatch, GuessContext, Memdb, GUESS_CONTEXT, MAX_QUERY_PHRASES};
 
 #[derive(Clone)]
 pub struct SearchParams {
@@ -133,6 +135,116 @@ const FOCUS_RESCORE_MULTIPLIER: usize = 5;
 const FOCUS_RESCORE_FLOOR: usize = 50;
 const SLOW_PHASE_WARN_MS: u128 = 250;
 const SLOW_SEARCH_WARN_MS: u128 = 1000;
+
+// All experiments are opt-in and read once at process startup. Run two query
+// processes on identical compiled indexes for a controlled A/B comparison.
+fn experiment_enabled(name: &'static str) -> bool {
+    match std::env::var(name).as_deref() {
+        Ok("1" | "true" | "on" | "yes") => true,
+        Ok("0" | "false" | "off" | "no") | Err(_) => false,
+        Ok(value) => {
+            warn!(target: "cypress::query::timing", name, value,
+                "invalid experimental boolean flag; using false");
+            false
+        }
+    }
+}
+
+static PREPARED_AREA_SCORING: OnceLock<bool> = OnceLock::new();
+static CACHE_STREET_COMPONENTS: OnceLock<bool> = OnceLock::new();
+static DISABLE_NGRAM_SNAPSHOTS: OnceLock<bool> = OnceLock::new();
+
+fn prepared_area_scoring() -> bool {
+    *PREPARED_AREA_SCORING.get_or_init(|| experiment_enabled("CYPRESS_PREPARED_AREA_SCORING"))
+}
+
+fn cache_street_components() -> bool {
+    *CACHE_STREET_COMPONENTS.get_or_init(|| experiment_enabled("CYPRESS_CACHE_STREET_COMPONENTS"))
+}
+
+fn disable_ngram_snapshots() -> bool {
+    *DISABLE_NGRAM_SNAPSHOTS.get_or_init(|| experiment_enabled("CYPRESS_DISABLE_NGRAM_SNAPSHOTS"))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NgramRetrievalMode {
+    Sparse,
+    Merge,
+}
+
+static NGRAM_RETRIEVAL_MODE: OnceLock<NgramRetrievalMode> = OnceLock::new();
+
+fn active_ngram_retrieval_mode() -> NgramRetrievalMode {
+    *NGRAM_RETRIEVAL_MODE.get_or_init(|| {
+        match std::env::var("CYPRESS_NGRAM_RETRIEVAL").as_deref() {
+            Ok("merge") => NgramRetrievalMode::Merge,
+            Ok("sparse") | Err(_) => NgramRetrievalMode::Sparse,
+            Ok(value) => {
+                warn!(target: "cypress::query::timing", value,
+                    "invalid CYPRESS_NGRAM_RETRIEVAL; using sparse");
+                NgramRetrievalMode::Sparse
+            }
+        }
+    })
+}
+
+// The compiler sorts and deduplicates (bigram, string_id) pairs, so posting
+// lists are strictly increasing. Merge G sorted lists in O(P log G) time,
+// using O(G) cursor memory. Only IDs meeting the shared-gram threshold enter
+// GuessContext; the ordinary cosine scorer remains unchanged.
+// This intentionally bypasses the sparse snapshot cache in merge mode.
+fn merge_sorted_ngram_postings(
+    db: &ArchivedCypressMemDb,
+    grams: &[u16],
+    min_shared: u16,
+    ctx: &mut GuessContext,
+) -> (usize, usize) {
+    let mut cursor = Vec::<(usize, usize)>::with_capacity(grams.len());
+    let mut heap = BinaryHeap::<Reverse<(u32, usize)>>::new();
+    let mut visited = 0usize;
+    for &gram in grams {
+        let start = db.bigram_offsets[gram as usize] as usize;
+        let end = db.bigram_offsets[gram as usize + 1] as usize;
+        if start >= end || end > db.bigram_data.len() {
+            continue;
+        }
+        let list = cursor.len();
+        cursor.push((start + 1, end));
+        heap.push(Reverse((db.bigram_data[start], list)));
+        visited += end - start;
+    }
+
+    while let Some(Reverse((string_id, list))) = heap.pop() {
+        let mut shared = 1u8;
+        let (next, end) = &mut cursor[list];
+        if *next < *end {
+            heap.push(Reverse((db.bigram_data[*next], list)));
+            *next += 1;
+        }
+        while let Some(Reverse((next_id, _))) = heap.peek().copied() {
+            if next_id != string_id {
+                break;
+            }
+            let Reverse((_, list)) = heap.pop().expect("peeked posting is present");
+            shared = shared.saturating_add(1);
+            let (next, end) = &mut cursor[list];
+            if *next < *end {
+                heap.push(Reverse((db.bigram_data[*next], list)));
+                *next += 1;
+            }
+        }
+
+        if (shared as u16) >= min_shared {
+            let id = string_id as usize;
+            if id < ctx.string_match_counts.len() {
+                ctx.string_match_epochs[id] = ctx.query_epoch;
+                ctx.string_match_counts[id] = shared;
+                ctx.touched_string_indices.push(string_id);
+            }
+        }
+    }
+    (cursor.len(), visited)
+}
 
 /// Runtime A/B selector. Defaults to ADR; set CYPRESS_COSINE_MODE=cypress
 /// before starting the query process to restore the original cosine behavior.
@@ -630,6 +742,7 @@ fn score_structured_candidate(
     area_components: &[Vec<ComponentMatchOption>],
     scratch: &mut Vec<ComponentMatchOption>,
     offset_arr: &mut Vec<cypress::models::sift4::SiftOffset>,
+    street_option_cache: &mut HashMap<u32, Vec<ComponentMatchOption>>,
     work: &mut SearchWorkStats,
 ) -> Option<f32> {
     let token_count = query_tokens.len().min(8);
@@ -663,12 +776,28 @@ fn score_structured_candidate(
             .map(|idx| idx as usize)
         {
             if let Some(street_name) = get_street_name(db, street_group_idx) {
-                let prepared = cypress::models::scoring::PreparedMatchCandidate::new(street_name);
-                if work.enabled {
-                    work.local_street_scorer_calls += phrases.len() as u64;
+                if cache_street_components() {
+                    if let Some(&name_id) = db.street_name_string_ids.get(street_group_idx) {
+                        if !street_option_cache.contains_key(&name_id) {
+                            let prepared = cypress::models::scoring::PreparedMatchCandidate::new(street_name);
+                            if work.enabled {
+                                work.local_street_scorer_calls += phrases.len() as u64;
+                            }
+                            collect_component_match_options(&prepared, phrases, offset_arr, scratch);
+                            street_option_cache.insert(name_id, scratch.clone());
+                        }
+                        if let Some(options) = street_option_cache.get(&name_id) {
+                            advance_component_dp(&mut dp, options, all_mask, work);
+                        }
+                    }
+                } else {
+                    let prepared = cypress::models::scoring::PreparedMatchCandidate::new(street_name);
+                    if work.enabled {
+                        work.local_street_scorer_calls += phrases.len() as u64;
+                    }
+                    collect_component_match_options(&prepared, phrases, offset_arr, scratch);
+                    advance_component_dp(&mut dp, scratch, all_mask, work);
                 }
-                collect_component_match_options(&prepared, phrases, offset_arr, scratch);
-                advance_component_dp(&mut dp, scratch, all_mask, work);
             }
         }
 
@@ -920,6 +1049,10 @@ fn cached_area_phrase_scores<'a>(
     let area_name = db.area_name_bytes.get(name_start..name_end)?;
 
     cache.get_or_compute(area_idx, query_epoch, |scores| {
+        // Reuse token boundaries for all phrases on a cache miss. This
+        // preserves get_match_score's exact existing scoring semantics.
+        let prepared = prepared_area_scoring()
+            .then(|| cypress::models::scoring::PreparedMatchCandidate::new(area_name));
         for (phrase_idx, phrase) in phrases.iter().enumerate() {
             // This preserves the existing alias-prefix preference exactly.
             scores[phrase_idx] = match phrase
@@ -927,11 +1060,14 @@ fn cached_area_phrase_scores<'a>(
                 .binary_search_by_key(&(area_idx as u32), |(id, _)| *id)
             {
                 Ok(pos) => phrase.admin_prefix_scores[pos].1,
-                Err(_) => cypress::models::scoring::get_area_match_score(
-                    area_name,
-                    &phrase.bytes,
-                    offset_arr,
-                ),
+                Err(_) => match prepared.as_ref() {
+                    Some(candidate) => candidate.score(&phrase.bytes, offset_arr),
+                    None => cypress::models::scoring::get_area_match_score(
+                        area_name,
+                        &phrase.bytes,
+                        offset_arr,
+                    ),
+                },
             };
         }
     })
@@ -1068,6 +1204,13 @@ pub fn search_place_ids(
 
     let cosine_mode = active_cosine_mode();
     let prefix_mode = active_prefix_mode();
+    let retrieval_mode = active_ngram_retrieval_mode();
+    debug!(target: "cypress::query::timing",
+        ?retrieval_mode,
+        prepared_area_scoring = prepared_area_scoring(),
+        cache_street_components = cache_street_components(),
+        disable_ngram_snapshots = disable_ngram_snapshots(),
+        "active ranking experiments");
     debug!(
         target: "cypress::query::timing",
         cosine_mode = cosine_mode.as_str(),
@@ -1248,12 +1391,17 @@ pub fn search_place_ids(
         let mut missing_bigrams = Vec::new();
 
         let phase_started = Instant::now();
-        let cached_counts = ctx
-            .query_cache
-            .get_closest_ref(&query_bigrams, &mut missing_bigrams);
-        let cache_base_reused = cached_counts.is_some();
-        if let Some(cached) = cached_counts {
-            ctx.restore_sparse_counts(&cached);
+        let mut cache_base_reused = false;
+        if retrieval_mode == NgramRetrievalMode::Sparse {
+            let cached_counts = ctx
+                .query_cache
+                .get_closest_ref(&query_bigrams, &mut missing_bigrams);
+            cache_base_reused = cached_counts.is_some();
+            if let Some(cached) = cached_counts {
+                ctx.restore_sparse_counts(&cached);
+            }
+        } else {
+            missing_bigrams.extend(query_bigrams.iter().copied());
         }
         let missing_bigram_count = missing_bigrams.len();
         let cache_exact_hit = cache_base_reused && missing_bigram_count == 0;
@@ -1277,19 +1425,28 @@ pub fn search_place_ids(
         let phase_started = Instant::now();
         let mut posting_lists_read = 0usize;
         let mut posting_entries_visited = 0usize;
-        for missing_idx in missing_bigrams.into_iter() {
-            let start = db.bigram_offsets[missing_idx as usize] as usize;
-            let end = db.bigram_offsets[(missing_idx + 1) as usize] as usize;
+        if retrieval_mode == NgramRetrievalMode::Merge {
+            let threshold = match cosine_mode {
+                CosineMode::Adr => adr_min_match_count,
+                CosineMode::Cypress => cypress_min_match_count,
+            };
+            (posting_lists_read, posting_entries_visited) =
+                merge_sorted_ngram_postings(db, &query_bigrams, threshold, ctx);
+        } else {
+            for missing_idx in missing_bigrams.into_iter() {
+                let start = db.bigram_offsets[missing_idx as usize] as usize;
+                let end = db.bigram_offsets[(missing_idx + 1) as usize] as usize;
 
-            // Use a slice iterator to eliminate bounds checks on bigram_data
-            if let Some(bigrams) = db.bigram_data.get(start..end) {
-                if detailed_metrics {
-                    posting_lists_read += 1;
-                    posting_entries_visited += bigrams.len();
-                }
-                for &string_idx in bigrams {
-                    let string_idx = string_idx as usize;
-                    ctx.increment_string_match(string_idx);
+                // Use a slice iterator to eliminate bounds checks on bigram_data
+                if let Some(bigrams) = db.bigram_data.get(start..end) {
+                    if detailed_metrics {
+                        posting_lists_read += 1;
+                        posting_entries_visited += bigrams.len();
+                    }
+                    for &string_idx in bigrams {
+                        let string_idx = string_idx as usize;
+                        ctx.increment_string_match(string_idx);
+                    }
                 }
             }
         }
@@ -1298,7 +1455,9 @@ pub fn search_place_ids(
         let phase_started = Instant::now();
         let mut cache_snapshot_entries = 0usize;
         let mut cache_snapshot_bytes = 0usize;
-        let cache_snapshot_needed = !ctx.query_cache.has_exact(&query_bigrams);
+        let cache_snapshot_needed = retrieval_mode == NgramRetrievalMode::Sparse
+            && !disable_ngram_snapshots()
+            && !ctx.query_cache.has_exact(&query_bigrams);
         if cache_snapshot_needed {
             let snapshot = ctx.snapshot_sparse_counts();
             cache_snapshot_entries = snapshot.string_ids.len();
@@ -1788,6 +1947,7 @@ pub fn search_place_ids(
         let phase_started = Instant::now();
         let sift4_rerank_before = sift4_guard.count();
         let mut area_component_cache = HashMap::<u32, Vec<Vec<ComponentMatchOption>>>::new();
+        let mut street_option_cache = HashMap::<u32, Vec<ComponentMatchOption>>::new();
         let mut planner_scratch = Vec::<ComponentMatchOption>::with_capacity(36);
         let mut rescored = Vec::with_capacity(results.len());
         for (place_id, base_score) in results.drain(..) {
@@ -1837,6 +1997,7 @@ pub fn search_place_ids(
                 area_components,
                 &mut planner_scratch,
                 &mut ctx.sift4_offset_arr,
+                &mut street_option_cache,
                 &mut work,
             );
             if work.enabled && exact_cost.is_none() {

@@ -1,6 +1,15 @@
 /// ADR-style token match scoring — ported from adr/score.h.
 /// Lower scores are better; `NO_MATCH` (f32::MAX) means rejected.
 use super::sift4::{sift4, SiftOffset};
+use std::sync::OnceLock;
+
+fn borrow_name_spans() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(std::env::var("CYPRESS_BORROW_NAME_SPANS").as_deref(),
+            Ok("1" | "true" | "on" | "yes"))
+    })
+}
 
 pub const NO_MATCH: f32 = f32::MAX;
 
@@ -162,6 +171,23 @@ impl<'a> PreparedMatchCandidate<'a> {
         &self.dataset_name[start..end]
     }
 
+    // Borrow a multiword phrase directly only when every separator is exactly
+    // one ASCII space. For punctuation, multiple spaces, etc., the old code
+    // must rebuild the canonical single-space phrase to retain identical SIFT4
+    // input and ranking semantics.
+    fn space_joined_span(&self, from: usize, to: usize) -> Option<&'a [u8]> {
+        for i in from + 1..to {
+            let (_, previous_end) = self.token_ranges[i - 1];
+            let (next_start, _) = self.token_ranges[i];
+            if next_start != previous_end + 1 || self.dataset_name[previous_end] != b' ' {
+                return None;
+            }
+        }
+        let (start, _) = self.token_ranges[from];
+        let (_, end) = self.token_ranges[to - 1];
+        Some(&self.dataset_name[start..end])
+    }
+
     /// Scores this prepared dataset name against one query phrase.
     pub fn score(&self, query: &[u8], offset_arr: &mut Vec<SiftOffset>) -> f32 {
         if self.dataset_name.is_empty() || query.is_empty() {
@@ -173,6 +199,7 @@ impl<'a> PreparedMatchCandidate<'a> {
         if self.token_count <= 1 {
             return fallback;
         }
+        let borrow_spans = borrow_name_spans();
 
         let mut best_score = NO_MATCH;
         let mut best_token_bits: u8 = 0;
@@ -187,6 +214,8 @@ impl<'a> PreparedMatchCandidate<'a> {
                 let mut buf_storage = [0u8; 256];
                 let score = if len == 1 {
                     get_token_match_score(self.token(from), query, offset_arr)
+                } else if let Some(span) = borrow_spans.then(|| self.space_joined_span(from, to)).flatten() {
+                    get_token_match_score(span, query, offset_arr)
                 } else {
                     let total_len: usize =
                         (from..to).map(|idx| self.token(idx).len()).sum::<usize>() + len - 1;
@@ -275,6 +304,28 @@ pub fn get_layer_score_bonus(layer_rank: u8) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn borrowed_name_spans_preserve_canonical_bytes() {
+        for name in [
+            b"hollywood walk of fame".as_slice(),
+            b"new-york,city".as_slice(),
+            b"  multiple  spaces  ".as_slice(),
+            b"sao paulo".as_slice(),
+        ] {
+            let prepared = PreparedMatchCandidate::new(name);
+            for from in 0..prepared.token_count {
+                for to in from + 2..=prepared.token_count {
+                    if let Some(span) = prepared.space_joined_span(from, to) {
+                        let expected = (from..to)
+                            .map(|i| prepared.token(i))
+                            .collect::<Vec<_>>().join(&[b' '][..]);
+                        assert_eq!(span, expected.as_slice());
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn exact_match_best_score() {
