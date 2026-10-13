@@ -17,8 +17,21 @@ them in arbitrary lexicographic order. All accepted candidates go through
 the normal ranker.
 
 The bigram cache stores a sparse count snapshot whenever a query's exact gram
-set is not yet cached. The query scorer uses the standard SIFT4 path, with
-the existing exact/prefix fast paths preserved.
+set is not yet cached. Multiway posting-list merging and unconditional snapshot
+disabling were rejected after query-latency regressions and, for merging,
+result-order changes; neither is available as a runtime mode.
+
+The query scorer now always borrows canonical space-separated name spans
+instead of rebuilding those substrings. For punctuation or repeated separators,
+it retains the canonical-building fallback. Existing SIFT4 exact/prefix fast
+paths and ranking semantics are unchanged. The previous
+`CYPRESS_BORROW_NAME_SPANS` flag is no longer read.
+
+Prepared administrative-area names and query-local street-component caching
+remain independent **opt-in** experiments via `CYPRESS_PREPARED_AREA_SCORING=1`
+and `CYPRESS_CACHE_STREET_COMPONENTS=1`. The individual variants helped in
+some benchmarks, but their combinations did not consistently improve median
+latency, so neither is enabled by default.
 
 The experimental `CYPRESS_LEXICAL_LOWER_BOUND`, `CYPRESS_NGRAM_CACHE_MODE`, and
 `CYPRESS_COSINE_SHADOW` environment variables are no longer supported. Remove

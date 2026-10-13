@@ -1,16 +1,6 @@
 /// ADR-style token match scoring — ported from adr/score.h.
 /// Lower scores are better; `NO_MATCH` (f32::MAX) means rejected.
 use super::sift4::{sift4, SiftOffset};
-use std::sync::OnceLock;
-
-fn borrow_name_spans() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(std::env::var("CYPRESS_BORROW_NAME_SPANS").as_deref(),
-            Ok("1" | "true" | "on" | "yes"))
-    })
-}
-
 pub const NO_MATCH: f32 = f32::MAX;
 
 const TOKEN_DELIMITERS: &[u8] = b" -,;/().";
@@ -199,7 +189,6 @@ impl<'a> PreparedMatchCandidate<'a> {
         if self.token_count <= 1 {
             return fallback;
         }
-        let borrow_spans = borrow_name_spans();
 
         let mut best_score = NO_MATCH;
         let mut best_token_bits: u8 = 0;
@@ -214,7 +203,7 @@ impl<'a> PreparedMatchCandidate<'a> {
                 let mut buf_storage = [0u8; 256];
                 let score = if len == 1 {
                     get_token_match_score(self.token(from), query, offset_arr)
-                } else if let Some(span) = borrow_spans.then(|| self.space_joined_span(from, to)).flatten() {
+                } else if let Some(span) = self.space_joined_span(from, to) {
                     get_token_match_score(span, query, offset_arr)
                 } else {
                     let total_len: usize =
@@ -310,6 +299,8 @@ mod tests {
         for name in [
             b"hollywood walk of fame".as_slice(),
             b"new-york,city".as_slice(),
+            b"st. john's".as_slice(),
+            "München Hauptbahnhof".as_bytes(),
             b"  multiple  spaces  ".as_slice(),
             b"sao paulo".as_slice(),
         ] {
@@ -319,7 +310,8 @@ mod tests {
                     if let Some(span) = prepared.space_joined_span(from, to) {
                         let expected = (from..to)
                             .map(|i| prepared.token(i))
-                            .collect::<Vec<_>>().join(&[b' '][..]);
+                            .collect::<Vec<_>>()
+                            .join(&[b' '][..]);
                         assert_eq!(span, expected.as_slice());
                     }
                 }
