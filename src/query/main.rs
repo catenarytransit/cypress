@@ -22,6 +22,7 @@ use axum::{
 };
 use clap::Parser;
 use serde::{Deserialize, Serialize};
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{info, Level};
@@ -89,6 +90,7 @@ async fn main() -> Result<()> {
         .route("/v1/place/details", get(place_details_handler))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
+        .layer(CompressionLayer::new())
         .with_state(state);
 
     info!("Starting server on {}", args.listen);

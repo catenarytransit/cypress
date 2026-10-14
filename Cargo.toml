@@ -30,7 +30,7 @@ reqwest = { version = "0.13", features = ["json", "gzip"] }
 
 # Web framework
 axum = { version = "0.8", features = ["macros"] }
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["compression-br", "compression-gzip", "cors", "trace"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
