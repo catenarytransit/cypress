@@ -11,8 +11,10 @@ use tikv_jemallocator::Jemalloc;
 static GLOBAL: Jemalloc = Jemalloc;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use axum::{
     extract::{Query, State},
     http::StatusCode,
@@ -25,13 +27,15 @@ use serde::{Deserialize, Serialize};
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use tracing::{info, Level};
-use tracing_subscriber::FmtSubscriber;
+use tracing::info;
+use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 use cypress::scylla::ScyllaClient;
 
+mod cpu;
 mod memdb;
 mod search;
+use cpu::{SearchCpu, SearchCpuError};
 use memdb::Memdb;
 use search::{SearchParams, SearchResult, SearchResultV2};
 
@@ -50,18 +54,56 @@ struct Args {
     /// Directory containing rkyv memory-mapped files compiled by 'compiler'
     #[arg(long, default_value = "./data/compiled")]
     memdb_dir: String,
+
+    /// Maximum simultaneous CPU searches (default: min(available CPUs, 4)).
+    #[arg(long)]
+    search_workers: Option<usize>,
+
+    /// Maximum number of searches waiting for a CPU worker (default: 4 per worker).
+    #[arg(long)]
+    search_queue: Option<usize>,
+
+    /// Maximum time a search can wait for CPU capacity.
+    #[arg(long, default_value_t = 2000)]
+    search_wait_ms: u64,
+
+    /// Maximum number of requests doing search/database work at once.
+    #[arg(long, default_value_t = 64)]
+    max_inflight_requests: usize,
 }
 
 /// Application state shared across handlers
 struct AppState {
     scylla_client: ScyllaClient,
     memdb: Arc<Memdb>,
+    cpu: SearchCpu,
+    inflight: Arc<Semaphore>,
+}
+
+fn admit(state: &AppState) -> Result<OwnedSemaphorePermit, (StatusCode, String)> {
+    state.inflight.clone().try_acquire_owned().map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Too many concurrent requests; retry shortly".to_string(),
+        )
+    })
+}
+
+fn map_search_error(error: anyhow::Error) -> (StatusCode, String) {
+    if let Some(SearchCpuError::Saturated | SearchCpuError::WaitTimedOut) =
+        error.downcast_ref::<SearchCpuError>()
+    {
+        return (StatusCode::SERVICE_UNAVAILABLE, error.to_string());
+    }
+    (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // DEBUG tracing on every ranking phase serializes huge amounts of log I/O
+    // under load. Operators can opt in with RUST_LOG when benchmarking.
     let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::DEBUG)
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
@@ -75,9 +117,29 @@ async fn main() -> Result<()> {
     info!("Initializing MemDB from {}", args.memdb_dir);
     let memdb = Memdb::new(&args.memdb_dir)?;
 
+    // Search contexts cache large arrays per OS thread. Bound their number as
+    // well as CPU contention; never execute ranking on a Tokio reactor worker.
+    let workers = args.search_workers.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2)
+            .min(4)
+    });
+    let queue = args.search_queue.unwrap_or_else(|| workers.saturating_mul(4));
+    anyhow::ensure!(workers > 0, "--search-workers must be positive");
+    anyhow::ensure!(queue > 0, "--search-queue must be positive");
+    anyhow::ensure!(args.search_wait_ms > 0, "--search-wait-ms must be positive");
+    anyhow::ensure!(
+        args.max_inflight_requests > 0,
+        "--max-inflight-requests must be positive"
+    );
+    info!(workers, queue, max_inflight = args.max_inflight_requests, "Search admission limits");
+
     let state = Arc::new(AppState {
         scylla_client,
         memdb,
+        cpu: SearchCpu::new(workers, queue, Duration::from_millis(args.search_wait_ms))?,
+        inflight: Arc::new(Semaphore::new(args.max_inflight_requests)),
     });
 
     let app = Router::new()
@@ -117,15 +179,13 @@ async fn autocomplete_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<SearchQueryParams>,
 ) -> Result<Json<AutocompleteResponse>, (StatusCode, String)> {
+    let _admission = admit(&state)?;
     let start = std::time::Instant::now();
     let text = params.text.trim().to_lowercase();
 
-    let mut features = Vec::new();
-
-    if text.len() >= 2 {
-        let memdb_data = state.memdb.get_data();
+    let features = if text.len() >= 2 {
+        let memdb = Arc::clone(&state.memdb);
         let size = params.size.unwrap_or(10).min(20);
-
         let focus_point =
             if let (Some(lat), Some(lon)) = (params.focus_point_lat, params.focus_point_lon) {
                 Some((lat, lon))
@@ -134,29 +194,33 @@ async fn autocomplete_handler(
             };
         let weight = params.focus_point_weight.unwrap_or(50.0);
 
-        let scored_places =
-            search::search_place_ids(&state.memdb, &text, focus_point, weight, None, size);
-
-        features = scored_places
-            .into_iter()
-            .filter_map(|(place_id, _)| memdb_data.get_place(place_id as usize))
-            .map(|place| AutocompleteFeature {
-                result_type: "Feature".to_string(),
-                geometry: search::Geometry {
-                    geo_type: "Point".to_string(),
-                    coordinates: [place.lon as f64, place.lat as f64],
-                },
-                properties: AutocompleteProperties {
-                    id: String::from_utf8_lossy(
-                        &place.source_id_bytes[..place.source_id_len as usize],
-                    )
-                    .into_owned(),
-                    name: String::from_utf8_lossy(&place.name_bytes[..place.name_len as usize])
+        state.cpu.run(move || {
+            let scored_places =
+                search::search_place_ids(&memdb, &text, focus_point, weight, None, size);
+            let memdb_data = memdb.get_data();
+            scored_places
+                .into_iter()
+                .filter_map(|(place_id, _)| memdb_data.get_place(place_id as usize))
+                .map(|place| AutocompleteFeature {
+                    result_type: "Feature".to_string(),
+                    geometry: search::Geometry {
+                        geo_type: "Point".to_string(),
+                        coordinates: [place.lon as f64, place.lat as f64],
+                    },
+                    properties: AutocompleteProperties {
+                        id: String::from_utf8_lossy(
+                            &place.source_id_bytes[..place.source_id_len as usize],
+                        )
                         .into_owned(),
-                },
-            })
-            .collect();
-    }
+                        name: String::from_utf8_lossy(&place.name_bytes[..place.name_len as usize])
+                            .into_owned(),
+                    },
+                })
+                .collect::<Vec<_>>()
+        }).await.map_err(|error| map_search_error(error.into()))?
+    } else {
+        Vec::new()
+    };
 
     Ok(Json(AutocompleteResponse {
         features,
@@ -169,6 +233,7 @@ async fn search_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<SearchQueryParams>,
 ) -> Result<Json<SearchResponse>, (StatusCode, String)> {
+    let _admission = admit(&state)?;
     let search_params = SearchParams {
         text: params.text.clone(),
         lang: params.lang.clone(),
@@ -183,11 +248,11 @@ async fn search_handler(
         size: params.size.unwrap_or(10).min(40),
     };
 
-    let results = search::execute_search(&state.scylla_client, &state.memdb, search_params)
+    let results = search::execute_search(&state.scylla_client, &state.memdb, &state.cpu, search_params)
         .await
         .map_err(|e| {
             tracing::error!("Search execution failed: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            map_search_error(e)
         })?;
 
     Ok(Json(SearchResponse {
@@ -201,6 +266,7 @@ async fn search_v2_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<SearchQueryParams>,
 ) -> Result<Json<SearchResponseV2>, (StatusCode, String)> {
+    let _admission = admit(&state)?;
     let search_params = SearchParams {
         text: params.text.clone(),
         lang: params.lang.clone(),
@@ -215,11 +281,11 @@ async fn search_v2_handler(
         size: params.size.unwrap_or(10).min(40),
     };
 
-    let results = search::execute_search_v2(&state.scylla_client, &state.memdb, search_params)
+    let results = search::execute_search_v2(&state.scylla_client, &state.memdb, &state.cpu, search_params)
         .await
         .map_err(|e| {
             tracing::error!("Search V2 execution failed: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            map_search_error(e)
         })?;
 
     Ok(Json(SearchResponseV2 {
@@ -233,9 +299,11 @@ async fn reverse_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ReverseQueryParams>,
 ) -> Result<Json<SearchResponse>, (StatusCode, String)> {
+    let _admission = admit(&state)?;
     let results = search::execute_reverse(
         &state.scylla_client,
         &state.memdb,
+        &state.cpu,
         params.point_lon,
         params.point_lat,
         params.size.unwrap_or(10).min(40),
@@ -247,7 +315,7 @@ async fn reverse_handler(
     .await
     .map_err(|e| {
         tracing::error!("Reverse geocoding failed: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        map_search_error(e)
     })?;
 
     Ok(Json(SearchResponse {
@@ -261,9 +329,11 @@ async fn reverse_v2_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ReverseQueryParams>,
 ) -> Result<Json<SearchResponseV2>, (StatusCode, String)> {
+    let _admission = admit(&state)?;
     let results = search::execute_reverse_v2(
         &state.scylla_client,
         &state.memdb,
+        &state.cpu,
         params.point_lon,
         params.point_lat,
         params.size.unwrap_or(10).min(40),
@@ -276,7 +346,7 @@ async fn reverse_v2_handler(
     .await
     .map_err(|e| {
         tracing::error!("Reverse geocoding V2 failed: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        map_search_error(e)
     })?;
 
     Ok(Json(SearchResponseV2 {
@@ -289,6 +359,7 @@ async fn place_details_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<PlaceDetailsQueryParams>,
 ) -> Result<axum::response::Response, StatusCode> {
+    let _admission = admit(&state).map_err(|(status, _)| status)?;
     let place_json = state
         .scylla_client
         .get_place(&params.id)

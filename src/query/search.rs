@@ -1,4 +1,5 @@
 use anyhow::Result;
+use futures::{stream, StreamExt};
 use fst::automaton::Str;
 use fst::{Automaton, IntoStreamer, Map, Streamer};
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,7 @@ use cypress::models::sift4::Sift4CountGuard;
 use cypress::models::AdminEntry;
 use cypress::scylla::ScyllaClient;
 
+use super::cpu::SearchCpu;
 use super::memdb::{AreaPhraseScoreCache, CosSimMatch, Memdb, GUESS_CONTEXT, MAX_QUERY_PHRASES};
 
 #[derive(Clone)]
@@ -2154,6 +2156,7 @@ fn spatial_search(
 pub async fn execute_search(
     scylla_client: &ScyllaClient,
     memdb: &Arc<Memdb>,
+    cpu: &SearchCpu,
     params: SearchParams,
 ) -> Result<TimedSearchResults> {
     let total_started = Instant::now();
@@ -2175,14 +2178,13 @@ pub async fn execute_search(
     let focus_weight = params.focus_weight.unwrap_or(50.0);
 
     let phase_started = Instant::now();
-    let scored_ids = bigram_search(
-        memdb,
-        &params.text,
-        focus,
-        focus_weight,
-        params.bbox,
-        params.size,
-    );
+    let memdb_for_search = Arc::clone(memdb);
+    let text = params.text.clone();
+    let bbox = params.bbox;
+    let size = params.size;
+    let scored_ids = cpu
+        .run(move || bigram_search(&memdb_for_search, &text, focus, focus_weight, bbox, size))
+        .await?;
     log_phase_timing("execute_search", "bigram_search", phase_started);
     debug!(
         target: "cypress::query::timing",
@@ -2195,8 +2197,9 @@ pub async fn execute_search(
     let mut admin_ids = std::collections::HashSet::new();
 
     let phase_started = Instant::now();
+    // Preserve ranking order while limiting Scylla fan-out per request.
     let fetch_futures = scored_ids.iter().map(|(id, _)| scylla_client.get_place(id));
-    let fetched = futures::future::join_all(fetch_futures).await;
+    let fetched = stream::iter(fetch_futures).buffered(8).collect::<Vec<_>>().await;
     log_phase_timing("execute_search", "fetch_places", phase_started);
 
     let phase_started = Instant::now();
@@ -2246,6 +2249,7 @@ pub async fn execute_search(
 pub async fn execute_search_v2(
     scylla_client: &ScyllaClient,
     memdb: &Arc<Memdb>,
+    cpu: &SearchCpu,
     params: SearchParams,
 ) -> Result<TimedSearchResultsV2> {
     let total_started = Instant::now();
@@ -2267,14 +2271,13 @@ pub async fn execute_search_v2(
     let focus_weight = params.focus_weight.unwrap_or(50.0);
 
     let phase_started = Instant::now();
-    let scored_ids = bigram_search(
-        memdb,
-        &params.text,
-        focus,
-        focus_weight,
-        params.bbox,
-        params.size,
-    );
+    let memdb_for_search = Arc::clone(memdb);
+    let text = params.text.clone();
+    let bbox = params.bbox;
+    let size = params.size;
+    let scored_ids = cpu
+        .run(move || bigram_search(&memdb_for_search, &text, focus, focus_weight, bbox, size))
+        .await?;
     log_phase_timing("execute_search_v2", "bigram_search", phase_started);
     debug!(
         target: "cypress::query::timing",
@@ -2287,7 +2290,7 @@ pub async fn execute_search_v2(
 
     let phase_started = Instant::now();
     let fetch_futures = scored_ids.iter().map(|(id, _)| scylla_client.get_place(id));
-    let fetched = futures::future::join_all(fetch_futures).await;
+    let fetched = stream::iter(fetch_futures).buffered(8).collect::<Vec<_>>().await;
     log_phase_timing("execute_search_v2", "fetch_places", phase_started);
 
     let phase_started = Instant::now();
@@ -2339,6 +2342,7 @@ pub async fn execute_search_v2(
 pub async fn execute_reverse(
     scylla_client: &ScyllaClient,
     memdb: &Arc<Memdb>,
+    cpu: &SearchCpu,
     lon: f64,
     lat: f64,
     size: usize,
@@ -2355,12 +2359,15 @@ pub async fn execute_reverse(
     );
 
     let phase_started = Instant::now();
-    let nearby = spatial_search(memdb, lon, lat, size, 1.0);
+    let memdb_for_search = Arc::clone(memdb);
+    let nearby = cpu
+        .run(move || spatial_search(&memdb_for_search, lon, lat, size, 1.0))
+        .await?;
     log_phase_timing("execute_reverse", "spatial_search", phase_started);
 
     let phase_started = Instant::now();
     let fetch_futures = nearby.iter().map(|(id, _)| scylla_client.get_place(id));
-    let fetched = futures::future::join_all(fetch_futures).await;
+    let fetched = stream::iter(fetch_futures).buffered(8).collect::<Vec<_>>().await;
     log_phase_timing("execute_reverse", "fetch_places", phase_started);
 
     let mut admin_ids = std::collections::HashSet::new();
@@ -2410,6 +2417,7 @@ pub async fn execute_reverse(
 pub async fn execute_reverse_v2(
     scylla_client: &ScyllaClient,
     memdb: &Arc<Memdb>,
+    cpu: &SearchCpu,
     lon: f64,
     lat: f64,
     size: usize,
@@ -2428,12 +2436,15 @@ pub async fn execute_reverse_v2(
     );
 
     let phase_started = Instant::now();
-    let nearby = spatial_search(memdb, lon, lat, size, 1.0);
+    let memdb_for_search = Arc::clone(memdb);
+    let nearby = cpu
+        .run(move || spatial_search(&memdb_for_search, lon, lat, size, 1.0))
+        .await?;
     log_phase_timing("execute_reverse_v2", "spatial_search", phase_started);
 
     let phase_started = Instant::now();
     let fetch_futures = nearby.iter().map(|(id, _)| scylla_client.get_place(id));
-    let fetched = futures::future::join_all(fetch_futures).await;
+    let fetched = stream::iter(fetch_futures).buffered(8).collect::<Vec<_>>().await;
     log_phase_timing("execute_reverse_v2", "fetch_places", phase_started);
 
     let mut admin_ids = std::collections::HashSet::new();
