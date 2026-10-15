@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tokio::time::{interval, Duration};
 use tracing::{info, warn};
 
+use cypress::models::token_index::{TokenIndexView, TOKEN_INDEX_FILE};
 use cypress::models::memdb::{
     ArchivedCypressMemDb, CypressMemDb, PlaceRecord, PLACE_RECORD_DISK_BYTES,
 };
@@ -410,6 +411,7 @@ thread_local! {
 pub struct MemdbData {
     pub index_mmap: Mmap,
     pub places_mmap: Mmap,
+    pub token_mmap: Option<Mmap>,
     pub version: String,
 }
 
@@ -500,9 +502,28 @@ impl Memdb {
             ));
         }
 
+        let token_path = out_dir.join(TOKEN_INDEX_FILE);
+        let token_mmap = if token_path.exists() {
+            let file = File::open(&token_path)?;
+            let mmap = unsafe { Mmap::map(&file)? };
+            let view = TokenIndexView::parse(&mmap)
+                .context("Invalid token sidecar; rebuild with compiler --token-index")?;
+            let db = unsafe { rkyv::archived_root::<CypressMemDb>(&index_mmap) };
+            let offsets: Vec<u32> = db.string_name_offsets.iter().copied().collect();
+            anyhow::ensure!(
+                view.matches_dictionary(&db.string_name_bytes[..], &offsets),
+                "Token sidecar does not match the active StringId dictionary"
+            );
+            info!("Loaded validated token sidecar: {} tokens", view.token_count);
+            Some(mmap)
+        } else {
+            None
+        };
+
         Ok(MemdbData {
             index_mmap,
             places_mmap,
+            token_mmap,
             version,
         })
     }

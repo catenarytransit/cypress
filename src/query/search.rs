@@ -18,6 +18,7 @@ use cypress::models::AdminEntry;
 use cypress::scylla::ScyllaClient;
 
 use super::cpu::SearchCpu;
+use super::token_retrieval;
 use super::memdb::{AreaPhraseScoreCache, CosSimMatch, Memdb, GUESS_CONTEXT, MAX_QUERY_PHRASES};
 
 #[derive(Clone)]
@@ -235,6 +236,30 @@ impl PrefixMode {
             Self::Legacy => "legacy",
         }
     }
+}
+
+/// Experimental mode. In token mode, conjunction is NOT equivalent to
+/// legacy fuzzy/global multi-field retrieval; explicitly opt in to compare.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TokenRetrievalMode {
+    Legacy,
+    Shadow,
+    Token,
+}
+
+fn token_retrieval_mode() -> TokenRetrievalMode {
+    static MODE: OnceLock<TokenRetrievalMode> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("CYPRESS_TOKEN_RETRIEVAL_MODE")
+        .unwrap_or_else(|_| "legacy".to_string()).as_str() {
+            "shadow" => TokenRetrievalMode::Shadow,
+            "token" => TokenRetrievalMode::Token,
+            "legacy" => TokenRetrievalMode::Legacy,
+            other => {
+                warn!(target: "cypress::query::timing", %other,
+                      "unknown token retrieval mode; using legacy");
+                TokenRetrievalMode::Legacy
+            }
+        })
 }
 
 static PREFIX_MODE: std::sync::OnceLock<PrefixMode> = std::sync::OnceLock::new();
@@ -1279,6 +1304,46 @@ pub fn search_place_ids(
         "prefix FST candidates ready (raw buckets overlap; final count is deduplicated)"
     );
 
+    // PR 4: lookup uses a prevalidated, generation-bound mmap.
+    // No O(token_count) validation on the request path.
+    let token_mode = token_retrieval_mode();
+    let mut token_candidate_ids = None::<Vec<u32>>;
+    let mut token_candidate_stats = None::<token_retrieval::RetrievalStats>;
+    if token_mode != TokenRetrievalMode::Legacy {
+        if let Some(sidecar) = memdb_data.token_mmap.as_ref() {
+            match cypress::models::token_index::TokenIndexView::view_validated(sidecar)
+                .and_then(|index| token_retrieval::retrieve(&index, &query))
+            {
+                Ok(Some((ids, stats))) => {
+                    if !ids.is_empty() && ids.len() <= MAX_STRING_MATCHES {
+                        token_candidate_ids = Some(ids);
+                    }
+                    token_candidate_stats = Some(stats);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    warn!(target: "cypress::query::timing", %error,
+                          "token retrieval rejected; falling back to legacy");
+                }
+            }
+        }
+        debug!(
+            target: "cypress::query::timing",
+            mode = if token_mode == TokenRetrievalMode::Shadow { "shadow" } else { "token" },
+            has_sidecar = memdb_data.token_mmap.is_some(),
+            token_candidates = token_candidate_ids.as_ref().map_or(0, Vec::len),
+            posting_entries_examined = token_candidate_stats.as_ref()
+                .map_or(0, |x| x.posting_entries_examined),
+            skip_block_seeks = token_candidate_stats.as_ref()
+                .map_or(0, |x| x.block_seeks),
+            anchor_document_frequency = token_candidate_stats.as_ref()
+                .map_or(0, |x| x.anchor_df),
+            "token retrieval plan"
+        );
+    }
+    let use_token_fast_path = token_mode == TokenRetrievalMode::Token
+        && token_candidate_ids.is_some();
+
     let mut results = Vec::<(u32, f64)>::new();
 
     GUESS_CONTEXT.with(|cell| {
@@ -1322,6 +1387,25 @@ pub fn search_place_ids(
             return;
         }
 
+        // Token mode bypasses *all* global bigram posting visits and
+        // cosine processing. In legacy/shadow mode the original branch runs
+        // unchanged to make latency and recall comparisons meaningful.
+        let (cold_postings, posting_lists_read, posting_entries_visited,
+             cache_exact_hit, cache_subset_hit, cache_restored_string_ids,
+             max_matches, fuzzy_matches_before_cap, cache_snapshot_entries,
+             cache_snapshot_bytes) = if use_token_fast_path {
+            let ids = token_candidate_ids.as_ref().unwrap();
+            ctx.string_matches.extend(ids.iter().copied().map(|string_idx| CosSimMatch {
+                string_idx, cos_sim: 0.0
+            }));
+            (
+                if detailed_metrics {
+                    cold_posting_cost(&db.bigram_offsets[..], &ctx.query_bigrams)
+                } else { ColdPostingCost::default() },
+                0usize, 0usize, false, false, 0usize,
+                ids.len(), ids.len(), 0usize, 0usize
+            )
+        } else {
         let query_bigram_count_u32 = query_bigram_count as u32;
         let cypress_min_match_count =
             (2 + query_bigram_count_u32 / (4 + query_bigram_count_u32 / 10)) as u16;
@@ -1485,6 +1569,12 @@ pub fn search_place_ids(
             "restrict_sort_string_matches",
             phase_started,
         );
+
+            (cold_postings, posting_lists_read, posting_entries_visited,
+             cache_exact_hit, cache_subset_hit, cache_restored_string_ids,
+             max_matches, fuzzy_matches_before_cap, cache_snapshot_entries,
+             cache_snapshot_bytes)
+        };
 
         let phase_started = Instant::now();
         if !prefix_string_ids.is_empty() {

@@ -102,6 +102,8 @@ pub struct TokenIndexView<'a> {
 
 pub struct TokenPostingList<'a> {
     pub document_frequency: u32,
+    /// Absolute offset in the posting arena for skip seek.
+    pub posting_start: u64,
     pub bytes: &'a [u8],
     pub skip_bytes: &'a [u8],
 }
@@ -165,6 +167,42 @@ impl<'a> TokenIndexView<'a> {
         })
     }
 
+    /// Cheap borrow-only view of a sidecar that was fully validated at load.
+    /// Call parse and matches_dictionary before this method; keep mmap immutable.
+    /// Avoids O(token_count) validation on every search request.
+    pub fn view_validated(data: &'a [u8]) -> Result<Self> {
+        ensure!(data.len() >= TOKEN_INDEX_HEADER_BYTES, "token index header truncated");
+        ensure!(&data[..8] == TOKEN_INDEX_MAGIC, "token index magic mismatch");
+        ensure!(le_u32(data, 8)? == TOKEN_INDEX_VERSION, "token index version mismatch");
+        ensure!(le_u32(data, 12)? == TOKEN_ANALYZER_VERSION, "analyzer version mismatch");
+        let string_count = le_u64(data, 16)?;
+        let fingerprint = le_u64(data, 24)?;
+        let token_count = le_u64(data, 32)?;
+        let posting_count = le_u64(data, 40)?;
+        let fst_bytes = usize::try_from(le_u64(data, 48)?)?;
+        let posting_bytes = usize::try_from(le_u64(data, 56)?)?;
+        let skip_count = usize::try_from(le_u64(data, 64)?)?;
+        let n = usize::try_from(token_count)?;
+        let offset_len = n.checked_add(1)
+            .and_then(|v| v.checked_mul(8))
+            .ok_or_else(|| anyhow!("offset length overflow"))?;
+        let freq_len = n.checked_mul(4).ok_or_else(|| anyhow!("freq overflow"))?;
+        let skip_len = skip_count.checked_mul(12)
+            .ok_or_else(|| anyhow!("skip length overflow"))?;
+        let mut cursor = TOKEN_INDEX_HEADER_BYTES;
+        let fst = Map::new(take(data, &mut cursor, fst_bytes)?)?;
+        let posting_offsets = take(data, &mut cursor, offset_len)?;
+        let frequencies = take(data, &mut cursor, freq_len)?;
+        let skip_offsets = take(data, &mut cursor, offset_len)?;
+        let skips = take(data, &mut cursor, skip_len)?;
+        let postings = take(data, &mut cursor, posting_bytes)?;
+        ensure!(cursor == data.len(), "token index trailing bytes");
+        Ok(Self {
+            fst, posting_offsets, frequencies, skip_offsets, skips, postings,
+            token_count, posting_count, string_count, fingerprint,
+        })
+    }
+
     pub fn matches_dictionary(&self, bytes: &[u8], offsets: &[u32]) -> bool {
         self.string_count == offsets.len().saturating_sub(1) as u64
             && self.fingerprint == dictionary_fingerprint(bytes, offsets)
@@ -182,6 +220,7 @@ impl<'a> TokenIndexView<'a> {
         let skip_end = usize::try_from(le_u64(self.skip_offsets, (i + 1) * 8)?)?;
         Ok(Some(TokenPostingList {
             document_frequency: le_u32(self.frequencies, i * 4)?,
+            posting_start: start as u64,
             bytes: &self.postings[start..end],
             skip_bytes: &self.skips[skip_start * 12..skip_end * 12],
         }))
