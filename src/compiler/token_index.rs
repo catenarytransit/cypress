@@ -1,13 +1,13 @@
 //! Offline compact token index builder.
 //! Bounded-memory external sort: one sorted run per fixed-size buffer,
 //! then heap-merge runs into a token FST and delta-varint postings.
-use anyhow::{anyhow, ensure, Context, Result};
+use anyhow::{anyhow, ensure, Result};
 use cypress::models::token_index::{
-    dictionary_fingerprint, tokenize_name, TokenIndexView, TOKEN_INDEX_FILE,
+    dictionary_fingerprint, tokenize_name, TokenIndexView,
     TOKEN_INDEX_MAGIC, TOKEN_INDEX_VERSION, TOKEN_ANALYZER_VERSION,
     TOKEN_SKIP_BLOCK,
 };
-use fst::{MapBuilder, Map};
+use fst::MapBuilder;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fs::{self, File};
@@ -78,7 +78,7 @@ fn merge_runs(
     }
     let mut last: Option<(String, u32)> = None;
     while let Some(Reverse((token, id, idx))) = heap.pop() {
-        let different = last.as_ref().is_none_or(|(t, x)| t != &token || *x != id);
+        let different = last.as_ref().map_or(true, |(t, x)| t != &token || *x != id);
         if different {
             emit(token.clone(), id)?;
             last = Some((token, id));
@@ -185,7 +185,7 @@ pub fn build_token_index(
     // Flush the currently accumulated block. Delta coding runs continuously
     // across blocks, so seeking into a block needs previous last ID.
     // PR 4 will use skip metadata for this.
-    let mut flush_block = |last: u32, buf: &mut Vec<u8>,
+    let flush_block = |last: u32, buf: &mut Vec<u8>,
                            out: &mut BufWriter<File>, bytes: &mut u64,
                            skips: &mut Vec<(u32, u64)>| -> Result<()> {
         if buf.is_empty() { return Ok(()); }
@@ -298,14 +298,14 @@ mod tests {
             offsets.push(bytes.len() as u32);
         }
         let temp = tempfile::tempdir().unwrap();
-        let file = temp.path().join(TOKEN_INDEX_FILE);
+        let file = temp.path().join(cypress::models::token_index::TOKEN_INDEX_FILE);
         build_token_index(&offsets, &bytes, temp.path(), &file).unwrap();
         let stored = fs::read(file).unwrap();
         let view = TokenIndexView::parse(&stored).unwrap();
         assert_eq!(view.lookup("hollywood").unwrap().unwrap().decode_ids().unwrap(),
                    vec![0, 1, 4]);
         assert_eq!(view.lookup("東京駅").unwrap().unwrap().decode_ids().unwrap(), vec![2]);
-        assert_eq!(view.lookup("القاھرة").unwrap().is_none(), true);
+        assert!(view.lookup("القاھرة").unwrap().is_none());
         assert!(view.matches_dictionary(&bytes, &offsets));
         assert!(!view.matches_dictionary(b"X", &[0, 1]));
     }
