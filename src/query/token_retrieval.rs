@@ -145,6 +145,28 @@ pub fn retrieve(
 mod tests {
     use super::*;
     #[test]
+    fn delta_varint_seek_intersection_counts_examined_entries() {
+        // Blocks: [1, 4, 9], [100, 200]. Deltas encoded continuously.
+        let bytes = [1u8, 3, 5, 91, 100];
+        let mut skip_bytes = Vec::new();
+        for (last_id, end) in [(9u32, 3u64), (200, 5)] {
+            skip_bytes.extend_from_slice(&last_id.to_le_bytes());
+            skip_bytes.extend_from_slice(&end.to_le_bytes());
+        }
+        let posting = TokenPostingList {
+            document_frequency: 5, posting_start: 0,
+            bytes: &bytes, skip_bytes: &skip_bytes
+        };
+        let table = skips(&posting).unwrap();
+        let mut stats = RetrievalStats::default();
+        assert_eq!(read_anchor(&posting, &mut stats).unwrap(), vec![1, 4, 9, 100, 200]);
+        assert!(contains(&posting, &table, 100, &mut stats).unwrap());
+        assert!(!contains(&posting, &table, 10, &mut stats).unwrap());
+        assert!(!contains(&posting, &table, 201, &mut stats).unwrap());
+        assert_eq!(stats.block_seeks, 2);
+    }
+
+    #[test]
     fn skip_partition_picks_first_possible_block() {
         let table = [Skip {last_id: 10, byte_end: 5}, Skip {last_id: 35, byte_end: 12}];
         assert_eq!(table.partition_point(|s| s.last_id < 11), 1);
