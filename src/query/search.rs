@@ -260,6 +260,8 @@ static NGRAM_SUBSET_HITS: AtomicU64 = AtomicU64::new(0);
 struct SearchWorkStats {
     enabled: bool,
     first_pass_scorer_calls: u64,
+    name_mapping_entries_examined: u64,
+    street_mapping_entries_examined: u64,
     first_pass_strings_scored: u64,
     local_street_scorer_calls: u64,
     local_house_scorer_calls: u64,
@@ -270,6 +272,31 @@ struct SearchWorkStats {
     dp_reachable_states: u64,
     dp_option_checks: u64,
     dp_legal_transitions: u64,
+}
+
+
+#[derive(Default, Debug, PartialEq, Eq)]
+struct ColdPostingCost {
+    entries: u64,
+    largest_list_len: u64,
+    largest_gram: Option<u16>,
+}
+
+// A logical full-scan baseline: reads only gram posting offsets, never bodies.
+fn cold_posting_cost(offsets: &[u32], grams: &[u16]) -> ColdPostingCost {
+    let mut cost = ColdPostingCost::default();
+    for &gram in grams {
+        let i = gram as usize;
+        if let Some((&start, &end)) = offsets.get(i).zip(offsets.get(i + 1)) {
+            let entries = end.saturating_sub(start) as u64;
+            cost.entries = cost.entries.saturating_add(entries);
+            if entries > cost.largest_list_len {
+                cost.largest_list_len = entries;
+                cost.largest_gram = Some(gram);
+            }
+        }
+    }
+    cost
 }
 
 fn log_phase_timing(op: &str, phase: &str, phase_started: Instant) {
@@ -1305,6 +1332,11 @@ pub fn search_place_ids(
             u16::MAX
         };
         let query_bigrams = ctx.query_bigrams.clone();
+        let cold_postings = if detailed_metrics {
+            cold_posting_cost(&db.bigram_offsets[..], &query_bigrams)
+        } else {
+            ColdPostingCost::default()
+        };
         let mut missing_bigrams = Vec::new();
 
         let phase_started = Instant::now();
@@ -1316,6 +1348,11 @@ pub fn search_place_ids(
             ctx.restore_sparse_counts(&cached);
         }
         let missing_bigram_count = missing_bigrams.len();
+        let cache_restored_string_ids = if detailed_metrics {
+            ctx.touched_string_indices.len()
+        } else {
+            0
+        };
         let cache_exact_hit = cache_base_reused && missing_bigram_count == 0;
         let cache_subset_hit = cache_base_reused && !cache_exact_hit;
         NGRAM_QUERIES.fetch_add(1, Ordering::Relaxed);
@@ -1537,7 +1574,9 @@ pub fn search_place_ids(
 
             let p_start = db.string_to_places_offsets[sid] as usize;
             let p_end = db.string_to_places_offsets[sid + 1] as usize;
-
+            if work.enabled {
+                work.name_mapping_entries_examined += p_end.saturating_sub(p_start) as u64;
+            }
             for i in p_start..p_end {
                 let place_id = db.string_to_places_data[i];
                 let place_idx = place_id as usize;
@@ -1623,6 +1662,9 @@ pub fn search_place_ids(
                 let s_start = db.string_to_street_offsets[sid] as usize;
                 let s_end = db.string_to_street_offsets[sid + 1] as usize;
                 if s_start <= s_end && s_end <= db.string_to_street_data.len() {
+                    if work.enabled {
+                        work.street_mapping_entries_examined += s_end.saturating_sub(s_start) as u64;
+                    }
                     for pos in s_start..s_end {
                         let street_group_id = db.string_to_street_data[pos];
                         for option in &component_options {
@@ -1986,6 +2028,35 @@ pub fn search_place_ids(
 
         results.truncate(max_results);
         log_phase_timing("search_place_ids", "final_sort_truncate", phase_started);
+
+        // Cache savings are counterfactual posting visits, not CPU or RAM savings.
+        debug!(
+            target: "cypress::query::timing",
+            op = "search_place_ids",
+            query_utf8_bytes = query.len(),
+            query_bigrams = query_bigram_count,
+            cold_bigram_posting_entries = cold_postings.entries,
+            largest_bigram_posting_entries = cold_postings.largest_list_len,
+            largest_bigram = ?cold_postings.largest_gram,
+            posting_lists_read,
+            posting_entries_examined = posting_entries_visited,
+            posting_entries_avoided_by_cache =
+                cold_postings.entries.saturating_sub(posting_entries_visited as u64),
+            cache_exact_hit,
+            cache_subset_hit,
+            cache_restored_string_ids,
+            touched_string_count = ctx.touched_string_indices.len(),
+            prefix_candidate_count = prefix_string_ids.len(),
+            name_mapping_entries_examined = work.name_mapping_entries_examined,
+            street_mapping_entries_examined = work.street_mapping_entries_examined,
+            string_candidates = ctx.string_matches.len(),
+            preliminary_place_candidates = unique_base_places,
+            dp_candidates = work.dp_candidates,
+            total_sift4_calls = sift4_guard.count(),
+            final_result_count = results.len(),
+            search_elapsed_ms = total_started.elapsed().as_millis(),
+            "query retrieval baseline"
+        );
     });
 
     log_total_timing("search_place_ids", total_started, results.len());
@@ -2722,6 +2793,19 @@ pub fn haversine_distance_km(p1: (f64, f64), p2: (f64, f64)) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cold_posting_cost_counts_sparse_and_duplicate_keys() {
+        let offsets = [0, 3, 3, 8];
+        let cost = cold_posting_cost(&offsets, &[0, 1, 2]);
+        assert_eq!(cost.entries, 8);
+        assert_eq!(cost.largest_list_len, 5);
+        assert_eq!(cost.largest_gram, Some(2));
+        assert_eq!(cold_posting_cost(&offsets, &[0, 0]).entries, 6);
+        assert_eq!(cold_posting_cost(&offsets, &[]), ColdPostingCost::default());
+        assert_eq!(cold_posting_cost(&offsets, &[5]), ColdPostingCost::default());
+    }
+
     use cypress::models::normalized::{AdminHierarchyIds, NormalizedPlace};
     use cypress::models::place::{Address, GeoPoint, Layer, OsmType};
     use std::collections::HashMap;
