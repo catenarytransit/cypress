@@ -2892,6 +2892,7 @@ mod tests {
     fn component_dp_finds_global_optimum_instead_of_greedy_choice() {
         let mut dp = [f32::INFINITY; 256];
         dp[0] = 0.0;
+        let mut work = SearchWorkStats::default();
 
         // A greedy first component would consume both tokens for -5. The
         // globally optimal assignment leaves token 2 for the second component:
@@ -2911,8 +2912,8 @@ mod tests {
             cost: -10.0,
         }];
 
-        advance_component_dp(&mut dp, &component_a, 0b11);
-        advance_component_dp(&mut dp, &component_b, 0b11);
+        advance_component_dp(&mut dp, &component_a, 0b11, &mut work);
+        advance_component_dp(&mut dp, &component_b, 0b11, &mut work);
 
         assert_eq!(dp[0b11], -10.0);
     }
@@ -2922,6 +2923,7 @@ mod tests {
         fn solve(street_mask: u8, house_mask: u8, admin_mask: u8) -> f32 {
             let mut dp = [f32::INFINITY; 256];
             dp[0] = 0.0;
+            let mut work = SearchWorkStats::default();
             advance_component_dp(
                 &mut dp,
                 &[ComponentMatchOption {
@@ -2929,6 +2931,7 @@ mod tests {
                     cost: -8.0,
                 }],
                 0b111,
+                &mut work,
             );
             advance_component_dp(
                 &mut dp,
@@ -2937,6 +2940,7 @@ mod tests {
                     cost: -3.0,
                 }],
                 0b111,
+                &mut work,
             );
             advance_component_dp(
                 &mut dp,
@@ -2945,6 +2949,7 @@ mod tests {
                     cost: -6.0,
                 }],
                 0b111,
+                &mut work,
             );
             dp[0b111]
         }
