@@ -17,6 +17,9 @@ use tracing_subscriber::FmtSubscriber;
 use xxhash_rust::xxh64::xxh64;
 
 use cypress::models::memdb::{CypressMemDb, PlaceRecord, PLACE_RECORD_DISK_BYTES};
+use cypress::models::token_index::TOKEN_INDEX_FILE;
+
+mod token_index;
 use cypress::models::normalized::NormalizedPlace;
 use cypress::models::place::Address;
 use cypress::models::population::decompress_population;
@@ -53,6 +56,11 @@ struct Args {
     /// Max retries per token range
     #[arg(long, default_value = "5")]
     max_retries: u32,
+
+    /// Compile an optional compact token sidecar for future selective retrieval.
+    /// Off by default; existing query engine and index format remain unchanged.
+    #[arg(long, default_value_t = false)]
+    token_index: bool,
 
     /// Temporary directory used for intermediate worker spill files
     #[arg(long, default_value = "./data/compiled/tmp")]
@@ -1616,6 +1624,32 @@ async fn main() -> Result<()> {
         cell_places,
     };
 
+
+    // Build the optional sidecar using the *final* canonical StringIds, not
+    // raw source records. This reuses every language alias and street anchor
+    // already admitted by the existing compiler without duplicating place data.
+    // Compute it before publishing current_version.txt; a failed build must
+    // not commit a new generation.
+    let token_path = out_dir.join(TOKEN_INDEX_FILE);
+    if args.token_index {
+        let report = token_index::build_token_index(
+            &memdb.string_name_offsets,
+            &memdb.string_name_bytes,
+            &run_tmp_dir,
+            &token_path,
+        )?;
+        info!(
+            tokens = report.token_count,
+            postings = report.posting_count,
+            fst_bytes = report.fst_bytes,
+            encoded_posting_bytes = report.posting_bytes,
+            skip_blocks = report.skip_count,
+            sidecar_bytes = report.total_bytes,
+            sidecar_mib = format!("{:.2}", report.total_bytes as f64 / 1_048_576.0),
+            "selective token sidecar compiled"
+        );
+    }
+
     info!("Serialising index to rkyv binary (streaming writer)...");
 
     let db_path = out_dir.join("cypress_index.bin");
@@ -1644,6 +1678,30 @@ async fn main() -> Result<()> {
             final_places_path.display()
         )
     })?;
+
+    // A new generation without --token-index must not leave an obsolete
+    // sidecar from a previous compiled dictionary beside the new MemDB.
+    if !args.token_index && token_path.exists() {
+        fs::remove_file(&token_path)
+            .context("Removing obsolete optional token sidecar")?;
+    }
+    let old_index_bytes = fs::metadata(&db_path)?.len();
+    let places_bytes = fs::metadata(&final_places_path)?.len();
+    let added_token_bytes = if args.token_index {
+        fs::metadata(&token_path)?.len()
+    } else {
+        0
+    };
+    let base_bytes = old_index_bytes + places_bytes;
+    info!(
+        existing_index_bytes = old_index_bytes,
+        places_bytes,
+        new_token_sidecar_bytes = added_token_bytes,
+        additional_percent = if base_bytes > 0 {
+            added_token_bytes as f64 * 100.0 / base_bytes as f64
+        } else { 0.0 },
+        "compiled dataset size summary"
+    );
 
     let version_path = out_dir.join("current_version.txt");
     fs::write(version_path, chrono::Utc::now().timestamp().to_string())?;
