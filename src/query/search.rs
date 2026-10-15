@@ -2198,11 +2198,13 @@ pub async fn execute_search(
 
     let phase_started = Instant::now();
     // Preserve ranking order while limiting Scylla fan-out per request.
-    let fetch_futures = scored_ids.iter().map(|(id, _)| {
-        // The DB future must own its ID rather than borrow the map closure's argument.
-        let id = id.clone();
-        async move { scylla_client.get_place(&id).await }
-    });
+    // Build futures directly: an iterator map closure captured across await
+    // triggers a higher-ranked FnOnce lifetime error in the Axum handler.
+    // The IDs stay alive through the buffered fetch, so borrowing is safe.
+    let mut fetch_futures = Vec::with_capacity(scored_ids.len());
+    for (id, _) in &scored_ids {
+        fetch_futures.push(scylla_client.get_place(id));
+    }
     let fetched = stream::iter(fetch_futures).buffered(8).collect::<Vec<_>>().await;
     log_phase_timing("execute_search", "fetch_places", phase_started);
 
@@ -2293,11 +2295,10 @@ pub async fn execute_search_v2(
     let mut admin_ids = std::collections::HashSet::new();
 
     let phase_started = Instant::now();
-    let fetch_futures = scored_ids.iter().map(|(id, _)| {
-        // The DB future must own its ID rather than borrow the map closure's argument.
-        let id = id.clone();
-        async move { scylla_client.get_place(&id).await }
-    });
+    let mut fetch_futures = Vec::with_capacity(scored_ids.len());
+    for (id, _) in &scored_ids {
+        fetch_futures.push(scylla_client.get_place(id));
+    }
     let fetched = stream::iter(fetch_futures).buffered(8).collect::<Vec<_>>().await;
     log_phase_timing("execute_search_v2", "fetch_places", phase_started);
 
@@ -2374,11 +2375,10 @@ pub async fn execute_reverse(
     log_phase_timing("execute_reverse", "spatial_search", phase_started);
 
     let phase_started = Instant::now();
-    let fetch_futures = nearby.iter().map(|(id, _)| {
-        // The DB future must own its ID rather than borrow the map closure's argument.
-        let id = id.clone();
-        async move { scylla_client.get_place(&id).await }
-    });
+    let mut fetch_futures = Vec::with_capacity(nearby.len());
+    for (id, _) in &nearby {
+        fetch_futures.push(scylla_client.get_place(id));
+    }
     let fetched = stream::iter(fetch_futures).buffered(8).collect::<Vec<_>>().await;
     log_phase_timing("execute_reverse", "fetch_places", phase_started);
 
@@ -2455,11 +2455,10 @@ pub async fn execute_reverse_v2(
     log_phase_timing("execute_reverse_v2", "spatial_search", phase_started);
 
     let phase_started = Instant::now();
-    let fetch_futures = nearby.iter().map(|(id, _)| {
-        // The DB future must own its ID rather than borrow the map closure's argument.
-        let id = id.clone();
-        async move { scylla_client.get_place(&id).await }
-    });
+    let mut fetch_futures = Vec::with_capacity(nearby.len());
+    for (id, _) in &nearby {
+        fetch_futures.push(scylla_client.get_place(id));
+    }
     let fetched = stream::iter(fetch_futures).buffered(8).collect::<Vec<_>>().await;
     log_phase_timing("execute_reverse_v2", "fetch_places", phase_started);
 
