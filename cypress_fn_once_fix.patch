@@ -1,0 +1,91 @@
+diff --git a/src/query/search.rs b/src/query/search.rs
+--- a/src/query/search.rs
++++ b/src/query/search.rs
+@@ -1,5 +1,4 @@
+ use anyhow::Result;
+-use futures::{stream, StreamExt};
+ use fst::automaton::Str;
+ use fst::{Automaton, IntoStreamer, Map, Streamer};
+ use serde::{Deserialize, Serialize};
+@@ -2153,6 +2152,29 @@
+     resolved
+ }
+ 
++/// Fetch ScyllaDB rows with bounded per-request concurrency.
++///
++/// Explicit loops avoid retaining iterator adaptor closures borrowing
++/// `ranked_ids` inside Axum handler futures (which can fail Send checking).
++/// join_all polls each batch concurrently and preserves input ordering.
++async fn fetch_places_bounded(
++    scylla_client: &ScyllaClient,
++    ranked_ids: &[(String, f64)],
++) -> Vec<Result<Option<String>>> {
++    const BATCH_SIZE: usize = 8;
++    let mut fetched = Vec::with_capacity(ranked_ids.len());
++
++    for batch in ranked_ids.chunks(BATCH_SIZE) {
++        let mut requests = Vec::with_capacity(batch.len());
++        for (id, _) in batch {
++            requests.push(scylla_client.get_place(id));
++        }
++        fetched.extend(futures::future::join_all(requests).await);
++    }
++
++    fetched
++}
++
+ pub async fn execute_search(
+     scylla_client: &ScyllaClient,
+     memdb: &Arc<Memdb>,
+@@ -2198,11 +2220,7 @@
+ 
+     let phase_started = Instant::now();
+     // Preserve ranking order while limiting Scylla fan-out per request.
+-    let fetch_futures = scored_ids
+-        .iter()
+-        .map(|(id, _)| id.clone())
+-        .map(|id| async move { scylla_client.get_place(&id).await });
+-    let fetched = stream::iter(fetch_futures).buffered(8).collect::<Vec<_>>().await;
++    let fetched = fetch_places_bounded(scylla_client, &scored_ids).await;
+     log_phase_timing("execute_search", "fetch_places", phase_started);
+ 
+     let phase_started = Instant::now();
+@@ -2292,11 +2310,7 @@
+     let mut admin_ids = std::collections::HashSet::new();
+ 
+     let phase_started = Instant::now();
+-    let fetch_futures = scored_ids
+-        .iter()
+-        .map(|(id, _)| id.clone())
+-        .map(|id| async move { scylla_client.get_place(&id).await });
+-    let fetched = stream::iter(fetch_futures).buffered(8).collect::<Vec<_>>().await;
++    let fetched = fetch_places_bounded(scylla_client, &scored_ids).await;
+     log_phase_timing("execute_search_v2", "fetch_places", phase_started);
+ 
+     let phase_started = Instant::now();
+@@ -2372,11 +2386,7 @@
+     log_phase_timing("execute_reverse", "spatial_search", phase_started);
+ 
+     let phase_started = Instant::now();
+-    let fetch_futures = nearby
+-        .iter()
+-        .map(|(id, _)| id.clone())
+-        .map(|id| async move { scylla_client.get_place(&id).await });
+-    let fetched = stream::iter(fetch_futures).buffered(8).collect::<Vec<_>>().await;
++    let fetched = fetch_places_bounded(scylla_client, &nearby).await;
+     log_phase_timing("execute_reverse", "fetch_places", phase_started);
+ 
+     let mut admin_ids = std::collections::HashSet::new();
+@@ -2452,11 +2462,7 @@
+     log_phase_timing("execute_reverse_v2", "spatial_search", phase_started);
+ 
+     let phase_started = Instant::now();
+-    let fetch_futures = nearby
+-        .iter()
+-        .map(|(id, _)| id.clone())
+-        .map(|id| async move { scylla_client.get_place(&id).await });
+-    let fetched = stream::iter(fetch_futures).buffered(8).collect::<Vec<_>>().await;
++    let fetched = fetch_places_bounded(scylla_client, &nearby).await;
+     log_phase_timing("execute_reverse_v2", "fetch_places", phase_started);
+ 
+     let mut admin_ids = std::collections::HashSet::new();

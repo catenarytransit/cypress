@@ -561,6 +561,10 @@ async fn main() -> Result<()> {
     tracing::subscriber::set_global_default(subscriber)?;
 
     let args = Args::parse();
+
+    println!("Temp dir: {}", args.tmp_dir);
+    println!("Output dir: {}", args.out_dir);
+
     let out_dir = Path::new(&args.out_dir);
     fs::create_dir_all(out_dir).context("Failed to create output directory")?;
 
