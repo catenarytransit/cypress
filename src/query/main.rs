@@ -35,6 +35,7 @@ use cypress::scylla::ScyllaClient;
 mod cpu;
 mod memdb;
 mod search;
+mod token_retrieval;
 use cpu::{SearchCpu, SearchCpuError};
 use memdb::Memdb;
 use search::{SearchParams, SearchResult, SearchResultV2};
