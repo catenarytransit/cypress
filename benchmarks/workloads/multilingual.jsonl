@@ -1,0 +1,31 @@
+{"id":"hollywood_walk","text":"Hollywood Walk of Fame"}
+{"id":"irvine_address","text":"4885 Paseo De Vega Irvine"}
+{"id":"hollywood_typo","text":"Hollywod Walk of Fame"}
+{"id":"paris_global","text":"Paris"}
+{"id":"paris_texas","text":"Paris Texas"}
+{"id":"springfield","text":"Springfield"}
+{"id":"main_street","text":"Main Street"}
+{"id":"brussels_fr","text":"Bruxelles"}
+{"id":"brussels_nl","text":"Brussel"}
+{"id":"brussels_bilingual","text":"Bruxelles - Brussel"}
+{"id":"munich_de","text":"München"}
+{"id":"munich_en","text":"Munich"}
+{"id":"zurich_de","text":"Zürich"}
+{"id":"zurich_ascii","text":"Zurich"}
+{"id":"moscow_ru","text":"Москва"}
+{"id":"moscow_en","text":"Moscow"}
+{"id":"tokyo_ja","text":"東京"}
+{"id":"tokyo_station_ja","text":"東京駅"}
+{"id":"tokyo_station_en","text":"Tokyo Station"}
+{"id":"tokyo_mixed","text":"東京 Station"}
+{"id":"beijing_zh","text":"北京市"}
+{"id":"beijing_en","text":"Beijing"}
+{"id":"seoul_ko","text":"서울역"}
+{"id":"cairo_ar","text":"القاهرة"}
+{"id":"cairo_en","text":"Cairo"}
+{"id":"montreal_fr","text":"Montréal"}
+{"id":"montreal_ascii","text":"Montreal"}
+{"id":"bangkok_th","text":"กรุงเทพมหานคร"}
+{"id":"new_delhi_hi","text":"नई दिल्ली"}
+{"id":"sao_paulo_pt","text":"São Paulo"}
+{"id":"focus_ambiguous","text":"Paris","focus.point.lat":33.6,"focus.point.lon":-117.8,"focus.point.weight":50}
