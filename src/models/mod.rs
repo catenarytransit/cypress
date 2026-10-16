@@ -8,6 +8,7 @@ pub mod population;
 pub mod scoring;
 pub mod sift4;
 pub mod spatial_grid;
+pub mod bigram_index;
 pub mod token_index;
 
 pub use admin::{AdminArea, AdminEntry, AdminHierarchy, AdminLevel};

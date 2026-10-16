@@ -20,6 +20,7 @@ use cypress::models::memdb::{CypressMemDb, PlaceRecord, PLACE_RECORD_DISK_BYTES}
 use cypress::models::token_index::TOKEN_INDEX_FILE;
 
 mod token_index;
+mod bigram_index;
 mod spatial_grid;
 use cypress::models::normalized::NormalizedPlace;
 use cypress::models::place::Address;
@@ -66,6 +67,10 @@ struct Args {
     /// Maximum sort-run memory for the on-disk spatial grid (MiB).
     #[arg(long, default_value_t = 128)]
     grid_sort_buffer_mib: usize,
+
+    /// Memory limit per bigram shard sorting chunk in MiB.
+    #[arg(long, default_value_t = 64)]
+    bigram_sort_buffer_mib: usize,
 
     /// Temporary directory used for intermediate worker spill files
     #[arg(long, default_value = "./data/compiled/tmp")]
@@ -1534,62 +1539,22 @@ async fn main() -> Result<()> {
         writer.flush()?;
     }
 
-    info!("Pass 2b: building flattened bigram offset/data arrays");
+    drop(bigram_shard_writers);
 
-    let mut bigram_offsets = Vec::with_capacity(65537);
-    let mut bigram_data = Vec::<u32>::new();
-    let mut current_offset = 0u32;
-    let mut current_bigram = 0u32;
-    bigram_offsets.push(0);
-
-    for shard in 0..BIGRAM_SHARDS {
-        let shard_path = bigram_shard_dir.join(format!("bg_{:03}.bin", shard));
-        if !shard_path.exists() {
-            continue;
-        }
-        if fs::metadata(&shard_path)?.len() == 0 {
-            continue;
-        }
-
-        let mut pairs = Vec::<(u16, u32)>::new();
-        let mut reader = BufReader::new(File::open(&shard_path)?);
-        while let Some(pair) = read_bigram_pair(&mut reader)? {
-            pairs.push(pair);
-        }
-
-        pairs.sort_unstable();
-        pairs.dedup();
-
-        let mut i = 0usize;
-        while i < pairs.len() {
-            let bg = pairs[i].0 as u32;
-            while current_bigram < bg {
-                bigram_offsets.push(current_offset);
-                current_bigram += 1;
-            }
-
-            while i < pairs.len() && pairs[i].0 as u32 == bg {
-                bigram_data.push(pairs[i].1);
-                i += 1;
-            }
-
-            current_offset = bigram_data.len() as u32;
-            bigram_offsets.push(current_offset);
-            current_bigram += 1;
-        }
-    }
-
-    while current_bigram < 65536 {
-        bigram_offsets.push(current_offset);
-        current_bigram += 1;
-    }
-
-    if bigram_offsets.len() != 65537 {
-        return Err(anyhow!(
-            "Invalid bigram_offsets length: {}",
-            bigram_offsets.len()
-        ));
-    }
+    info!("Pass 2b: bounded external sort of bigram postings");
+    let bigram_stage_path = run_tmp_dir.join("staged_bigrams.bin");
+    let (bigram_offsets, bigram_posting_count) = bigram_index::build(
+        &bigram_shard_dir,
+        &run_tmp_dir.join("bigram_sort"),
+        &bigram_stage_path,
+        &string_name_bytes,
+        &string_bigram_counts,
+        args.bigram_sort_buffer_mib,
+    )?;
+    info!(postings = bigram_posting_count,
+          sort_buffer_mib = args.bigram_sort_buffer_mib,
+          "Disk-backed bigram postings ready");
+    let bigram_data = Vec::new();
 
     // Spatial arrays live in cypress_grid.bin, not in long-lived heap vectors.
     let active_cells = Vec::new();
@@ -1699,9 +1664,12 @@ async fn main() -> Result<()> {
         fs::remove_file(&token_path)
             .context("Removing obsolete optional token sidecar")?;
     }
-    // Do not publish the sidecar before its associated main index is complete.
+    // Publish sidecars after the main index has been serialized.
     fs::rename(&staged_grid_path, &grid_path)?;
+    let bigram_path = out_dir.join(cypress::models::bigram_index::BIGRAM_INDEX_FILE);
+    fs::rename(&bigram_stage_path, &bigram_path)?;
     let spatial_grid_bytes = fs::metadata(&grid_path)?.len();
+    let bigram_index_bytes = fs::metadata(&bigram_path)?.len();
     let old_index_bytes = fs::metadata(&db_path)?.len();
     let places_bytes = fs::metadata(&final_places_path)?.len();
     let added_token_bytes = if args.token_index {
@@ -1709,11 +1677,12 @@ async fn main() -> Result<()> {
     } else {
         0
     };
-    let base_bytes = old_index_bytes + places_bytes + spatial_grid_bytes;
+    let base_bytes = old_index_bytes + places_bytes + spatial_grid_bytes + bigram_index_bytes;
     info!(
         existing_index_bytes = old_index_bytes,
         places_bytes,
         spatial_grid_bytes,
+        bigram_index_bytes,
         new_token_sidecar_bytes = added_token_bytes,
         additional_percent = if base_bytes > 0 {
             added_token_bytes as f64 * 100.0 / base_bytes as f64
