@@ -1567,6 +1567,7 @@ async fn main() -> Result<()> {
     house_number_bytes.finish()?;
     house_postcode_offsets.finish()?;
     house_postcode_bytes.finish()?;
+    let house_count = house_place_ids.len();
     house_place_ids.finish()?;
     reverse_pairs_writer.flush()?;
     drop(reverse_pairs_writer);
@@ -1605,7 +1606,7 @@ async fn main() -> Result<()> {
     info!(
         "Built {} street groups containing {} houses",
         street_name_string_ids.len(),
-        house_place_ids.len()
+        house_count
     );
 
     for writer in bigram_shard_writers.values_mut() {
