@@ -57,18 +57,30 @@ fn copy_across_filesystems(source: &Path, destination: &Path) -> Result<()> {
         )
     })?;
     staged.as_file().sync_all().with_context(|| {
-        format!("Failed to sync staged compiler artifact for {}", destination.display())
+        format!(
+            "Failed to sync staged compiler artifact for {}",
+            destination.display()
+        )
     })?;
 
     // This rename is always within the destination filesystem. In particular,
     // an existing destination is not truncated if an earlier copy fails.
-    staged.persist(destination).map_err(|err| err.error).with_context(|| {
-        format!("Failed to publish staged compiler artifact {}", destination.display())
-    })?;
+    staged
+        .persist(destination)
+        .map_err(|err| err.error)
+        .with_context(|| {
+            format!(
+                "Failed to publish staged compiler artifact {}",
+                destination.display()
+            )
+        })?;
 
     // Only discard the scratch file after the destination is fully published.
     fs::remove_file(source).with_context(|| {
-        format!("Failed to remove published scratch artifact {}", source.display())
+        format!(
+            "Failed to remove published scratch artifact {}",
+            source.display()
+        )
     })?;
     Ok(())
 }

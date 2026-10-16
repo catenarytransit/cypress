@@ -43,7 +43,10 @@ pub fn suffix_splits(tokens: &[&[u8]]) -> Vec<(Vec<u8>, Vec<u8>)> {
     (1..tokens.len())
         .rev()
         .map(|split| {
-            (tokens[..split].join(&[b' '][..]), tokens[split..].join(&[b' '][..]))
+            (
+                tokens[..split].join(&[b' '][..]),
+                tokens[split..].join(&[b' '][..]),
+            )
         })
         .collect()
 }
@@ -138,14 +141,16 @@ pub fn retain_joined_strings(
         let name_match = index.string_place_ids[place_start..place_end]
             .iter()
             .any(|&place_id| {
-                index.place_area_sets
+                index
+                    .place_area_sets
                     .get(place_id as usize)
                     .is_some_and(|&set| in_area(index, set, candidate_areas))
             });
         let street_match = index.string_street_groups[street_start..street_end]
             .iter()
             .any(|&group| {
-                index.street_area_sets
+                index
+                    .street_area_sets
                     .get(group as usize)
                     .is_some_and(|&set| in_area(index, set, candidate_areas))
             });
@@ -213,7 +218,13 @@ mod tests {
         assert_eq!(stats.name_matches, 1);
         assert_eq!(stats.street_matches, 1);
         assert_eq!(stats.examined_links, 3);
-        assert_eq!(retain_joined_strings(&index, &[0, 1, 2], &[100]).unwrap().0.len(), 0);
+        assert_eq!(
+            retain_joined_strings(&index, &[0, 1, 2], &[100])
+                .unwrap()
+                .0
+                .len(),
+            0
+        );
     }
 
     #[test]

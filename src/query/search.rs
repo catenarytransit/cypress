@@ -1356,14 +1356,22 @@ pub fn search_place_ids(
                             &db.admin_alias_area_offsets[..],
                             &db.admin_alias_area_data[..],
                             &admin,
-                        ) else { continue; };
+                        ) else {
+                            continue;
+                        };
                         splits_attempted += 1;
-                        let Ok(name) = std::str::from_utf8(&name) else { continue; };
+                        let Ok(name) = std::str::from_utf8(&name) else {
+                            continue;
+                        };
                         match token_retrieval::retrieve(&index, name) {
                             Ok(Some((ids, stats))) => {
                                 examined += stats.posting_entries_examined;
                                 if let Some((filtered, join_stats)) =
-                                    field_aware::retain_joined_strings(&join_index, &ids, &admin_ids)
+                                    field_aware::retain_joined_strings(
+                                        &join_index,
+                                        &ids,
+                                        &admin_ids,
+                                    )
                                 {
                                     links += join_stats.examined_links;
                                     if !filtered.is_empty() {
@@ -1390,7 +1398,9 @@ pub fn search_place_ids(
                     areas.sort_unstable();
                     areas.dedup();
                     if !rejected && !joined.is_empty() && joined.len() <= MAX_STRING_MATCHES {
-                        field_join_only_ids = joined.iter().copied()
+                        field_join_only_ids = joined
+                            .iter()
+                            .copied()
                             .filter(|sid| prefix_string_ids.binary_search(sid).is_err())
                             .collect();
                         field_join_areas = areas;
@@ -1786,7 +1796,9 @@ pub fn search_place_ids(
             for i in p_start..p_end {
                 let place_id = db.string_to_places_data[i];
                 if field_join_only_ids.binary_search(string_idx).is_ok() {
-                    let Some(&area_set) = db.place_area_sets.get(place_id as usize) else { continue; };
+                    let Some(&area_set) = db.place_area_sets.get(place_id as usize) else {
+                        continue;
+                    };
                     if !field_aware::in_area(&join_index, area_set, &field_join_areas) {
                         continue;
                     }
@@ -1881,7 +1893,10 @@ pub fn search_place_ids(
                     for pos in s_start..s_end {
                         let street_group_id = db.string_to_street_data[pos];
                         if field_join_only_ids.binary_search(string_idx).is_ok() {
-                            let Some(&area_set) = db.street_area_sets.get(street_group_id as usize) else { continue; };
+                            let Some(&area_set) = db.street_area_sets.get(street_group_id as usize)
+                            else {
+                                continue;
+                            };
                             if !field_aware::in_area(&join_index, area_set, &field_join_areas) {
                                 continue;
                             }
