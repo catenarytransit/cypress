@@ -1336,7 +1336,7 @@ async fn main() -> Result<()> {
 
     let mut string_bigram_counts = Vec::new();
     let mut string_to_places_offsets = Vec::new();
-    let mut string_to_places_data = Vec::new();
+    let mut string_to_places_data = disk_columns::DiskColumn::<u32>::new(&dense_dir, "string_to_places_data")?;
     let mut string_name_offsets: Vec<u32> = Vec::new();
     let mut string_name_bytes: Vec<u8> = Vec::new();
     let mut next_string_id = 0u32;
@@ -1370,6 +1370,9 @@ async fn main() -> Result<()> {
             string_name_bytes.extend_from_slice(phrase.as_bytes());
             string_name_offsets.push(string_name_bytes.len() as u32);
 
+            // Duplicate suppression only examines this phrase. Spill the
+            // completed posting list instead of retaining all prior strings.
+            let mut local_place_ids: Vec<u32> = Vec::new();
             let mut last_place = None::<u32>;
             while i < entries.len() && entries[i].0 == phrase {
                 let place_id = entries[i].1;
@@ -1382,8 +1385,7 @@ async fn main() -> Result<()> {
                     let lon2 = place_longitudes[place_id as usize];
                     let mut duplicate = false;
 
-                    let start_idx = *string_to_places_offsets.last().unwrap() as usize;
-                    for &existing_id in &string_to_places_data[start_idx..] {
+                    for &existing_id in &local_place_ids {
                         let lat1 = place_latitudes[existing_id as usize];
                         let lon1 = place_longitudes[existing_id as usize];
 
@@ -1403,12 +1405,13 @@ async fn main() -> Result<()> {
                     }
 
                     if !duplicate {
-                        string_to_places_data.push(place_id);
+                        local_place_ids.push(place_id);
                     }
                     last_place = Some(place_id);
                 }
                 i += 1;
             }
+            string_to_places_data.extend_from_slice(&local_place_ids)?;
 
             // ADR-aligned little-endian bigram encoding
             let mut local_bigrams: Vec<u16> = phrase
@@ -1435,7 +1438,9 @@ async fn main() -> Result<()> {
         }
     }
 
-    string_to_places_offsets.push(string_to_places_data.len() as u32);
+    string_to_places_offsets.push(u32::try_from(string_to_places_data.len())
+        .context("string posting count exceeds u32 capacity")?);
+    string_to_places_data.finish()?;
 
     // Build a minimal FST over every searchable place alias. The term spill
     // already contains every place.name language variant plus place.phrase, so
@@ -1642,7 +1647,7 @@ async fn main() -> Result<()> {
         bigram_offsets,
         bigram_data,
         string_to_places_offsets,
-        string_to_places_data,
+        string_to_places_data: Vec::new(),
         string_to_street_offsets,
         string_to_street_data,
         place_latitudes: Vec::new(),
