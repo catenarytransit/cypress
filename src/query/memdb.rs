@@ -592,6 +592,16 @@ impl Memdb {
                 view.place_latitudes.len() == places_mmap.len() / PLACE_RECORD_DISK_BYTES,
                 "Dense sidecar place count differs from place records"
             );
+            anyhow::ensure!(
+                db.string_to_places_offsets.last().copied()
+                    == u32::try_from(view.string_to_places_data.len()).ok(),
+                "String-to-place offsets do not match dense postings"
+            );
+            anyhow::ensure!(
+                db.street_house_offsets.last().copied()
+                    == u32::try_from(view.house_place_ids.len()).ok(),
+                "Street group offsets do not match dense house list"
+            );
             anyhow::ensure!(db.place_latitudes.is_empty() &&
                 db.house_place_ids.is_empty() && db.place_area_sets.is_empty() &&
                 db.string_to_places_data.is_empty(),
