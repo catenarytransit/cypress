@@ -2,6 +2,7 @@
 
 pub mod admin;
 pub mod memdb;
+pub mod dense_columns;
 pub mod normalized;
 pub mod place;
 pub mod population;
