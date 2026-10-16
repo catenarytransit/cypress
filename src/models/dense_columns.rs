@@ -6,7 +6,7 @@ use std::convert::TryInto;
 pub const DENSE_FILE: &str = "cypress_dense.bin";
 pub const DENSE_MAGIC: &[u8; 8] = b"CYDENS01";
 pub const DENSE_VERSION: u32 = 1;
-pub const SECTION_COUNT: usize = 15;
+pub const SECTION_COUNT: usize = 16;
 pub const HEADER_SIZE: usize = 24 + SECTION_COUNT * 16;
 
 /// The order is part of the disk format, not an enum derived from Rust layout.
@@ -16,11 +16,11 @@ pub const SECTION_NAMES: [&str; SECTION_COUNT] = [
     "place_layer_ranks", "place_populations",
     "house_street_groups", "house_number_offsets", "house_number_bytes",
     "house_postcode_offsets", "house_postcode_bytes", "house_place_ids",
-    "place_address_house_indices", "place_area_sets",
+    "place_address_house_indices", "place_area_sets", "string_to_places_data",
 ];
 
 pub const ELEMENT_BYTES: [usize; SECTION_COUNT] = [
-    4, 4, 4, 4, 1, 1, 4, 4, 8, 1, 8, 1, 4, 4, 4,
+    4, 4, 4, 4, 1, 1, 4, 4, 8, 1, 8, 1, 4, 4, 4, 4,
 ];
 
 pub struct DenseColumnsView<'a> {
@@ -39,6 +39,7 @@ pub struct DenseColumnsView<'a> {
     pub house_place_ids: &'a [u32],
     pub place_address_house_indices: &'a [u32],
     pub place_area_sets: &'a [u32],
+    pub string_to_places_data: &'a [u32],
     pub dictionary_fingerprint: u64,
 }
 
@@ -88,6 +89,7 @@ impl<'a> DenseColumnsView<'a> {
             house_place_ids: cast(data, ranges[12])?,
             place_address_house_indices: cast(data, ranges[13])?,
             place_area_sets: cast(data, ranges[14])?,
+            string_to_places_data: cast(data, ranges[15])?,
             dictionary_fingerprint: fingerprint,
         };
         view.validate()?;
