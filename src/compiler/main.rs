@@ -21,6 +21,8 @@ use cypress::models::token_index::TOKEN_INDEX_FILE;
 
 mod token_index;
 mod bigram_index;
+mod address_sort;
+mod disk_columns;
 mod spatial_grid;
 use cypress::models::normalized::NormalizedPlace;
 use cypress::models::place::Address;
@@ -71,6 +73,10 @@ struct Args {
     /// Memory limit per bigram shard sorting chunk in MiB.
     #[arg(long, default_value_t = 64)]
     bigram_sort_buffer_mib: usize,
+
+    /// Maximum address bucket sort-run memory in MiB.
+    #[arg(long, default_value_t = 64)]
+    address_sort_buffer_mib: usize,
 
     /// Temporary directory used for intermediate worker spill files
     #[arg(long, default_value = "./data/compiled/tmp")]
@@ -1436,32 +1442,18 @@ async fn main() -> Result<()> {
             continue;
         }
 
-        let mut reader = BufReader::new(File::open(&bucket_path).with_context(|| {
-            format!("Failed to open address bucket: {}", bucket_path.display())
-        })?);
-        let mut entries = Vec::<AddressBucketEntry>::new();
-        while let Some(entry) = read_address_bucket_entry(&mut reader)? {
-            entries.push(entry);
-        }
-
-        entries.sort_unstable_by(|a, b| {
-            a.anchor
-                .cmp(&b.anchor)
-                .then(a.area_set.cmp(&b.area_set))
-                .then(a.house_number.cmp(&b.house_number))
-                .then(a.postcode.cmp(&b.postcode))
-                .then(a.place_id.cmp(&b.place_id))
-        });
-
-        let mut i = 0usize;
-        while i < entries.len() {
-            let anchor = entries[i].anchor.clone();
-            let area_set = entries[i].area_set;
+        let sorted_path = address_sort::sort_bucket(
+            &bucket_path,
+            &run_tmp_dir.join(format!("address_sort_{bucket:03}")),
+            args.address_sort_buffer_mib,
+        )?;
+        let mut reader = BufReader::new(File::open(&sorted_path)?);
+        let mut next = read_address_bucket_entry(&mut reader)?;
+        while let Some(first) = next.take() {
+            let anchor = first.anchor.clone();
+            let area_set = first.area_set;
             let string_id = prefix_map.get(anchor.as_bytes()).ok_or_else(|| {
-                anyhow!(
-                    "Address anchor {:?} missing from compiled string dictionary",
-                    anchor
-                )
+                anyhow!("Address anchor {:?} missing from compiled string dictionary", anchor)
             })? as u32;
 
             let street_group_id = street_name_string_ids.len() as u32;
@@ -1469,17 +1461,13 @@ async fn main() -> Result<()> {
             street_area_sets.push(area_set);
             string_to_street_pairs.push((string_id, street_group_id));
 
-            while i < entries.len()
-                && entries[i].anchor == anchor
-                && entries[i].area_set == area_set
-            {
-                let entry = &entries[i];
+            let mut current = Some(first);
+            loop {
+                let entry = current.take().expect("current entry in sorted group");
                 if entry.place_id >= total_places {
                     return Err(anyhow!(
                         "Corrupt address bucket {}: place id {} >= {}",
-                        bucket_path.display(),
-                        entry.place_id,
-                        total_places
+                        bucket_path.display(), entry.place_id, total_places
                     ));
                 }
 
@@ -1489,7 +1477,6 @@ async fn main() -> Result<()> {
 
                 house_number_bytes.extend_from_slice(entry.house_number.as_bytes());
                 house_number_offsets.push(house_number_bytes.len() as u32);
-
                 house_postcode_bytes.extend_from_slice(entry.postcode.as_bytes());
                 house_postcode_offsets.push(house_postcode_bytes.len() as u32);
 
@@ -1498,11 +1485,17 @@ async fn main() -> Result<()> {
                     *reverse_slot = house_idx;
                 }
 
-                i += 1;
+                next = read_address_bucket_entry(&mut reader)?;
+                if next.as_ref().is_some_and(|e| e.anchor == anchor && e.area_set == area_set) {
+                    current = next.take();
+                } else {
+                    break;
+                }
             }
-
             street_house_offsets.push(house_place_ids.len() as u32);
         }
+        drop(reader);
+        fs::remove_dir_all(sorted_path.parent().unwrap())?;
     }
     drop(prefix_map);
 
