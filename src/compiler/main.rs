@@ -1154,6 +1154,16 @@ async fn main() -> Result<()> {
             .filter(|&&v| v != sentinel_area_set)
             .count()
     );
+    // The interning table is only needed for ID assignment. Its Vec keys
+    // duplicate the final area_set_data arena, so do not retain it into
+    // address sorting, bigram compilation, or final serialization.
+    drop(area_set_map);
+    drop(area_id_to_idx);
+    drop(area_level_by_id);
+    drop(admin_area_data);
+    drop(sorted_area_ids);
+    drop(all_area_ids_vec);
+
 
     info!(
         "Distributing worker term spills into {} hash buckets",
@@ -1398,14 +1408,20 @@ async fn main() -> Result<()> {
         string_name_bytes[a_start..a_end].cmp(&string_name_bytes[b_start..b_end])
     });
 
-    let mut prefix_builder = MapBuilder::memory();
-    for string_id in prefix_string_ids {
-        let sid = string_id as usize;
-        let start = string_name_offsets[sid] as usize;
-        let end = string_name_offsets[sid + 1] as usize;
-        prefix_builder.insert(&string_name_bytes[start..end], string_id as u64)?;
+    // Build directly to disk: avoid an additional 328+ MB growable FST heap arena
+    // while the house/parent/name columns are already resident.
+    let prefix_fst_path = run_tmp_dir.join("place_prefix.fst");
+    {
+        let mut prefix_builder = MapBuilder::new(BufWriter::new(File::create(&prefix_fst_path)?))?;
+        for string_id in prefix_string_ids {
+            let sid = string_id as usize;
+            let start = string_name_offsets[sid] as usize;
+            let end = string_name_offsets[sid + 1] as usize;
+            prefix_builder.insert(&string_name_bytes[start..end], string_id as u64)?;
+        }
+        prefix_builder.finish()?;
     }
-    let prefix_fst_bytes = prefix_builder.into_inner()?;
+    let prefix_fst_bytes = fs::read(&prefix_fst_path)?;
     info!(
         "Built multilingual place-prefix FST ({} bytes, {} aliases)",
         prefix_fst_bytes.len(),
