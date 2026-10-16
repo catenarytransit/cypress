@@ -23,6 +23,7 @@ mod token_index;
 mod bigram_index;
 mod address_sort;
 mod disk_columns;
+mod reverse_index;
 mod spatial_grid;
 use cypress::models::normalized::NormalizedPlace;
 use cypress::models::place::Address;
@@ -77,6 +78,10 @@ struct Args {
     /// Maximum address bucket sort-run memory in MiB.
     #[arg(long, default_value_t = 64)]
     address_sort_buffer_mib: usize,
+
+    /// Working-memory budget used for the reverse-address external sort.
+    #[arg(long, default_value_t = 64)]
+    reverse_sort_buffer_mib: usize,
 
     /// Temporary directory used for intermediate worker spill files
     #[arg(long, default_value = "./data/compiled/tmp")]
@@ -1445,7 +1450,8 @@ async fn main() -> Result<()> {
     let mut house_postcode_offsets = Vec::<u32>::new();
     let mut house_postcode_bytes = Vec::<u8>::new();
     let mut house_place_ids = Vec::<u32>::new();
-    let mut place_address_house_indices = vec![u32::MAX; total_places as usize];
+    let reverse_pairs_path = run_tmp_dir.join("reverse_address_pairs.bin");
+    let mut reverse_pairs_writer = BufWriter::new(File::create(&reverse_pairs_path)?);
     let mut string_to_street_pairs = Vec::<(u32, u32)>::new();
 
     street_house_offsets.push(0);
@@ -1496,10 +1502,7 @@ async fn main() -> Result<()> {
                 house_postcode_bytes.extend_from_slice(entry.postcode.as_bytes());
                 house_postcode_offsets.push(house_postcode_bytes.len() as u32);
 
-                let reverse_slot = &mut place_address_house_indices[entry.place_id as usize];
-                if *reverse_slot == u32::MAX {
-                    *reverse_slot = house_idx;
-                }
+                reverse_index::write_pair(&mut reverse_pairs_writer, entry.place_id, house_idx)?;
 
                 next = read_address_bucket_entry(&mut reader)?;
                 if next.as_ref().is_some_and(|e| e.anchor == anchor && e.area_set == area_set) {
@@ -1514,6 +1517,20 @@ async fn main() -> Result<()> {
         fs::remove_dir_all(sorted_path.parent().unwrap())?;
     }
     drop(prefix_map);
+    reverse_pairs_writer.flush()?;
+    drop(reverse_pairs_writer);
+    reverse_index::build(
+        &reverse_pairs_path,
+        &run_tmp_dir.join("reverse_address_sort"),
+        &run_tmp_dir.join("reverse_address_columns"),
+        "place_address_house_indices",
+        total_places,
+        args.reverse_sort_buffer_mib,
+    )?;
+    let reverse_path = run_tmp_dir.join("reverse_address_columns/place_address_house_indices.bin");
+    let reverse_file = File::open(&reverse_path)?;
+    let reverse_mmap = unsafe { MmapOptions::new().map(&reverse_file)? };
+    let place_address_house_indices = bytemuck::try_cast_slice::<u8, u32>(&reverse_mmap)?.to_vec();
 
     string_to_street_pairs.sort_unstable();
     string_to_street_pairs.dedup();
