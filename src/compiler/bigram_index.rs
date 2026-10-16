@@ -1,6 +1,6 @@
 //! External-sort bigram shard pairs, streaming final postings into a sidecar.
 use anyhow::{anyhow, ensure, Result};
-use cypress::models::bigram_index::{name_fingerprint, BIGRAM_HEADER_SIZE, BIGRAM_INDEX_MAGIC, BIGRAM_INDEX_VERSION};
+use cypress::models::bigram_index::{name_fingerprint, BIGRAM_INDEX_MAGIC, BIGRAM_INDEX_VERSION};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fs::{self, File};

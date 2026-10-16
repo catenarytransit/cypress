@@ -23,6 +23,8 @@ mod token_index;
 mod bigram_index;
 mod address_sort;
 mod disk_columns;
+mod reverse_index;
+mod dense_build;
 mod spatial_grid;
 use cypress::models::normalized::NormalizedPlace;
 use cypress::models::place::Address;
@@ -77,6 +79,10 @@ struct Args {
     /// Maximum address bucket sort-run memory in MiB.
     #[arg(long, default_value_t = 64)]
     address_sort_buffer_mib: usize,
+
+    /// Working-memory budget used for the reverse-address external sort.
+    #[arg(long, default_value_t = 64)]
+    reverse_sort_buffer_mib: usize,
 
     /// Temporary directory used for intermediate worker spill files
     #[arg(long, default_value = "./data/compiled/tmp")]
@@ -770,15 +776,16 @@ async fn main() -> Result<()> {
     info!("Processing places for spatial index");
     let grid_pairs_path = run_tmp_dir.join("spatial_pairs.bin");
     let mut grid_pairs_writer = BufWriter::new(File::create(&grid_pairs_path)?);
-    let mut place_latitudes = Vec::with_capacity(total_places as usize);
-    let mut place_longitudes = Vec::with_capacity(total_places as usize);
-    let mut place_importances = Vec::with_capacity(total_places as usize);
-    let mut place_source_id_offsets = Vec::with_capacity(total_places as usize + 1);
-    let mut place_source_id_bytes = Vec::new();
-    let mut place_layer_ranks = Vec::with_capacity(total_places as usize);
-    let mut place_populations = Vec::with_capacity(total_places as usize);
+    let dense_dir = run_tmp_dir.join("dense_columns");
+    let mut place_latitudes = disk_columns::DiskColumn::<f32>::new(&dense_dir, "place_latitudes")?;
+    let mut place_longitudes = disk_columns::DiskColumn::<f32>::new(&dense_dir, "place_longitudes")?;
+    let mut place_importances = disk_columns::DiskColumn::<f32>::new(&dense_dir, "place_importances")?;
+    let mut place_source_id_offsets = disk_columns::DiskColumn::<u32>::new(&dense_dir, "place_source_id_offsets")?;
+    let mut place_source_id_bytes = disk_columns::DiskColumn::<u8>::new(&dense_dir, "place_source_id_bytes")?;
+    let mut place_layer_ranks = disk_columns::DiskColumn::<u8>::new(&dense_dir, "place_layer_ranks")?;
+    let mut place_populations = disk_columns::DiskColumn::<u32>::new(&dense_dir, "place_populations")?;
 
-    place_source_id_offsets.push(0);
+    place_source_id_offsets.push(0)?;
 
     for (idx, chunk) in places_mmap
         .chunks_exact(PLACE_RECORD_DISK_BYTES)
@@ -789,19 +796,44 @@ async fn main() -> Result<()> {
         let cell_id = CypressMemDb::coord_to_cell(place.lat, place.lon);
         spatial_grid::write_pair(&mut grid_pairs_writer, cell_id, place_id)?;
 
-        place_latitudes.push(place.lat);
-        place_longitudes.push(place.lon);
-        place_importances.push(place.importance);
-        place_layer_ranks.push(place.layer_rank);
-        place_populations.push(place.population);
+        place_latitudes.push(place.lat)?;
+        place_longitudes.push(place.lon)?;
+        place_importances.push(place.importance)?;
+        place_layer_ranks.push(place.layer_rank)?;
+        place_populations.push(place.population)?;
 
         let id_bytes = &place.source_id_bytes[..place.source_id_len as usize];
-        place_source_id_bytes.extend_from_slice(id_bytes);
-        place_source_id_offsets.push(place_source_id_bytes.len() as u32);
+        place_source_id_bytes.extend_from_slice(id_bytes)?;
+        place_source_id_offsets.push(u32::try_from(place_source_id_bytes.len())
+            .context("source ID bytes exceed u32 offset capacity")?)?;
     }
 
     grid_pairs_writer.flush()?;
     drop(grid_pairs_writer);
+    place_latitudes.finish()?;
+    place_longitudes.finish()?;
+    place_importances.finish()?;
+    place_layer_ranks.finish()?;
+    place_populations.finish()?;
+    place_source_id_bytes.finish()?;
+    place_source_id_offsets.finish()?;
+    let lat_file = File::open(dense_dir.join("place_latitudes.bin"))?;
+    let lon_file = File::open(dense_dir.join("place_longitudes.bin"))?;
+    // Mapping an empty file is invalid on Linux; empty datasets use slices.
+    let lat_mmap = if total_places == 0 { None }
+        else { Some(unsafe { MmapOptions::new().map(&lat_file)? }) };
+    let lon_mmap = if total_places == 0 { None }
+        else { Some(unsafe { MmapOptions::new().map(&lon_file)? }) };
+    let place_latitudes: &[f32] = match lat_mmap.as_ref() {
+        Some(m) => bytemuck::try_cast_slice::<u8, f32>(m)
+            .map_err(|e| anyhow!("latitude mmap alignment: {e:?}"))?,
+        None => &[],
+    };
+    let place_longitudes: &[f32] = match lon_mmap.as_ref() {
+        Some(m) => bytemuck::try_cast_slice::<u8, f32>(m)
+            .map_err(|e| anyhow!("longitude mmap alignment: {e:?}"))?,
+        None => &[],
+    };
     // No subsequent pass needs the giant place record mmap.
     drop(places_mmap);
 
@@ -1060,11 +1092,12 @@ async fn main() -> Result<()> {
     );
 
     // === Pass 1.5c: Build area sets from bucketed compact pair spills ===
-    let sentinel_area_set = u32::MAX;
     let mut area_set_map: HashMap<Vec<u32>, u32> = HashMap::new();
     let mut area_set_offsets: Vec<u32> = Vec::new();
     let mut area_set_data: Vec<u32> = Vec::new();
-    let mut place_area_sets = vec![sentinel_area_set; total_places as usize];
+    let area_pairs_path = run_tmp_dir.join("place_area_assignment_pairs.bin");
+    let mut area_pairs_writer = BufWriter::new(File::create(&area_pairs_path)?);
+    let mut assigned_place_count = 0u64;
 
     area_set_offsets.push(0);
 
@@ -1142,18 +1175,30 @@ async fn main() -> Result<()> {
                 idx
             };
 
-            place_area_sets[place_id as usize] = area_set_idx;
+            reverse_index::write_pair(&mut area_pairs_writer, place_id, area_set_idx)?;
+            assigned_place_count += 1;
         }
     }
 
     info!(
         "Pass 1.5 complete: built {} deduplicated area sets for {} places",
         area_set_map.len(),
-        place_area_sets
-            .iter()
-            .filter(|&&v| v != sentinel_area_set)
-            .count()
+        assigned_place_count
     );
+    area_pairs_writer.flush()?;
+    drop(area_pairs_writer);
+    reverse_index::build(
+        &area_pairs_path,
+        &run_tmp_dir.join("place_area_sort"),
+        &dense_dir,
+        "place_area_sets",
+        total_places,
+        args.reverse_sort_buffer_mib,
+    )?;
+    let area_sets_file = File::open(dense_dir.join("place_area_sets.bin"))?;
+    let area_sets_mmap = unsafe { MmapOptions::new().map(&area_sets_file)? };
+    let place_area_sets = bytemuck::try_cast_slice::<u8,u32>(&area_sets_mmap)
+        .map_err(|e| anyhow!("area set mmap alignment: {e:?}"))?;
     // The interning table is only needed for ID assignment. Its Vec keys
     // duplicate the final area_set_data arena, so do not retain it into
     // address sorting, bigram compilation, or final serialization.
@@ -1291,7 +1336,7 @@ async fn main() -> Result<()> {
 
     let mut string_bigram_counts = Vec::new();
     let mut string_to_places_offsets = Vec::new();
-    let mut string_to_places_data = Vec::new();
+    let mut string_to_places_data = disk_columns::DiskColumn::<u32>::new(&dense_dir, "string_to_places_data")?;
     let mut string_name_offsets: Vec<u32> = Vec::new();
     let mut string_name_bytes: Vec<u8> = Vec::new();
     let mut next_string_id = 0u32;
@@ -1325,6 +1370,9 @@ async fn main() -> Result<()> {
             string_name_bytes.extend_from_slice(phrase.as_bytes());
             string_name_offsets.push(string_name_bytes.len() as u32);
 
+            // Duplicate suppression only examines this phrase. Spill the
+            // completed posting list instead of retaining all prior strings.
+            let mut local_place_ids: Vec<u32> = Vec::new();
             let mut last_place = None::<u32>;
             while i < entries.len() && entries[i].0 == phrase {
                 let place_id = entries[i].1;
@@ -1337,8 +1385,7 @@ async fn main() -> Result<()> {
                     let lon2 = place_longitudes[place_id as usize];
                     let mut duplicate = false;
 
-                    let start_idx = *string_to_places_offsets.last().unwrap() as usize;
-                    for &existing_id in &string_to_places_data[start_idx..] {
+                    for &existing_id in &local_place_ids {
                         let lat1 = place_latitudes[existing_id as usize];
                         let lon1 = place_longitudes[existing_id as usize];
 
@@ -1358,12 +1405,13 @@ async fn main() -> Result<()> {
                     }
 
                     if !duplicate {
-                        string_to_places_data.push(place_id);
+                        local_place_ids.push(place_id);
                     }
                     last_place = Some(place_id);
                 }
                 i += 1;
             }
+            string_to_places_data.extend_from_slice(&local_place_ids)?;
 
             // ADR-aligned little-endian bigram encoding
             let mut local_bigrams: Vec<u16> = phrase
@@ -1390,7 +1438,9 @@ async fn main() -> Result<()> {
         }
     }
 
-    string_to_places_offsets.push(string_to_places_data.len() as u32);
+    string_to_places_offsets.push(u32::try_from(string_to_places_data.len())
+        .context("string posting count exceeds u32 capacity")?);
+    string_to_places_data.finish()?;
 
     // Build a minimal FST over every searchable place alias. The term spill
     // already contains every place.name language variant plus place.phrase, so
@@ -1439,18 +1489,19 @@ async fn main() -> Result<()> {
     let mut street_name_string_ids = Vec::<u32>::new();
     let mut street_area_sets = Vec::<u32>::new();
     let mut street_house_offsets = Vec::<u32>::new();
-    let mut house_street_groups = Vec::<u32>::new();
-    let mut house_number_offsets = Vec::<u32>::new();
-    let mut house_number_bytes = Vec::<u8>::new();
-    let mut house_postcode_offsets = Vec::<u32>::new();
-    let mut house_postcode_bytes = Vec::<u8>::new();
-    let mut house_place_ids = Vec::<u32>::new();
-    let mut place_address_house_indices = vec![u32::MAX; total_places as usize];
+    let mut house_street_groups = disk_columns::DiskColumn::<u32>::new(&dense_dir, "house_street_groups")?;
+    let mut house_number_offsets = disk_columns::DiskColumn::<u64>::new(&dense_dir, "house_number_offsets")?;
+    let mut house_number_bytes = disk_columns::DiskColumn::<u8>::new(&dense_dir, "house_number_bytes")?;
+    let mut house_postcode_offsets = disk_columns::DiskColumn::<u64>::new(&dense_dir, "house_postcode_offsets")?;
+    let mut house_postcode_bytes = disk_columns::DiskColumn::<u8>::new(&dense_dir, "house_postcode_bytes")?;
+    let mut house_place_ids = disk_columns::DiskColumn::<u32>::new(&dense_dir, "house_place_ids")?;
+    let reverse_pairs_path = run_tmp_dir.join("reverse_address_pairs.bin");
+    let mut reverse_pairs_writer = BufWriter::new(File::create(&reverse_pairs_path)?);
     let mut string_to_street_pairs = Vec::<(u32, u32)>::new();
 
     street_house_offsets.push(0);
-    house_number_offsets.push(0);
-    house_postcode_offsets.push(0);
+    house_number_offsets.push(0)?;
+    house_postcode_offsets.push(0)?;
 
     for bucket in 0..ADDRESS_BUCKETS {
         let bucket_path = address_bucket_dir.join(format!("addresses_{:03}.bin", bucket));
@@ -1488,18 +1539,15 @@ async fn main() -> Result<()> {
                 }
 
                 let house_idx = house_place_ids.len() as u32;
-                house_street_groups.push(street_group_id);
-                house_place_ids.push(entry.place_id);
+                house_street_groups.push(street_group_id)?;
+                house_place_ids.push(entry.place_id)?;
 
-                house_number_bytes.extend_from_slice(entry.house_number.as_bytes());
-                house_number_offsets.push(house_number_bytes.len() as u32);
-                house_postcode_bytes.extend_from_slice(entry.postcode.as_bytes());
-                house_postcode_offsets.push(house_postcode_bytes.len() as u32);
+                house_number_bytes.extend_from_slice(entry.house_number.as_bytes())?;
+                house_number_offsets.push(house_number_bytes.len() as u64)?;
+                house_postcode_bytes.extend_from_slice(entry.postcode.as_bytes())?;
+                house_postcode_offsets.push(house_postcode_bytes.len() as u64)?;
 
-                let reverse_slot = &mut place_address_house_indices[entry.place_id as usize];
-                if *reverse_slot == u32::MAX {
-                    *reverse_slot = house_idx;
-                }
+                reverse_index::write_pair(&mut reverse_pairs_writer, entry.place_id, house_idx)?;
 
                 next = read_address_bucket_entry(&mut reader)?;
                 if next.as_ref().is_some_and(|e| e.anchor == anchor && e.area_set == area_set) {
@@ -1514,6 +1562,23 @@ async fn main() -> Result<()> {
         fs::remove_dir_all(sorted_path.parent().unwrap())?;
     }
     drop(prefix_map);
+    house_street_groups.finish()?;
+    house_number_offsets.finish()?;
+    house_number_bytes.finish()?;
+    house_postcode_offsets.finish()?;
+    house_postcode_bytes.finish()?;
+    let house_count = house_place_ids.len();
+    house_place_ids.finish()?;
+    reverse_pairs_writer.flush()?;
+    drop(reverse_pairs_writer);
+    reverse_index::build(
+        &reverse_pairs_path,
+        &run_tmp_dir.join("reverse_address_sort"),
+        &dense_dir,
+        "place_address_house_indices",
+        total_places,
+        args.reverse_sort_buffer_mib,
+    )?;
 
     string_to_street_pairs.sort_unstable();
     string_to_street_pairs.dedup();
@@ -1541,7 +1606,7 @@ async fn main() -> Result<()> {
     info!(
         "Built {} street groups containing {} houses",
         street_name_string_ids.len(),
-        house_place_ids.len()
+        house_count
     );
 
     for writer in bigram_shard_writers.values_mut() {
@@ -1570,21 +1635,29 @@ async fn main() -> Result<()> {
     let cell_offsets = Vec::new();
     let cell_places = Vec::new();
 
+    let dense_stage_path = run_tmp_dir.join("staged_dense.bin");
+    dense_build::assemble(
+        &dense_dir, &dense_stage_path,
+        cypress::models::bigram_index::name_fingerprint(&string_name_bytes, &string_bigram_counts),
+    )?;
+    info!(bytes = fs::metadata(&dense_stage_path)?.len(),
+          "Disk-backed dense columns ready");
+
     let memdb = CypressMemDb {
         string_bigram_counts,
         bigram_offsets,
         bigram_data,
         string_to_places_offsets,
-        string_to_places_data,
+        string_to_places_data: Vec::new(),
         string_to_street_offsets,
         string_to_street_data,
-        place_latitudes,
-        place_longitudes,
-        place_importances,
-        place_source_id_offsets,
-        place_source_id_bytes,
-        place_layer_ranks,
-        place_populations,
+        place_latitudes: Vec::new(),
+        place_longitudes: Vec::new(),
+        place_importances: Vec::new(),
+        place_source_id_offsets: Vec::new(),
+        place_source_id_bytes: Vec::new(),
+        place_layer_ranks: Vec::new(),
+        place_populations: Vec::new(),
         string_name_offsets,
         string_name_bytes,
         prefix_fst_bytes,
@@ -1597,17 +1670,17 @@ async fn main() -> Result<()> {
         admin_alias_area_data,
         area_set_offsets,
         area_set_data,
-        place_area_sets,
+        place_area_sets: Vec::new(),
         street_name_string_ids,
         street_area_sets,
         street_house_offsets,
-        house_street_groups,
-        house_number_offsets,
-        house_number_bytes,
-        house_postcode_offsets,
-        house_postcode_bytes,
-        house_place_ids,
-        place_address_house_indices,
+        house_street_groups: Vec::new(),
+        house_number_offsets: Vec::new(),
+        house_number_bytes: Vec::new(),
+        house_postcode_offsets: Vec::new(),
+        house_postcode_bytes: Vec::new(),
+        house_place_ids: Vec::new(),
+        place_address_house_indices: Vec::new(),
         active_cells,
         cell_offsets,
         cell_places,
@@ -1675,6 +1748,8 @@ async fn main() -> Result<()> {
     }
     // Publish sidecars after the main index has been serialized.
     fs::rename(&staged_grid_path, &grid_path)?;
+    let dense_path = out_dir.join(cypress::models::dense_columns::DENSE_FILE);
+    fs::rename(&dense_stage_path, &dense_path)?;
     let bigram_path = out_dir.join(cypress::models::bigram_index::BIGRAM_INDEX_FILE);
     fs::rename(&bigram_stage_path, &bigram_path)?;
     let spatial_grid_bytes = fs::metadata(&grid_path)?.len();
