@@ -43,3 +43,48 @@ pub fn assemble(columns: &Path, output: &Path, fingerprint: u64) -> Result<()> {
     drop(mmap);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cypress::models::dense_columns::DenseColumnsView;
+
+    fn le_u32(values: &[u32]) -> Vec<u8> {
+        values.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+    fn le_u64(values: &[u64]) -> Vec<u8> {
+        values.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+    fn le_f32(values: &[f32]) -> Vec<u8> {
+        values.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn roundtrip_and_reject_malformed_offsets() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("columns");
+        fs::create_dir(&dir).unwrap();
+        let fields: [&[u8]; SECTION_COUNT] = [
+            &le_f32(&[34.0,35.0]), &le_f32(&[-118.0,-119.0]),
+            &le_f32(&[1.0,2.0]), &le_u32(&[0,1,3]),
+            b"abc", &[0u8,1], &le_u32(&[5,6]),
+            &le_u32(&[0]), &le_u64(&[0,2]), b"12",
+            &le_u64(&[0,5]), b"90210", &le_u32(&[1]),
+            &le_u32(&[u32::MAX,0]), &le_u32(&[1,2]),
+        ];
+        for (name,data) in SECTION_NAMES.iter().zip(fields) {
+            fs::write(dir.join(format!("{name}.bin")),data).unwrap();
+        }
+        let path=temp.path().join("dense.bin");
+        assemble(&dir,&path,0x1234_5678).unwrap();
+        let mut data=fs::read(&path).unwrap();
+        let view=DenseColumnsView::parse(&data).unwrap();
+        assert_eq!(view.place_latitudes, &[34.0,35.0]);
+        assert_eq!(view.house_number_offsets, &[0,2]);
+        assert_eq!(view.house_place_ids, &[1]);
+        assert_eq!(view.place_area_sets, &[1,2]);
+        assert_eq!(view.dictionary_fingerprint, 0x1234_5678);
+        data[24] ^= 1; // first section offset no longer equals header size
+        assert!(DenseColumnsView::parse(&data).is_err());
+    }
+}
