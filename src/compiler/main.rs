@@ -1083,7 +1083,6 @@ async fn main() -> Result<()> {
     );
 
     // === Pass 1.5c: Build area sets from bucketed compact pair spills ===
-    let sentinel_area_set = u32::MAX;
     let mut area_set_map: HashMap<Vec<u32>, u32> = HashMap::new();
     let mut area_set_offsets: Vec<u32> = Vec::new();
     let mut area_set_data: Vec<u32> = Vec::new();
