@@ -2,7 +2,7 @@
 use anyhow::{anyhow, ensure, Result};
 use cypress::models::dense_columns::{DenseColumnsView, DENSE_MAGIC, DENSE_VERSION,
     HEADER_SIZE, SECTION_COUNT, SECTION_NAMES, ELEMENT_BYTES};
-use std::{fs::{self, File}, io::{BufReader, BufWriter, Read, Write}, path::Path};
+use std::{fs::{self, File}, io::{BufReader, BufWriter, Write}, path::Path};
 
 pub fn assemble(columns: &Path, output: &Path, fingerprint: u64) -> Result<()> {
     let mut sections=Vec::with_capacity(SECTION_COUNT);
