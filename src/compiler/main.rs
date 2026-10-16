@@ -796,11 +796,12 @@ async fn main() -> Result<()> {
 
     // Sort while the address/bigram/global name vectors have not yet been built.
     let grid_path = out_dir.join(cypress::models::spatial_grid::SPATIAL_GRID_FILE);
+    let staged_grid_path = run_tmp_dir.join("staged_grid.bin");
     info!("Building disk-backed spatial grid with {} MiB runs", args.grid_sort_buffer_mib);
     let grid_stats = spatial_grid::build_spatial_grid(
         &grid_pairs_path,
         &run_tmp_dir.join("spatial_sort"),
-        &grid_path,
+        &staged_grid_path,
         total_places,
         args.grid_sort_buffer_mib,
     )?;
@@ -1698,6 +1699,8 @@ async fn main() -> Result<()> {
         fs::remove_file(&token_path)
             .context("Removing obsolete optional token sidecar")?;
     }
+    // Do not publish the sidecar before its associated main index is complete.
+    fs::rename(&staged_grid_path, &grid_path)?;
     let spatial_grid_bytes = fs::metadata(&grid_path)?.len();
     let old_index_bytes = fs::metadata(&db_path)?.len();
     let places_bytes = fs::metadata(&final_places_path)?.len();
