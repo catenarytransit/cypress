@@ -71,6 +71,7 @@ mod tests {
             le_u32(&[0]), le_u64(&[0,2]), b"12".to_vec(),
             le_u64(&[0,5]), b"90210".to_vec(), le_u32(&[1]),
             le_u32(&[u32::MAX,0]), le_u32(&[1,2]),
+            le_u32(&[0,1,1]),
         ];
         for (name,data) in SECTION_NAMES.iter().zip(fields.iter()) {
             fs::write(dir.join(format!("{name}.bin")),data).unwrap();
@@ -83,6 +84,7 @@ mod tests {
         assert_eq!(view.house_number_offsets, &[0,2]);
         assert_eq!(view.house_place_ids, &[1]);
         assert_eq!(view.place_area_sets, &[1,2]);
+        assert_eq!(view.string_to_places_data, &[0,1,1]);
         assert_eq!(view.dictionary_fingerprint, 0x1234_5678);
         data[24] ^= 1; // first section offset no longer equals header size
         assert!(DenseColumnsView::parse(&data).is_err());
