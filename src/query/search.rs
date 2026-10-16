@@ -18,6 +18,7 @@ use cypress::models::AdminEntry;
 use cypress::scylla::ScyllaClient;
 
 use super::cpu::SearchCpu;
+use super::field_aware::{self, JoinIndex};
 use super::memdb::{
     AreaPhraseScoreCache, CosSimMatch, Memdb, QueryDbView, GUESS_CONTEXT, MAX_QUERY_PHRASES,
 };
@@ -1298,6 +1299,19 @@ pub fn search_place_ids(
         "prefix FST candidates ready (raw buckets overlap; final count is deduplicated)"
     );
 
+    let join_index = JoinIndex {
+        string_place_offsets: &db.string_to_places_offsets[..],
+        string_place_ids: db.string_to_places_data,
+        place_area_sets: db.place_area_sets,
+        string_street_offsets: &db.string_to_street_offsets[..],
+        string_street_groups: &db.string_to_street_data[..],
+        street_area_sets: &db.street_area_sets[..],
+        area_set_offsets: &db.area_set_offsets[..],
+        area_set_data: &db.area_set_data[..],
+    };
+    let mut field_join_only_ids = Vec::<u32>::new();
+    let mut field_join_areas = Vec::<u32>::new();
+
     // PR 4: lookup uses a prevalidated, generation-bound mmap.
     // No O(token_count) validation on the request path.
     let token_mode = token_retrieval_mode();
@@ -1318,6 +1332,79 @@ pub fn search_place_ids(
                 Err(error) => {
                     warn!(target: "cypress::query::timing", %error,
                           "token retrieval rejected; falling back to legacy");
+                }
+            }
+        }
+
+        if token_candidate_ids.is_none() && (2..=8).contains(&query_tokens.len()) {
+            if let (Some(sidecar), Some(admin_fst)) =
+                (memdb_data.token_mmap.as_ref(), admin_alias_fst.as_ref())
+            {
+                if let Ok(index) =
+                    cypress::models::token_index::TokenIndexView::view_validated(sidecar)
+                {
+                    let mut joined = Vec::<u32>::new();
+                    let mut areas = Vec::<u32>::new();
+                    let mut examined = 0u64;
+                    let mut links = 0usize;
+                    let mut splits_attempted = 0usize;
+                    let mut splits_matched = 0usize;
+                    let mut rejected = false;
+                    for (name, admin) in field_aware::suffix_splits(&query_tokens) {
+                        let Some(admin_ids) = field_aware::exact_admin_areas(
+                            admin_fst,
+                            &db.admin_alias_area_offsets[..],
+                            &db.admin_alias_area_data[..],
+                            &admin,
+                        ) else { continue; };
+                        splits_attempted += 1;
+                        let Ok(name) = std::str::from_utf8(&name) else { continue; };
+                        match token_retrieval::retrieve(&index, name) {
+                            Ok(Some((ids, stats))) => {
+                                examined += stats.posting_entries_examined;
+                                if let Some((filtered, join_stats)) =
+                                    field_aware::retain_joined_strings(&join_index, &ids, &admin_ids)
+                                {
+                                    links += join_stats.examined_links;
+                                    if !filtered.is_empty() {
+                                        splits_matched += 1;
+                                        joined.extend(filtered);
+                                        areas.extend(admin_ids);
+                                    }
+                                } else {
+                                    rejected = true;
+                                    break;
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                warn!(target: "cypress::query::timing", %error,
+                                      "field-aware token retrieval rejected");
+                                rejected = true;
+                                break;
+                            }
+                        }
+                    }
+                    joined.sort_unstable();
+                    joined.dedup();
+                    areas.sort_unstable();
+                    areas.dedup();
+                    if !rejected && !joined.is_empty() && joined.len() <= MAX_STRING_MATCHES {
+                        field_join_only_ids = joined.iter().copied()
+                            .filter(|sid| prefix_string_ids.binary_search(sid).is_err())
+                            .collect();
+                        field_join_areas = areas;
+                        token_candidate_ids = Some(joined);
+                    }
+                    debug!(
+                        target: "cypress::query::timing",
+                        splits_attempted, splits_matched,
+                        matching_strings = token_candidate_ids.as_ref().map_or(0, Vec::len),
+                        posting_entries_examined = examined,
+                        mapping_links_examined = links,
+                        rejected,
+                        "field-aware token retrieval plan"
+                    );
                 }
             }
         }
@@ -1698,6 +1785,12 @@ pub fn search_place_ids(
             }
             for i in p_start..p_end {
                 let place_id = db.string_to_places_data[i];
+                if field_join_only_ids.binary_search(string_idx).is_ok() {
+                    let Some(&area_set) = db.place_area_sets.get(place_id as usize) else { continue; };
+                    if !field_aware::in_area(&join_index, area_set, &field_join_areas) {
+                        continue;
+                    }
+                }
                 let place_idx = place_id as usize;
                 if place_idx >= place_count {
                     continue;
@@ -1787,6 +1880,12 @@ pub fn search_place_ids(
                     }
                     for pos in s_start..s_end {
                         let street_group_id = db.string_to_street_data[pos];
+                        if field_join_only_ids.binary_search(string_idx).is_ok() {
+                            let Some(&area_set) = db.street_area_sets.get(street_group_id as usize) else { continue; };
+                            if !field_aware::in_area(&join_index, area_set, &field_join_areas) {
+                                continue;
+                            }
+                        }
                         for option in &component_options {
                             street_evidence.push(StreetEvidence {
                                 street_group_id,
