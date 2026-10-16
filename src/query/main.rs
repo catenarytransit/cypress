@@ -33,6 +33,7 @@ use tracing_subscriber::{EnvFilter, FmtSubscriber};
 use cypress::scylla::ScyllaClient;
 
 mod cpu;
+mod field_aware;
 mod memdb;
 mod search;
 mod token_retrieval;
