@@ -19,7 +19,7 @@ use cypress::scylla::ScyllaClient;
 
 use super::cpu::SearchCpu;
 use super::token_retrieval;
-use super::memdb::{AreaPhraseScoreCache, CosSimMatch, Memdb, GUESS_CONTEXT, MAX_QUERY_PHRASES};
+use super::memdb::{AreaPhraseScoreCache, CosSimMatch, Memdb, QueryDbView, GUESS_CONTEXT, MAX_QUERY_PHRASES};
 
 #[derive(Clone)]
 pub struct SearchParams {
@@ -498,11 +498,10 @@ fn query_token_mask(token_count: usize) -> u8 {
 }
 
 fn get_house_number<'a>(
-    db: &'a cypress::models::memdb::ArchivedCypressMemDb,
+    db: &'a QueryDbView<'_>,
     house_idx: usize,
 ) -> Option<&'a [u8]> {
-    let start = *db.house_number_offsets.get(house_idx)? as usize;
-    let end = *db.house_number_offsets.get(house_idx + 1)? as usize;
+    let (start, end) = db.house_number_range(house_idx)?;
     if start > end || end > db.house_number_bytes.len() {
         return None;
     }
@@ -510,11 +509,10 @@ fn get_house_number<'a>(
 }
 
 fn get_house_postcode<'a>(
-    db: &'a cypress::models::memdb::ArchivedCypressMemDb,
+    db: &'a QueryDbView<'_>,
     house_idx: usize,
 ) -> Option<&'a [u8]> {
-    let start = *db.house_postcode_offsets.get(house_idx)? as usize;
-    let end = *db.house_postcode_offsets.get(house_idx + 1)? as usize;
+    let (start, end) = db.house_postcode_range(house_idx)?;
     if start > end || end > db.house_postcode_bytes.len() {
         return None;
     }
@@ -522,7 +520,7 @@ fn get_house_postcode<'a>(
 }
 
 fn get_street_name<'a>(
-    db: &'a cypress::models::memdb::ArchivedCypressMemDb,
+    db: &'a QueryDbView<'_>,
     street_group_idx: usize,
 ) -> Option<&'a [u8]> {
     let string_id = *db.street_name_string_ids.get(street_group_idx)? as usize;
@@ -539,7 +537,7 @@ fn get_street_name<'a>(
 /// O(log H_s + R), where H_s is houses in the street group and R is the number
 /// of records sharing that exact house number.
 fn find_exact_house_range(
-    db: &cypress::models::memdb::ArchivedCypressMemDb,
+    db: &QueryDbView<'_>,
     street_group_idx: usize,
     target: &[u8],
 ) -> Option<(usize, usize)> {
@@ -579,7 +577,7 @@ fn find_exact_house_range(
     Some((first, lo))
 }
 
-fn place_prior_bonus(db: &cypress::models::memdb::ArchivedCypressMemDb, place_idx: usize) -> f32 {
+fn place_prior_bonus(db: &QueryDbView<'_>, place_idx: usize) -> f32 {
     let layer_rank = db.place_layer_ranks[place_idx];
     let population = db.place_populations[place_idx] as f32;
     let layer_bonus = cypress::models::scoring::get_layer_score_bonus(layer_rank);
@@ -638,7 +636,7 @@ fn advance_component_dp(
 }
 
 fn build_area_component_options(
-    db: &cypress::models::memdb::ArchivedCypressMemDb,
+    db: &QueryDbView<'_>,
     area_set_idx: u32,
     phrases: &[QueryPhrase],
     query_epoch: u32,
@@ -702,7 +700,7 @@ fn build_area_component_options(
 }
 
 fn score_structured_candidate(
-    db: &cypress::models::memdb::ArchivedCypressMemDb,
+    db: &QueryDbView<'_>,
     place_idx: usize,
     phrases: &[QueryPhrase],
     query_tokens: &[&[u8]],
@@ -951,7 +949,7 @@ fn collect_bounded_prefix_candidates(
 }
 
 fn resolve_admin_prefix_scores(
-    db: &cypress::models::memdb::ArchivedCypressMemDb,
+    db: &QueryDbView<'_>,
     admin_alias_fst: Option<&Map<&[u8]>>,
     phrase: &[u8],
 ) -> Vec<(u32, f32)> {
@@ -1008,7 +1006,7 @@ fn resolve_admin_prefix_scores(
 /// query, as in ADR's activate_areas(). First-pass matching, address seeding,
 /// and exact final reranking must use the identical cached lexical scores.
 fn cached_area_phrase_scores<'a>(
-    db: &cypress::models::memdb::ArchivedCypressMemDb,
+    db: &QueryDbView<'_>,
     area_idx: usize,
     phrases: &[QueryPhrase],
     query_epoch: u32,
@@ -1047,7 +1045,7 @@ fn cached_area_phrase_scores<'a>(
 
 /// Try to match unmatched query tokens against area names for a place.
 fn score_area_matches(
-    db: &cypress::models::memdb::ArchivedCypressMemDb,
+    db: &QueryDbView<'_>,
     area_set_idx: usize,
     phrases: &[QueryPhrase],
     matched_mask: u8,
@@ -1159,7 +1157,7 @@ pub fn search_place_ids(
     );
 
     let memdb_data = memdb.get_data();
-    let db = memdb_data.get_archived();
+    let db = &memdb_data.get_view();
     let string_count = db.string_bigram_counts.len();
     let place_count = db.place_latitudes.len();
     let safe_focus_weight = focus_weight.max(0.001);
@@ -2221,7 +2219,7 @@ fn spatial_search_place_ids(
     );
 
     let memdb_data = memdb.get_data();
-    let db = memdb_data.get_archived();
+    let db = &memdb_data.get_view();
 
     let delta_deg = (radius_km / 111.0) as f32;
     let min_lat = (lat as f32 - delta_deg).max(-90.0);
