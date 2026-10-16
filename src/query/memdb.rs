@@ -9,6 +9,7 @@ use tokio::time::{interval, Duration};
 use tracing::{info, warn};
 
 use cypress::models::token_index::{TokenIndexView, TOKEN_INDEX_FILE};
+use cypress::models::spatial_grid::{SpatialGridView, SPATIAL_GRID_FILE};
 use cypress::models::memdb::{
     ArchivedCypressMemDb, CypressMemDb, PlaceRecord, PLACE_RECORD_DISK_BYTES,
 };
@@ -412,6 +413,7 @@ pub struct MemdbData {
     pub index_mmap: Mmap,
     pub places_mmap: Mmap,
     pub token_mmap: Option<Mmap>,
+    pub grid_mmap: Option<Mmap>,
     pub version: String,
 }
 
@@ -520,10 +522,31 @@ impl Memdb {
             None
         };
 
+        let grid_path = out_dir.join(SPATIAL_GRID_FILE);
+        let db = unsafe { rkyv::archived_root::<CypressMemDb>(&index_mmap) };
+        let grid_mmap = if grid_path.exists() {
+            let file = File::open(&grid_path)?;
+            let mmap = unsafe { Mmap::map(&file)? };
+            let grid = SpatialGridView::validate(&mmap)
+                .context("Invalid disk-backed spatial grid")?;
+            anyhow::ensure!(
+                grid.place_count == db.place_latitudes.len(),
+                "Spatial grid place count does not match index"
+            );
+            Some(mmap)
+        } else {
+            anyhow::ensure!(
+                !db.active_cells.is_empty() || db.place_latitudes.is_empty(),
+                "Missing cypress_grid.bin for disk-backed spatial index"
+            );
+            None
+        };
+
         Ok(MemdbData {
             index_mmap,
             places_mmap,
             token_mmap,
+            grid_mmap,
             version,
         })
     }

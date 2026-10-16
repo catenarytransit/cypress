@@ -2243,17 +2243,26 @@ fn spatial_search_place_ids(
     let phase_started = Instant::now();
     let mut candidates: Vec<(u32, f64)> = Vec::new();
 
+    let grid = memdb_data.grid_mmap.as_ref().map(|mmap| {
+        cypress::models::spatial_grid::SpatialGridView::from_validated(mmap)
+            .expect("spatial grid validated during generation load")
+    });
     for row in row_start..=row_end {
         for col in col_start..=col_end {
             let cell_id = (row * cols + col) as u32;
-
-            // Binary search for this cell in the sorted active_cells array.
-            if let Ok(pos) = db.active_cells.binary_search_by(|c| c.cmp(&cell_id)) {
+            let ids: Box<dyn Iterator<Item = u32> + '_> = if let Some(grid) = &grid {
+                match grid.cell_places(cell_id) {
+                    Some(places) => Box::new(places),
+                    None => continue,
+                }
+            } else if let Ok(pos) = db.active_cells.binary_search_by(|c| c.cmp(&cell_id)) {
                 let start = db.cell_offsets[pos] as usize;
                 let end = db.cell_offsets[pos + 1] as usize;
-
-                for i in start..end {
-                    let place_id = db.cell_places[i];
+                Box::new(db.cell_places[start..end].iter().copied())
+            } else {
+                continue;
+            };
+                for place_id in ids {
                     let place_idx = place_id as usize;
                     if place_idx >= db.place_latitudes.len() {
                         continue;
@@ -2267,7 +2276,6 @@ fn spatial_search_place_ids(
                         candidates.push((place_id, dist));
                     }
                 }
-            }
         }
     }
     log_phase_timing("spatial_search_place_ids", "scan_grid_cells", phase_started);

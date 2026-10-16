@@ -20,6 +20,7 @@ use cypress::models::memdb::{CypressMemDb, PlaceRecord, PLACE_RECORD_DISK_BYTES}
 use cypress::models::token_index::TOKEN_INDEX_FILE;
 
 mod token_index;
+mod spatial_grid;
 use cypress::models::normalized::NormalizedPlace;
 use cypress::models::place::Address;
 use cypress::models::population::decompress_population;
@@ -61,6 +62,10 @@ struct Args {
     /// Off by default; existing query engine and index format remain unchanged.
     #[arg(long, default_value_t = false)]
     token_index: bool,
+
+    /// Maximum sort-run memory for the on-disk spatial grid (MiB).
+    #[arg(long, default_value_t = 128)]
+    grid_sort_buffer_mib: usize,
 
     /// Temporary directory used for intermediate worker spill files
     #[arg(long, default_value = "./data/compiled/tmp")]
@@ -752,7 +757,8 @@ async fn main() -> Result<()> {
     };
 
     info!("Processing places for spatial index");
-    let mut cell_pairs = Vec::with_capacity(total_places as usize);
+    let grid_pairs_path = run_tmp_dir.join("spatial_pairs.bin");
+    let mut grid_pairs_writer = BufWriter::new(File::create(&grid_pairs_path)?);
     let mut place_latitudes = Vec::with_capacity(total_places as usize);
     let mut place_longitudes = Vec::with_capacity(total_places as usize);
     let mut place_importances = Vec::with_capacity(total_places as usize);
@@ -770,7 +776,7 @@ async fn main() -> Result<()> {
         let place = decode_place_record(chunk)?;
         let place_id = idx as u32;
         let cell_id = CypressMemDb::coord_to_cell(place.lat, place.lon);
-        cell_pairs.push((cell_id, place_id));
+        spatial_grid::write_pair(&mut grid_pairs_writer, cell_id, place_id)?;
 
         place_latitudes.push(place.lat);
         place_longitudes.push(place.lon);
@@ -782,6 +788,30 @@ async fn main() -> Result<()> {
         place_source_id_bytes.extend_from_slice(id_bytes);
         place_source_id_offsets.push(place_source_id_bytes.len() as u32);
     }
+
+    grid_pairs_writer.flush()?;
+    drop(grid_pairs_writer);
+    // No subsequent pass needs the giant place record mmap.
+    drop(places_mmap);
+
+    // Sort while the address/bigram/global name vectors have not yet been built.
+    let grid_path = out_dir.join(cypress::models::spatial_grid::SPATIAL_GRID_FILE);
+    info!("Building disk-backed spatial grid with {} MiB runs", args.grid_sort_buffer_mib);
+    let grid_stats = spatial_grid::build_spatial_grid(
+        &grid_pairs_path,
+        &run_tmp_dir.join("spatial_sort"),
+        &grid_path,
+        total_places,
+        args.grid_sort_buffer_mib,
+    )?;
+    fs::remove_file(&grid_pairs_path)?;
+    info!(
+        places = grid_stats.place_count,
+        active_cells = grid_stats.active_cells,
+        sorted_runs = grid_stats.initial_runs,
+        bytes = grid_stats.grid_bytes,
+        "Disk-backed spatial grid complete"
+    );
 
     // === Pass 1.5a: Process parent hierarchy spills (collect unique area ids only) ===
     info!("Pass 1.5a: collecting unique parent area IDs");
@@ -1560,26 +1590,10 @@ async fn main() -> Result<()> {
         ));
     }
 
-    info!("Building sparse spatial grid arrays");
-
-    cell_pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-
-    let mut active_cells = Vec::new();
-    let mut cell_offsets = Vec::new();
-    let mut cell_places = Vec::new();
-
-    let mut i = 0usize;
-    while i < cell_pairs.len() {
-        let cell_id = cell_pairs[i].0;
-        active_cells.push(cell_id);
-        cell_offsets.push(cell_places.len() as u32);
-
-        while i < cell_pairs.len() && cell_pairs[i].0 == cell_id {
-            cell_places.push(cell_pairs[i].1);
-            i += 1;
-        }
-    }
-    cell_offsets.push(cell_places.len() as u32);
+    // Spatial arrays live in cypress_grid.bin, not in long-lived heap vectors.
+    let active_cells = Vec::new();
+    let cell_offsets = Vec::new();
+    let cell_places = Vec::new();
 
     let memdb = CypressMemDb {
         string_bigram_counts,
@@ -1667,7 +1681,6 @@ async fn main() -> Result<()> {
     let mut writer = serializer.into_serializer().into_inner();
     writer.flush()?;
 
-    drop(places_mmap);
     drop(merged_places_file);
 
     let final_places_path = out_dir.join("cypress_places.bin");
@@ -1685,6 +1698,7 @@ async fn main() -> Result<()> {
         fs::remove_file(&token_path)
             .context("Removing obsolete optional token sidecar")?;
     }
+    let spatial_grid_bytes = fs::metadata(&grid_path)?.len();
     let old_index_bytes = fs::metadata(&db_path)?.len();
     let places_bytes = fs::metadata(&final_places_path)?.len();
     let added_token_bytes = if args.token_index {
@@ -1692,10 +1706,11 @@ async fn main() -> Result<()> {
     } else {
         0
     };
-    let base_bytes = old_index_bytes + places_bytes;
+    let base_bytes = old_index_bytes + places_bytes + spatial_grid_bytes;
     info!(
         existing_index_bytes = old_index_bytes,
         places_bytes,
+        spatial_grid_bytes,
         new_token_sidecar_bytes = added_token_bytes,
         additional_percent = if base_bytes > 0 {
             added_token_bytes as f64 * 100.0 / base_bytes as f64
