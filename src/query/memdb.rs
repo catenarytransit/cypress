@@ -435,6 +435,7 @@ pub struct QueryDbView<'a> {
     pub place_layer_ranks: &'a [u8],
     pub place_populations: &'a [u32],
     pub place_area_sets: &'a [u32],
+    pub string_to_places_data: &'a [u32],
     pub house_street_groups: &'a [u32],
     pub house_number_bytes: &'a [u8],
     pub house_postcode_bytes: &'a [u8],
@@ -492,6 +493,7 @@ impl MemdbData {
             place_layer_ranks: dense.as_ref().map_or(&db.place_layer_ranks[..], |v| v.place_layer_ranks),
             place_populations: dense.as_ref().map_or(&db.place_populations[..], |v| v.place_populations),
             place_area_sets: dense.as_ref().map_or(&db.place_area_sets[..], |v| v.place_area_sets),
+            string_to_places_data: dense.as_ref().map_or(&db.string_to_places_data[..], |v| v.string_to_places_data),
             house_street_groups: dense.as_ref().map_or(&db.house_street_groups[..], |v| v.house_street_groups),
             house_number_bytes: dense.as_ref().map_or(&db.house_number_bytes[..], |v| v.house_number_bytes),
             house_postcode_bytes: dense.as_ref().map_or(&db.house_postcode_bytes[..], |v| v.house_postcode_bytes),
@@ -591,7 +593,8 @@ impl Memdb {
                 "Dense sidecar place count differs from place records"
             );
             anyhow::ensure!(db.place_latitudes.is_empty() &&
-                db.house_place_ids.is_empty() && db.place_area_sets.is_empty(),
+                db.house_place_ids.is_empty() && db.place_area_sets.is_empty() &&
+                db.string_to_places_data.is_empty(),
                 "Dense sidecar must not coexist with nonempty embedded columns");
             Some(mmap)
         } else {
