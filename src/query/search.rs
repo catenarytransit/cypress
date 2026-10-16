@@ -2333,17 +2333,13 @@ pub fn search_place_ids(
         if let Some(ids) = shadow_shortlist.as_ref() {
             let mut covered = 0usize;
             for (place_id, _) in &results {
-                let start = name_evidence.partition_point(|e| e.place_id < *place_id);
-                let end = name_evidence.partition_point(|e| e.place_id <= *place_id);
-                if name_evidence[start..end].iter().any(|e| {
-                    // Evidence does not retain its StringId. Query through
-                    // candidate -> place mappings instead to avoid false hits.
-                    ids.iter().any(|sid| {
-                        let ix = *sid as usize;
-                        let lo = db.string_to_places_offsets[ix] as usize;
-                        let hi = db.string_to_places_offsets[ix+1] as usize;
-                        db.string_to_places_data[lo..hi].contains(place_id)
-                    })
+                // A place can also be admitted via a street/house match.
+                // This counts name aliases only, so report it as an estimate.
+                if ids.iter().any(|sid| {
+                    let ix = *sid as usize;
+                    let lo = db.string_to_places_offsets[ix] as usize;
+                    let hi = db.string_to_places_offsets[ix+1] as usize;
+                    db.string_to_places_data[lo..hi].contains(place_id)
                 }) { covered += 1; }
             }
             debug!(target: "cypress::query::timing",
