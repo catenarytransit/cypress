@@ -1330,6 +1330,7 @@ pub fn search_place_ids(
             mode = if token_mode == TokenRetrievalMode::Shadow { "shadow" } else { "token" },
             has_sidecar = memdb_data.token_mmap.is_some(),
             token_candidates = token_candidate_ids.as_ref().map_or(0, Vec::len),
+            token_count = token_candidate_stats.as_ref().map_or(0, |x| x.tokens),
             posting_entries_examined = token_candidate_stats.as_ref()
                 .map_or(0, |x| x.posting_entries_examined),
             skip_block_seeks = token_candidate_stats.as_ref()
