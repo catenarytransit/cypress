@@ -1458,12 +1458,19 @@ pub fn search_place_ids(
         let phase_started = Instant::now();
         let mut posting_lists_read = 0usize;
         let mut posting_entries_visited = 0usize;
+        let sidecar = memdb_data.bigram_mmap.as_ref().map(|mmap| {
+            cypress::models::bigram_index::BigramIndexView::parse(mmap)
+                .expect("bigram index validated on generation load")
+        });
         for missing_idx in missing_bigrams.into_iter() {
             let start = db.bigram_offsets[missing_idx as usize] as usize;
             let end = db.bigram_offsets[(missing_idx + 1) as usize] as usize;
 
-            // Use a slice iterator to eliminate bounds checks on bigram_data
-            if let Some(bigrams) = db.bigram_data.get(start..end) {
+            let bigrams = match sidecar.as_ref() {
+                Some(sidecar) => sidecar.postings(start, end),
+                None => db.bigram_data.get(start..end),
+            };
+            if let Some(bigrams) = bigrams {
                 if detailed_metrics {
                     posting_lists_read += 1;
                     posting_entries_visited += bigrams.len();

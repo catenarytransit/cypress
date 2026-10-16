@@ -9,6 +9,7 @@ use tokio::time::{interval, Duration};
 use tracing::{info, warn};
 
 use cypress::models::token_index::{TokenIndexView, TOKEN_INDEX_FILE};
+use cypress::models::bigram_index::{BigramIndexView, BIGRAM_INDEX_FILE};
 use cypress::models::spatial_grid::{SpatialGridView, SPATIAL_GRID_FILE};
 use cypress::models::memdb::{
     ArchivedCypressMemDb, CypressMemDb, PlaceRecord, PLACE_RECORD_DISK_BYTES,
@@ -414,6 +415,7 @@ pub struct MemdbData {
     pub places_mmap: Mmap,
     pub token_mmap: Option<Mmap>,
     pub grid_mmap: Option<Mmap>,
+    pub bigram_mmap: Option<Mmap>,
     pub version: String,
 }
 
@@ -542,12 +544,30 @@ impl Memdb {
             None
         };
 
+        let bigram_file_path = out_dir.join(BIGRAM_INDEX_FILE);
+        let bigram_mmap = if bigram_file_path.exists() {
+            let file = File::open(&bigram_file_path)?;
+            let mmap = unsafe { Mmap::map(&file)? };
+            let view = BigramIndexView::parse(&mmap)
+                .context("Invalid bigram sidecar")?;
+            let db = unsafe { rkyv::archived_root::<CypressMemDb>(&index_mmap) };
+            let offsets: Vec<u32> = db.bigram_offsets.iter().copied().collect();
+            view.validate_offsets(&offsets)?;
+            anyhow::ensure!(
+                view.matches_names(&db.string_name_bytes[..], &db.string_bigram_counts[..]),
+                "Bigram sidecar dictionary fingerprint mismatch"
+            );
+            Some(mmap)
+        } else {
+            let db = unsafe { rkyv::archived_root::<CypressMemDb>(&index_mmap) };
+            anyhow::ensure!(
+                !db.bigram_data.is_empty() || db.bigram_offsets.last().copied() == Some(0),
+                "Missing bigram sidecar for external postings"
+            );
+            None
+        };
         Ok(MemdbData {
-            index_mmap,
-            places_mmap,
-            token_mmap,
-            grid_mmap,
-            version,
+            index_mmap, places_mmap, token_mmap, grid_mmap, bigram_mmap, version,
         })
     }
 
