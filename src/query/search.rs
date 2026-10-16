@@ -1,7 +1,7 @@
 use anyhow::Result;
-use futures::{stream, StreamExt};
 use fst::automaton::Str;
 use fst::{Automaton, IntoStreamer, Map, Streamer};
+use futures::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,8 +18,10 @@ use cypress::models::AdminEntry;
 use cypress::scylla::ScyllaClient;
 
 use super::cpu::SearchCpu;
+use super::memdb::{
+    AreaPhraseScoreCache, CosSimMatch, Memdb, QueryDbView, GUESS_CONTEXT, MAX_QUERY_PHRASES,
+};
 use super::token_retrieval;
-use super::memdb::{AreaPhraseScoreCache, CosSimMatch, Memdb, QueryDbView, GUESS_CONTEXT, MAX_QUERY_PHRASES};
 
 #[derive(Clone)]
 pub struct SearchParams {
@@ -249,8 +251,11 @@ enum TokenRetrievalMode {
 
 fn token_retrieval_mode() -> TokenRetrievalMode {
     static MODE: OnceLock<TokenRetrievalMode> = OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("CYPRESS_TOKEN_RETRIEVAL_MODE")
-        .unwrap_or_else(|_| "legacy".to_string()).as_str() {
+    *MODE.get_or_init(|| {
+        match std::env::var("CYPRESS_TOKEN_RETRIEVAL_MODE")
+            .unwrap_or_else(|_| "legacy".to_string())
+            .as_str()
+        {
             "shadow" => TokenRetrievalMode::Shadow,
             "token" => TokenRetrievalMode::Token,
             "legacy" => TokenRetrievalMode::Legacy,
@@ -259,7 +264,8 @@ fn token_retrieval_mode() -> TokenRetrievalMode {
                       "unknown token retrieval mode; using legacy");
                 TokenRetrievalMode::Legacy
             }
-        })
+        }
+    })
 }
 
 static PREFIX_MODE: std::sync::OnceLock<PrefixMode> = std::sync::OnceLock::new();
@@ -298,7 +304,6 @@ struct SearchWorkStats {
     dp_option_checks: u64,
     dp_legal_transitions: u64,
 }
-
 
 #[derive(Default, Debug, PartialEq, Eq)]
 struct ColdPostingCost {
@@ -497,10 +502,7 @@ fn query_token_mask(token_count: usize) -> u8 {
     }
 }
 
-fn get_house_number<'a>(
-    db: &'a QueryDbView<'_>,
-    house_idx: usize,
-) -> Option<&'a [u8]> {
+fn get_house_number<'a>(db: &'a QueryDbView<'_>, house_idx: usize) -> Option<&'a [u8]> {
     let (start, end) = db.house_number_range(house_idx)?;
     if start > end || end > db.house_number_bytes.len() {
         return None;
@@ -508,10 +510,7 @@ fn get_house_number<'a>(
     Some(&db.house_number_bytes[start..end])
 }
 
-fn get_house_postcode<'a>(
-    db: &'a QueryDbView<'_>,
-    house_idx: usize,
-) -> Option<&'a [u8]> {
+fn get_house_postcode<'a>(db: &'a QueryDbView<'_>, house_idx: usize) -> Option<&'a [u8]> {
     let (start, end) = db.house_postcode_range(house_idx)?;
     if start > end || end > db.house_postcode_bytes.len() {
         return None;
@@ -519,10 +518,7 @@ fn get_house_postcode<'a>(
     Some(&db.house_postcode_bytes[start..end])
 }
 
-fn get_street_name<'a>(
-    db: &'a QueryDbView<'_>,
-    street_group_idx: usize,
-) -> Option<&'a [u8]> {
+fn get_street_name<'a>(db: &'a QueryDbView<'_>, street_group_idx: usize) -> Option<&'a [u8]> {
     let string_id = *db.street_name_string_ids.get(street_group_idx)? as usize;
     let start = *db.string_name_offsets.get(string_id)? as usize;
     let end = *db.string_name_offsets.get(string_id + 1)? as usize;
@@ -1340,8 +1336,8 @@ pub fn search_place_ids(
             "token retrieval plan"
         );
     }
-    let use_token_fast_path = token_mode == TokenRetrievalMode::Token
-        && token_candidate_ids.is_some();
+    let use_token_fast_path =
+        token_mode == TokenRetrievalMode::Token && token_candidate_ids.is_some();
 
     let mut results = Vec::<(u32, f64)>::new();
 
@@ -1389,197 +1385,224 @@ pub fn search_place_ids(
         // Token mode bypasses *all* global bigram posting visits and
         // cosine processing. In legacy/shadow mode the original branch runs
         // unchanged to make latency and recall comparisons meaningful.
-        let (cold_postings, posting_lists_read, posting_entries_visited,
-             cache_exact_hit, cache_subset_hit, cache_restored_string_ids,
-             max_matches, fuzzy_matches_before_cap, cache_snapshot_entries,
-             cache_snapshot_bytes) = if use_token_fast_path {
+        let (
+            cold_postings,
+            posting_lists_read,
+            posting_entries_visited,
+            cache_exact_hit,
+            cache_subset_hit,
+            cache_restored_string_ids,
+            max_matches,
+            fuzzy_matches_before_cap,
+            cache_snapshot_entries,
+            cache_snapshot_bytes,
+        ) = if use_token_fast_path {
             let ids = token_candidate_ids.as_ref().unwrap();
-            ctx.string_matches.extend(ids.iter().copied().map(|string_idx| CosSimMatch {
-                string_idx, cos_sim: 0.0
-            }));
+            ctx.string_matches
+                .extend(ids.iter().copied().map(|string_idx| CosSimMatch {
+                    string_idx,
+                    cos_sim: 0.0,
+                }));
             (
                 if detailed_metrics {
                     cold_posting_cost(&db.bigram_offsets[..], &ctx.query_bigrams)
-                } else { ColdPostingCost::default() },
-                0usize, 0usize, false, false, 0usize,
-                ids.len(), ids.len(), 0usize, 0usize
+                } else {
+                    ColdPostingCost::default()
+                },
+                0usize,
+                0usize,
+                false,
+                false,
+                0usize,
+                ids.len(),
+                ids.len(),
+                0usize,
+                0usize,
             )
         } else {
-        let query_bigram_count_u32 = query_bigram_count as u32;
-        let cypress_min_match_count =
-            (2 + query_bigram_count_u32 / (4 + query_bigram_count_u32 / 10)) as u16;
-        let adr_min_match_count = if adr_query_bigram_count != 0 {
-            let n = adr_query_bigram_count as u32;
-            (2 + n / (4 + n / 10)) as u16
-        } else {
-            u16::MAX
-        };
-        let query_bigrams = ctx.query_bigrams.clone();
-        let cold_postings = if detailed_metrics {
-            cold_posting_cost(&db.bigram_offsets[..], &query_bigrams)
-        } else {
-            ColdPostingCost::default()
-        };
-        let mut missing_bigrams = Vec::new();
-
-        let phase_started = Instant::now();
-        let cached_counts = ctx
-            .query_cache
-            .get_closest_ref(&query_bigrams, &mut missing_bigrams);
-        let cache_base_reused = cached_counts.is_some();
-        if let Some(cached) = cached_counts {
-            ctx.restore_sparse_counts(&cached);
-        }
-        let missing_bigram_count = missing_bigrams.len();
-        let cache_restored_string_ids = if detailed_metrics {
-            ctx.touched_string_indices.len()
-        } else {
-            0
-        };
-        let cache_exact_hit = cache_base_reused && missing_bigram_count == 0;
-        let cache_subset_hit = cache_base_reused && !cache_exact_hit;
-        NGRAM_QUERIES.fetch_add(1, Ordering::Relaxed);
-        if cache_exact_hit {
-            NGRAM_EXACT_HITS.fetch_add(1, Ordering::Relaxed);
-        } else if cache_subset_hit {
-            NGRAM_SUBSET_HITS.fetch_add(1, Ordering::Relaxed);
-        }
-        log_phase_timing("search_place_ids", "cache_lookup_restore", phase_started);
-        debug!(
-            target: "cypress::query::timing",
-            op = "search_place_ids",
-            cache_hit = cache_exact_hit,
-            cache_subset_hit,
-            missing_bigram_count,
-            "cache lookup summary"
-        );
-
-        let phase_started = Instant::now();
-        let mut posting_lists_read = 0usize;
-        let mut posting_entries_visited = 0usize;
-        let sidecar = memdb_data.bigram_mmap.as_ref().map(|mmap| {
-            cypress::models::bigram_index::BigramIndexView::parse(mmap)
-                .expect("bigram index validated on generation load")
-        });
-        for missing_idx in missing_bigrams.into_iter() {
-            let start = db.bigram_offsets[missing_idx as usize] as usize;
-            let end = db.bigram_offsets[(missing_idx + 1) as usize] as usize;
-
-            let bigrams = match sidecar.as_ref() {
-                Some(sidecar) => sidecar.postings(start, end),
-                None => db.bigram_data.get(start..end),
+            let query_bigram_count_u32 = query_bigram_count as u32;
+            let cypress_min_match_count =
+                (2 + query_bigram_count_u32 / (4 + query_bigram_count_u32 / 10)) as u16;
+            let adr_min_match_count = if adr_query_bigram_count != 0 {
+                let n = adr_query_bigram_count as u32;
+                (2 + n / (4 + n / 10)) as u16
+            } else {
+                u16::MAX
             };
-            if let Some(bigrams) = bigrams {
-                if detailed_metrics {
-                    posting_lists_read += 1;
-                    posting_entries_visited += bigrams.len();
-                }
-                for &string_idx in bigrams {
-                    let string_idx = string_idx as usize;
-                    ctx.increment_string_match(string_idx);
-                }
+            let query_bigrams = ctx.query_bigrams.clone();
+            let cold_postings = if detailed_metrics {
+                cold_posting_cost(&db.bigram_offsets[..], &query_bigrams)
+            } else {
+                ColdPostingCost::default()
+            };
+            let mut missing_bigrams = Vec::new();
+
+            let phase_started = Instant::now();
+            let cached_counts = ctx
+                .query_cache
+                .get_closest_ref(&query_bigrams, &mut missing_bigrams);
+            let cache_base_reused = cached_counts.is_some();
+            if let Some(cached) = cached_counts {
+                ctx.restore_sparse_counts(&cached);
             }
-        }
-        log_phase_timing("search_place_ids", "expand_missing_bigrams", phase_started);
+            let missing_bigram_count = missing_bigrams.len();
+            let cache_restored_string_ids = if detailed_metrics {
+                ctx.touched_string_indices.len()
+            } else {
+                0
+            };
+            let cache_exact_hit = cache_base_reused && missing_bigram_count == 0;
+            let cache_subset_hit = cache_base_reused && !cache_exact_hit;
+            NGRAM_QUERIES.fetch_add(1, Ordering::Relaxed);
+            if cache_exact_hit {
+                NGRAM_EXACT_HITS.fetch_add(1, Ordering::Relaxed);
+            } else if cache_subset_hit {
+                NGRAM_SUBSET_HITS.fetch_add(1, Ordering::Relaxed);
+            }
+            log_phase_timing("search_place_ids", "cache_lookup_restore", phase_started);
+            debug!(
+                target: "cypress::query::timing",
+                op = "search_place_ids",
+                cache_hit = cache_exact_hit,
+                cache_subset_hit,
+                missing_bigram_count,
+                "cache lookup summary"
+            );
 
-        let phase_started = Instant::now();
-        let mut cache_snapshot_entries = 0usize;
-        let mut cache_snapshot_bytes = 0usize;
-        let cache_snapshot_needed = !ctx.query_cache.has_exact(&query_bigrams);
-        if cache_snapshot_needed {
-            let snapshot = ctx.snapshot_sparse_counts();
-            cache_snapshot_entries = snapshot.string_ids.len();
-            cache_snapshot_bytes = snapshot.string_ids.len() * std::mem::size_of::<u32>()
-                + snapshot.counts.len() * std::mem::size_of::<u8>();
-            ctx.query_cache.put(&query_bigrams, Arc::new(snapshot));
-        }
-        log_phase_timing("search_place_ids", "cache_store_counts", phase_started);
-        debug!(
-            target: "cypress::query::timing",
-            op = "search_place_ids",
-            cache_snapshot_needed,
-            cache_snapshot_entries,
-            cache_snapshot_bytes,
-            "bigram snapshot admission summary"
-        );
+            let phase_started = Instant::now();
+            let mut posting_lists_read = 0usize;
+            let mut posting_entries_visited = 0usize;
+            let sidecar = memdb_data.bigram_mmap.as_ref().map(|mmap| {
+                cypress::models::bigram_index::BigramIndexView::parse(mmap)
+                    .expect("bigram index validated on generation load")
+            });
+            for missing_idx in missing_bigrams.into_iter() {
+                let start = db.bigram_offsets[missing_idx as usize] as usize;
+                let end = db.bigram_offsets[(missing_idx + 1) as usize] as usize;
 
-        // Evaluate only the production cosine formula. Prefix FST candidates
-        // are added separately below and do not depend on this cutoff.
-        let phase_started = Instant::now();
-        let mut string_matches = Vec::<CosSimMatch>::new();
-        for touched_idx in 0..ctx.touched_string_indices.len() {
-            let i = ctx.touched_string_indices[touched_idx] as usize;
-            let match_count = ctx.string_match_count(i);
-            let shared = match_count as u16;
-            let score = match cosine_mode {
-                CosineMode::Adr if shared >= adr_min_match_count => {
-                    match (
-                        db.string_name_offsets.get(i).copied(),
-                        db.string_name_offsets.get(i + 1).copied(),
-                    ) {
-                        (Some(start), Some(end)) if end >= start => adr_cosine_score(
-                            match_count,
-                            (end - start) as usize,
-                            adr_query_bigram_count,
-                        )
-                        .filter(|&similarity| similarity >= COS_SIM_CUTOFF),
-                        _ => None,
+                let bigrams = match sidecar.as_ref() {
+                    Some(sidecar) => sidecar.postings(start, end),
+                    None => db.bigram_data.get(start..end),
+                };
+                if let Some(bigrams) = bigrams {
+                    if detailed_metrics {
+                        posting_lists_read += 1;
+                        posting_entries_visited += bigrams.len();
+                    }
+                    for &string_idx in bigrams {
+                        let string_idx = string_idx as usize;
+                        ctx.increment_string_match(string_idx);
                     }
                 }
-                CosineMode::Cypress if shared >= cypress_min_match_count => {
-                    let stored_unique_grams = db.string_bigram_counts[i] as f32;
-                    if stored_unique_grams > 0.0 {
-                        let count = match_count as f32;
-                        let similarity =
-                            count * count / (stored_unique_grams * query_bigram_count_u32 as f32);
-                        (similarity >= COS_SIM_CUTOFF).then_some(similarity)
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            };
-            if let Some(cos_sim) = score {
-                string_matches.push(CosSimMatch {
-                    string_idx: i as u32,
-                    cos_sim,
-                });
             }
-        }
-        let fuzzy_matches_before_cap = string_matches.len();
-        ctx.string_matches.extend(string_matches);
-        log_phase_timing(
-            "search_place_ids",
-            "compute_cosine_candidates",
-            phase_started,
-        );
+            log_phase_timing("search_place_ids", "expand_missing_bigrams", phase_started);
 
-        let phase_started = Instant::now();
-        let max_matches = MAX_STRING_MATCHES.min(ctx.string_matches.len());
-        if ctx.string_matches.len() > max_matches {
-            ctx.string_matches
-                .select_nth_unstable_by(max_matches, |a, b| {
-                    b.cos_sim
-                        .partial_cmp(&a.cos_sim)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-            ctx.string_matches.truncate(max_matches);
-        }
-        ctx.string_matches.sort_unstable_by(|a, b| {
-            b.cos_sim
-                .partial_cmp(&a.cos_sim)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        log_phase_timing(
-            "search_place_ids",
-            "restrict_sort_string_matches",
-            phase_started,
-        );
+            let phase_started = Instant::now();
+            let mut cache_snapshot_entries = 0usize;
+            let mut cache_snapshot_bytes = 0usize;
+            let cache_snapshot_needed = !ctx.query_cache.has_exact(&query_bigrams);
+            if cache_snapshot_needed {
+                let snapshot = ctx.snapshot_sparse_counts();
+                cache_snapshot_entries = snapshot.string_ids.len();
+                cache_snapshot_bytes = snapshot.string_ids.len() * std::mem::size_of::<u32>()
+                    + snapshot.counts.len() * std::mem::size_of::<u8>();
+                ctx.query_cache.put(&query_bigrams, Arc::new(snapshot));
+            }
+            log_phase_timing("search_place_ids", "cache_store_counts", phase_started);
+            debug!(
+                target: "cypress::query::timing",
+                op = "search_place_ids",
+                cache_snapshot_needed,
+                cache_snapshot_entries,
+                cache_snapshot_bytes,
+                "bigram snapshot admission summary"
+            );
 
-            (cold_postings, posting_lists_read, posting_entries_visited,
-             cache_exact_hit, cache_subset_hit, cache_restored_string_ids,
-             max_matches, fuzzy_matches_before_cap, cache_snapshot_entries,
-             cache_snapshot_bytes)
+            // Evaluate only the production cosine formula. Prefix FST candidates
+            // are added separately below and do not depend on this cutoff.
+            let phase_started = Instant::now();
+            let mut string_matches = Vec::<CosSimMatch>::new();
+            for touched_idx in 0..ctx.touched_string_indices.len() {
+                let i = ctx.touched_string_indices[touched_idx] as usize;
+                let match_count = ctx.string_match_count(i);
+                let shared = match_count as u16;
+                let score = match cosine_mode {
+                    CosineMode::Adr if shared >= adr_min_match_count => {
+                        match (
+                            db.string_name_offsets.get(i).copied(),
+                            db.string_name_offsets.get(i + 1).copied(),
+                        ) {
+                            (Some(start), Some(end)) if end >= start => adr_cosine_score(
+                                match_count,
+                                (end - start) as usize,
+                                adr_query_bigram_count,
+                            )
+                            .filter(|&similarity| similarity >= COS_SIM_CUTOFF),
+                            _ => None,
+                        }
+                    }
+                    CosineMode::Cypress if shared >= cypress_min_match_count => {
+                        let stored_unique_grams = db.string_bigram_counts[i] as f32;
+                        if stored_unique_grams > 0.0 {
+                            let count = match_count as f32;
+                            let similarity = count * count
+                                / (stored_unique_grams * query_bigram_count_u32 as f32);
+                            (similarity >= COS_SIM_CUTOFF).then_some(similarity)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(cos_sim) = score {
+                    string_matches.push(CosSimMatch {
+                        string_idx: i as u32,
+                        cos_sim,
+                    });
+                }
+            }
+            let fuzzy_matches_before_cap = string_matches.len();
+            ctx.string_matches.extend(string_matches);
+            log_phase_timing(
+                "search_place_ids",
+                "compute_cosine_candidates",
+                phase_started,
+            );
+
+            let phase_started = Instant::now();
+            let max_matches = MAX_STRING_MATCHES.min(ctx.string_matches.len());
+            if ctx.string_matches.len() > max_matches {
+                ctx.string_matches
+                    .select_nth_unstable_by(max_matches, |a, b| {
+                        b.cos_sim
+                            .partial_cmp(&a.cos_sim)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                ctx.string_matches.truncate(max_matches);
+            }
+            ctx.string_matches.sort_unstable_by(|a, b| {
+                b.cos_sim
+                    .partial_cmp(&a.cos_sim)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            log_phase_timing(
+                "search_place_ids",
+                "restrict_sort_string_matches",
+                phase_started,
+            );
+
+            (
+                cold_postings,
+                posting_lists_read,
+                posting_entries_visited,
+                cache_exact_hit,
+                cache_subset_hit,
+                cache_restored_string_ids,
+                max_matches,
+                fuzzy_matches_before_cap,
+                cache_snapshot_entries,
+                cache_snapshot_bytes,
+            )
         };
 
         let phase_started = Instant::now();
@@ -1759,7 +1782,8 @@ pub fn search_place_ids(
                 let s_end = db.string_to_street_offsets[sid + 1] as usize;
                 if s_start <= s_end && s_end <= db.string_to_street_data.len() {
                     if work.enabled {
-                        work.street_mapping_entries_examined += s_end.saturating_sub(s_start) as u64;
+                        work.street_mapping_entries_examined +=
+                            s_end.saturating_sub(s_start) as u64;
                     }
                     for pos in s_start..s_end {
                         let street_group_id = db.string_to_street_data[pos];
@@ -2268,20 +2292,20 @@ fn spatial_search_place_ids(
             } else {
                 continue;
             };
-                for place_id in ids {
-                    let place_idx = place_id as usize;
-                    if place_idx >= db.place_latitudes.len() {
-                        continue;
-                    }
-
-                    let place_lat = db.place_latitudes[place_idx] as f64;
-                    let place_lon = db.place_longitudes[place_idx] as f64;
-
-                    let dist = haversine_distance_km((lat, lon), (place_lat, place_lon));
-                    if dist <= radius_km {
-                        candidates.push((place_id, dist));
-                    }
+            for place_id in ids {
+                let place_idx = place_id as usize;
+                if place_idx >= db.place_latitudes.len() {
+                    continue;
                 }
+
+                let place_lat = db.place_latitudes[place_idx] as f64;
+                let place_lon = db.place_longitudes[place_idx] as f64;
+
+                let dist = haversine_distance_km((lat, lon), (place_lat, place_lon));
+                if dist <= radius_km {
+                    candidates.push((place_id, dist));
+                }
+            }
         }
     }
     log_phase_timing("spatial_search_place_ids", "scan_grid_cells", phase_started);
@@ -2380,7 +2404,10 @@ pub async fn execute_search(
     for (id, _) in &scored_ids {
         fetch_futures.push(scylla_client.get_place(id));
     }
-    let fetched = stream::iter(fetch_futures).buffered(8).collect::<Vec<_>>().await;
+    let fetched = stream::iter(fetch_futures)
+        .buffered(8)
+        .collect::<Vec<_>>()
+        .await;
     log_phase_timing("execute_search", "fetch_places", phase_started);
 
     let phase_started = Instant::now();
@@ -2474,7 +2501,10 @@ pub async fn execute_search_v2(
     for (id, _) in &scored_ids {
         fetch_futures.push(scylla_client.get_place(id));
     }
-    let fetched = stream::iter(fetch_futures).buffered(8).collect::<Vec<_>>().await;
+    let fetched = stream::iter(fetch_futures)
+        .buffered(8)
+        .collect::<Vec<_>>()
+        .await;
     log_phase_timing("execute_search_v2", "fetch_places", phase_started);
 
     let phase_started = Instant::now();
@@ -2554,7 +2584,10 @@ pub async fn execute_reverse(
     for (id, _) in &nearby {
         fetch_futures.push(scylla_client.get_place(id));
     }
-    let fetched = stream::iter(fetch_futures).buffered(8).collect::<Vec<_>>().await;
+    let fetched = stream::iter(fetch_futures)
+        .buffered(8)
+        .collect::<Vec<_>>()
+        .await;
     log_phase_timing("execute_reverse", "fetch_places", phase_started);
 
     let mut admin_ids = std::collections::HashSet::new();
@@ -2634,7 +2667,10 @@ pub async fn execute_reverse_v2(
     for (id, _) in &nearby {
         fetch_futures.push(scylla_client.get_place(id));
     }
-    let fetched = stream::iter(fetch_futures).buffered(8).collect::<Vec<_>>().await;
+    let fetched = stream::iter(fetch_futures)
+        .buffered(8)
+        .collect::<Vec<_>>()
+        .await;
     log_phase_timing("execute_reverse_v2", "fetch_places", phase_started);
 
     let mut admin_ids = std::collections::HashSet::new();
@@ -2907,7 +2943,10 @@ mod tests {
         assert_eq!(cost.largest_gram, Some(2));
         assert_eq!(cold_posting_cost(&offsets, &[0, 0]).entries, 6);
         assert_eq!(cold_posting_cost(&offsets, &[]), ColdPostingCost::default());
-        assert_eq!(cold_posting_cost(&offsets, &[5]), ColdPostingCost::default());
+        assert_eq!(
+            cold_posting_cost(&offsets, &[5]),
+            ColdPostingCost::default()
+        );
     }
 
     use cypress::models::normalized::{AdminHierarchyIds, NormalizedPlace};

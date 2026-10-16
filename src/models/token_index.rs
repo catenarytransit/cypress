@@ -19,10 +19,7 @@ pub const TOKEN_INDEX_HEADER_BYTES: usize = 72;
 /// Fingerprint the exact byte arena and its boundaries, not just the name text.
 /// A sidecar from a different compiler generation must never be joined by ID.
 pub fn dictionary_fingerprint(name_bytes: &[u8], name_offsets: &[u32]) -> u64 {
-    xxh64(
-        bytemuck::cast_slice(name_offsets),
-        xxh64(name_bytes, 0),
-    )
+    xxh64(bytemuck::cast_slice(name_offsets), xxh64(name_bytes, 0))
 }
 
 /// Token boundaries for the *existing* lowercased string dictionary.
@@ -62,20 +59,34 @@ fn is_combining_mark(c: char) -> bool {
 }
 
 fn le_u64(bytes: &[u8], pos: usize) -> Result<u64> {
-    let raw = bytes.get(pos..pos.checked_add(8).ok_or_else(|| anyhow!("offset overflow"))?)
+    let raw = bytes
+        .get(
+            pos..pos
+                .checked_add(8)
+                .ok_or_else(|| anyhow!("offset overflow"))?,
+        )
         .ok_or_else(|| anyhow!("truncated token index u64"))?;
     Ok(u64::from_le_bytes(raw.try_into()?))
 }
 
 fn le_u32(bytes: &[u8], pos: usize) -> Result<u32> {
-    let raw = bytes.get(pos..pos.checked_add(4).ok_or_else(|| anyhow!("offset overflow"))?)
+    let raw = bytes
+        .get(
+            pos..pos
+                .checked_add(4)
+                .ok_or_else(|| anyhow!("offset overflow"))?,
+        )
         .ok_or_else(|| anyhow!("truncated token index u32"))?;
     Ok(u32::from_le_bytes(raw.try_into()?))
 }
 
 fn take<'a>(data: &'a [u8], cursor: &mut usize, len: usize) -> Result<&'a [u8]> {
-    let end = cursor.checked_add(len).ok_or_else(|| anyhow!("token index length overflow"))?;
-    let slice = data.get(*cursor..end).ok_or_else(|| anyhow!("truncated token index section"))?;
+    let end = cursor
+        .checked_add(len)
+        .ok_or_else(|| anyhow!("token index length overflow"))?;
+    let slice = data
+        .get(*cursor..end)
+        .ok_or_else(|| anyhow!("truncated token index section"))?;
     *cursor = end;
     Ok(slice)
 }
@@ -110,10 +121,22 @@ pub struct TokenPostingList<'a> {
 
 impl<'a> TokenIndexView<'a> {
     pub fn parse(data: &'a [u8]) -> Result<Self> {
-        ensure!(data.len() >= TOKEN_INDEX_HEADER_BYTES, "token index header is truncated");
-        ensure!(&data[..8] == TOKEN_INDEX_MAGIC, "token index magic mismatch");
-        ensure!(le_u32(data, 8)? == TOKEN_INDEX_VERSION, "unsupported token index version");
-        ensure!(le_u32(data, 12)? == TOKEN_ANALYZER_VERSION, "unsupported analyzer version");
+        ensure!(
+            data.len() >= TOKEN_INDEX_HEADER_BYTES,
+            "token index header is truncated"
+        );
+        ensure!(
+            &data[..8] == TOKEN_INDEX_MAGIC,
+            "token index magic mismatch"
+        );
+        ensure!(
+            le_u32(data, 8)? == TOKEN_INDEX_VERSION,
+            "unsupported token index version"
+        );
+        ensure!(
+            le_u32(data, 12)? == TOKEN_ANALYZER_VERSION,
+            "unsupported analyzer version"
+        );
         let string_count = le_u64(data, 16)?;
         let fingerprint = le_u64(data, 24)?;
         let token_count = le_u64(data, 32)?;
@@ -123,10 +146,15 @@ impl<'a> TokenIndexView<'a> {
         let skip_count = le_u64(data, 64)?;
 
         let n = usize::try_from(token_count)?;
-        let off_bytes = n.checked_add(1).and_then(|x| x.checked_mul(8))
+        let off_bytes = n
+            .checked_add(1)
+            .and_then(|x| x.checked_mul(8))
             .ok_or_else(|| anyhow!("token count overflow"))?;
-        let df_bytes = n.checked_mul(4).ok_or_else(|| anyhow!("docfreq overflow"))?;
-        let skips_bytes = usize::try_from(skip_count)?.checked_mul(12)
+        let df_bytes = n
+            .checked_mul(4)
+            .ok_or_else(|| anyhow!("docfreq overflow"))?;
+        let skips_bytes = usize::try_from(skip_count)?
+            .checked_mul(12)
             .ok_or_else(|| anyhow!("skip count overflow"))?;
 
         let mut cursor = TOKEN_INDEX_HEADER_BYTES;
@@ -136,10 +164,19 @@ impl<'a> TokenIndexView<'a> {
         let skip_offsets = take(data, &mut cursor, off_bytes)?;
         let skips = take(data, &mut cursor, skips_bytes)?;
         let postings = take(data, &mut cursor, usize::try_from(posting_bytes)?)?;
-        ensure!(cursor == data.len(), "unexpected token index trailing bytes");
+        ensure!(
+            cursor == data.len(),
+            "unexpected token index trailing bytes"
+        );
         ensure!(fst.len() == n, "token FST count mismatch");
-        ensure!(le_u64(posting_offsets, 0)? == 0, "posting offsets must start at zero");
-        ensure!(le_u64(skip_offsets, 0)? == 0, "skip offsets must start at zero");
+        ensure!(
+            le_u64(posting_offsets, 0)? == 0,
+            "posting offsets must start at zero"
+        );
+        ensure!(
+            le_u64(skip_offsets, 0)? == 0,
+            "skip offsets must start at zero"
+        );
 
         let mut counted = 0u64;
         let mut expected_skip_count = 0u64;
@@ -151,19 +188,41 @@ impl<'a> TokenIndexView<'a> {
             let sb = le_u64(skip_offsets, (i + 1) * 8)?;
             ensure!(sa <= sb && sb <= skip_count, "invalid skip offsets");
             let df = le_u32(frequencies, i * 4)? as u64;
-            counted = counted.checked_add(df).ok_or_else(|| anyhow!("posting count overflow"))?;
+            counted = counted
+                .checked_add(df)
+                .ok_or_else(|| anyhow!("posting count overflow"))?;
             expected_skip_count += df.div_ceil(TOKEN_SKIP_BLOCK as u64);
-            ensure!(sb - sa == df.div_ceil(TOKEN_SKIP_BLOCK as u64), "incorrect skip count for term");
+            ensure!(
+                sb - sa == df.div_ceil(TOKEN_SKIP_BLOCK as u64),
+                "incorrect skip count for term"
+            );
             ensure!(df == 0 || a < b, "nonempty posting has no bytes");
         }
-        ensure!(le_u64(posting_offsets, n * 8)? == posting_bytes, "posting length mismatch");
-        ensure!(le_u64(skip_offsets, n * 8)? == skip_count, "skip length mismatch");
+        ensure!(
+            le_u64(posting_offsets, n * 8)? == posting_bytes,
+            "posting length mismatch"
+        );
+        ensure!(
+            le_u64(skip_offsets, n * 8)? == skip_count,
+            "skip length mismatch"
+        );
         ensure!(counted == posting_count, "posting count mismatch");
-        ensure!(expected_skip_count == skip_count, "total skip count mismatch");
+        ensure!(
+            expected_skip_count == skip_count,
+            "total skip count mismatch"
+        );
 
         Ok(Self {
-            fst, posting_offsets, frequencies, skip_offsets, skips, postings,
-            token_count, posting_count, string_count, fingerprint,
+            fst,
+            posting_offsets,
+            frequencies,
+            skip_offsets,
+            skips,
+            postings,
+            token_count,
+            posting_count,
+            string_count,
+            fingerprint,
         })
     }
 
@@ -171,10 +230,22 @@ impl<'a> TokenIndexView<'a> {
     /// Call parse and matches_dictionary before this method; keep mmap immutable.
     /// Avoids O(token_count) validation on every search request.
     pub fn view_validated(data: &'a [u8]) -> Result<Self> {
-        ensure!(data.len() >= TOKEN_INDEX_HEADER_BYTES, "token index header truncated");
-        ensure!(&data[..8] == TOKEN_INDEX_MAGIC, "token index magic mismatch");
-        ensure!(le_u32(data, 8)? == TOKEN_INDEX_VERSION, "token index version mismatch");
-        ensure!(le_u32(data, 12)? == TOKEN_ANALYZER_VERSION, "analyzer version mismatch");
+        ensure!(
+            data.len() >= TOKEN_INDEX_HEADER_BYTES,
+            "token index header truncated"
+        );
+        ensure!(
+            &data[..8] == TOKEN_INDEX_MAGIC,
+            "token index magic mismatch"
+        );
+        ensure!(
+            le_u32(data, 8)? == TOKEN_INDEX_VERSION,
+            "token index version mismatch"
+        );
+        ensure!(
+            le_u32(data, 12)? == TOKEN_ANALYZER_VERSION,
+            "analyzer version mismatch"
+        );
         let string_count = le_u64(data, 16)?;
         let fingerprint = le_u64(data, 24)?;
         let token_count = le_u64(data, 32)?;
@@ -183,11 +254,13 @@ impl<'a> TokenIndexView<'a> {
         let posting_bytes = usize::try_from(le_u64(data, 56)?)?;
         let skip_count = usize::try_from(le_u64(data, 64)?)?;
         let n = usize::try_from(token_count)?;
-        let offset_len = n.checked_add(1)
+        let offset_len = n
+            .checked_add(1)
             .and_then(|v| v.checked_mul(8))
             .ok_or_else(|| anyhow!("offset length overflow"))?;
         let freq_len = n.checked_mul(4).ok_or_else(|| anyhow!("freq overflow"))?;
-        let skip_len = skip_count.checked_mul(12)
+        let skip_len = skip_count
+            .checked_mul(12)
             .ok_or_else(|| anyhow!("skip length overflow"))?;
         let mut cursor = TOKEN_INDEX_HEADER_BYTES;
         let fst = Map::new(take(data, &mut cursor, fst_bytes)?)?;
@@ -198,8 +271,16 @@ impl<'a> TokenIndexView<'a> {
         let postings = take(data, &mut cursor, posting_bytes)?;
         ensure!(cursor == data.len(), "token index trailing bytes");
         Ok(Self {
-            fst, posting_offsets, frequencies, skip_offsets, skips, postings,
-            token_count, posting_count, string_count, fingerprint,
+            fst,
+            posting_offsets,
+            frequencies,
+            skip_offsets,
+            skips,
+            postings,
+            token_count,
+            posting_count,
+            string_count,
+            fingerprint,
         })
     }
 
@@ -237,7 +318,9 @@ impl TokenPostingList<'_> {
             let mut delta = 0u32;
             let mut terminated = false;
             for shift in (0..=28).step_by(7) {
-                let byte = *self.bytes.get(pos)
+                let byte = *self
+                    .bytes
+                    .get(pos)
                     .ok_or_else(|| anyhow!("truncated varint"))?;
                 pos += 1;
                 if shift == 28 && byte & 0xF0 != 0 {
@@ -250,8 +333,13 @@ impl TokenPostingList<'_> {
                 }
             }
             ensure!(terminated, "unterminated varint");
-            ensure!(i == 0 || delta > 0, "posting IDs are not strictly increasing");
-            last = last.checked_add(delta).ok_or_else(|| anyhow!("posting ID overflow"))?;
+            ensure!(
+                i == 0 || delta > 0,
+                "posting IDs are not strictly increasing"
+            );
+            last = last
+                .checked_add(delta)
+                .ok_or_else(|| anyhow!("posting ID overflow"))?;
             ids.push(last);
         }
         ensure!(pos == self.bytes.len(), "unexpected trailing posting bytes");

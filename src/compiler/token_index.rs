@@ -3,9 +3,8 @@
 //! then heap-merge runs into a token FST and delta-varint postings.
 use anyhow::{anyhow, ensure, Result};
 use cypress::models::token_index::{
-    dictionary_fingerprint, tokenize_name, TokenIndexView,
-    TOKEN_INDEX_MAGIC, TOKEN_INDEX_VERSION, TOKEN_ANALYZER_VERSION,
-    TOKEN_SKIP_BLOCK,
+    dictionary_fingerprint, tokenize_name, TokenIndexView, TOKEN_ANALYZER_VERSION,
+    TOKEN_INDEX_MAGIC, TOKEN_INDEX_VERSION, TOKEN_SKIP_BLOCK,
 };
 use fst::MapBuilder;
 use std::cmp::Reverse;
@@ -64,12 +63,12 @@ fn flush_run(pairs: &mut Vec<(String, u32)>, dir: &Path, seq: usize) -> Result<P
 }
 
 /// Merge pre-sorted runs. The callback receives globally ordered, unique pairs.
-fn merge_runs(
-    paths: &[PathBuf],
-    mut emit: impl FnMut(String, u32) -> Result<()>,
-) -> Result<()> {
-    let mut readers = paths.iter().map(File::open)
-        .map(|f| f.map(BufReader::new)).collect::<std::io::Result<Vec<_>>>()?;
+fn merge_runs(paths: &[PathBuf], mut emit: impl FnMut(String, u32) -> Result<()>) -> Result<()> {
+    let mut readers = paths
+        .iter()
+        .map(File::open)
+        .map(|f| f.map(BufReader::new))
+        .collect::<std::io::Result<Vec<_>>>()?;
     let mut heap = BinaryHeap::<Reverse<(String, u32, usize)>>::new();
     for (i, reader) in readers.iter_mut().enumerate() {
         if let Some((token, id)) = read_pair(reader)? {
@@ -124,11 +123,15 @@ fn append_varint(mut value: u32, out: &mut Vec<u8>) {
 }
 
 fn write_u64s<W: Write>(w: &mut W, a: &[u64]) -> Result<()> {
-    for &x in a { w.write_all(&x.to_le_bytes())?; }
+    for &x in a {
+        w.write_all(&x.to_le_bytes())?;
+    }
     Ok(())
 }
 fn write_u32s<W: Write>(w: &mut W, a: &[u32]) -> Result<()> {
-    for &x in a { w.write_all(&x.to_le_bytes())?; }
+    for &x in a {
+        w.write_all(&x.to_le_bytes())?;
+    }
     Ok(())
 }
 
@@ -140,8 +143,10 @@ pub fn build_token_index(
 ) -> Result<BuildReport> {
     ensure!(!string_name_offsets.is_empty(), "missing string boundaries");
     ensure!(string_name_offsets[0] == 0, "invalid first string offset");
-    ensure!(string_name_offsets.last().copied() == Some(string_name_bytes.len() as u32),
-        "last string offset mismatch");
+    ensure!(
+        string_name_offsets.last().copied() == Some(string_name_bytes.len() as u32),
+        "last string offset mismatch"
+    );
     let run_dir = scratch_root.join("tokens");
     fs::create_dir_all(&run_dir)?;
     let mut pairs = Vec::<(String, u32)>::with_capacity(RUN_PAIR_LIMIT);
@@ -149,10 +154,14 @@ pub fn build_token_index(
     for string_id in 0..string_name_offsets.len() - 1 {
         let begin = string_name_offsets[string_id] as usize;
         let end = string_name_offsets[string_id + 1] as usize;
-        ensure!(begin <= end && end <= string_name_bytes.len(), "invalid string offsets");
+        ensure!(
+            begin <= end && end <= string_name_bytes.len(),
+            "invalid string offsets"
+        );
         let name = std::str::from_utf8(&string_name_bytes[begin..end])?;
         let mut unique: Vec<&str> = tokenize_name(name)
-            .filter(|token| token.len() <= MAX_TOKEN_BYTES).collect();
+            .filter(|token| token.len() <= MAX_TOKEN_BYTES)
+            .collect();
         unique.sort_unstable();
         unique.dedup();
         for token in unique {
@@ -162,7 +171,9 @@ pub fn build_token_index(
             }
         }
     }
-    if !pairs.is_empty() { runs.push(flush_run(&mut pairs, &run_dir, runs.len())?); }
+    if !pairs.is_empty() {
+        runs.push(flush_run(&mut pairs, &run_dir, runs.len())?);
+    }
     let runs = reduce_runs(runs, &run_dir)?;
 
     // Emit flattened sections to temporary files, keeping only one posting
@@ -185,10 +196,15 @@ pub fn build_token_index(
     // Flush the currently accumulated block. Delta coding runs continuously
     // across blocks, so seeking into a block needs previous last ID.
     // PR 4 will use skip metadata for this.
-    let flush_block = |last: u32, buf: &mut Vec<u8>,
-                           out: &mut BufWriter<File>, bytes: &mut u64,
-                           skips: &mut Vec<(u32, u64)>| -> Result<()> {
-        if buf.is_empty() { return Ok(()); }
+    let flush_block = |last: u32,
+                       buf: &mut Vec<u8>,
+                       out: &mut BufWriter<File>,
+                       bytes: &mut u64,
+                       skips: &mut Vec<(u32, u64)>|
+     -> Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
         out.write_all(buf)?;
         *bytes += buf.len() as u64;
         skips.push((last, *bytes));
@@ -199,8 +215,13 @@ pub fn build_token_index(
     merge_runs(&runs, |token, id| {
         if current_token.as_deref() != Some(token.as_str()) {
             if current_token.is_some() {
-                flush_block(last_id, &mut block_bytes, &mut posting_writer,
-                            &mut byte_count, &mut skips)?;
+                flush_block(
+                    last_id,
+                    &mut block_bytes,
+                    &mut posting_writer,
+                    &mut byte_count,
+                    &mut skips,
+                )?;
                 offsets.push(byte_count);
                 frequencies.push(local_count);
                 skip_offsets.push(skips.len() as u64);
@@ -210,21 +231,36 @@ pub fn build_token_index(
             last_id = 0;
             local_count = 0;
         }
-        ensure!(local_count == 0 || id > last_id, "posting list must be increasing");
+        ensure!(
+            local_count == 0 || id > last_id,
+            "posting list must be increasing"
+        );
         let delta = id - last_id;
         append_varint(delta, &mut block_bytes);
-        local_count = local_count.checked_add(1).ok_or_else(|| anyhow!("docfreq overflow"))?;
+        local_count = local_count
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("docfreq overflow"))?;
         total_postings += 1;
         last_id = id;
         if local_count as usize % TOKEN_SKIP_BLOCK == 0 {
-            flush_block(last_id, &mut block_bytes, &mut posting_writer,
-                        &mut byte_count, &mut skips)?;
+            flush_block(
+                last_id,
+                &mut block_bytes,
+                &mut posting_writer,
+                &mut byte_count,
+                &mut skips,
+            )?;
         }
         Ok(())
     })?;
     if current_token.is_some() {
-        flush_block(last_id, &mut block_bytes, &mut posting_writer,
-                    &mut byte_count, &mut skips)?;
+        flush_block(
+            last_id,
+            &mut block_bytes,
+            &mut posting_writer,
+            &mut byte_count,
+            &mut skips,
+        )?;
         offsets.push(byte_count);
         frequencies.push(local_count);
         skip_offsets.push(skips.len() as u64);
@@ -234,8 +270,14 @@ pub fn build_token_index(
     fst_builder.finish()?;
     let fst_bytes = fs::metadata(&fst_path)?.len();
     let posting_bytes = fs::metadata(&postings_path)?.len();
-    ensure!(posting_bytes == byte_count, "posting byte accounting mismatch");
-    ensure!(offsets.len() == frequencies.len() + 1, "incorrect token offsets");
+    ensure!(
+        posting_bytes == byte_count,
+        "posting byte accounting mismatch"
+    );
+    ensure!(
+        offsets.len() == frequencies.len() + 1,
+        "incorrect token offsets"
+    );
 
     let temp_output = output_path.with_extension("bin.tmp");
     {
@@ -251,7 +293,9 @@ pub fn build_token_index(
             fst_bytes,
             posting_bytes,
             skips.len() as u64,
-        ] { out.write_all(&v.to_le_bytes())?; }
+        ] {
+            out.write_all(&v.to_le_bytes())?;
+        }
         std::io::copy(&mut BufReader::new(File::open(&fst_path)?), &mut out)?;
         write_u64s(&mut out, &offsets)?;
         write_u32s(&mut out, &frequencies)?;
@@ -267,8 +311,10 @@ pub fn build_token_index(
     let mmap_file = File::open(&temp_output)?;
     let mapped = unsafe { memmap2::MmapOptions::new().map(&mmap_file)? };
     let view = TokenIndexView::parse(&mapped)?;
-    ensure!(view.matches_dictionary(string_name_bytes, string_name_offsets),
-        "token index dictionary fingerprint mismatch");
+    ensure!(
+        view.matches_dictionary(string_name_bytes, string_name_offsets),
+        "token index dictionary fingerprint mismatch"
+    );
     fs::rename(&temp_output, output_path)?;
     let size = fs::metadata(output_path)?.len();
 
@@ -277,7 +323,8 @@ pub fn build_token_index(
     Ok(BuildReport {
         token_count: frequencies.len() as u64,
         posting_count: total_postings,
-        posting_bytes, fst_bytes,
+        posting_bytes,
+        fst_bytes,
         skip_count: skips.len() as u64,
         total_bytes: size,
     })
@@ -289,8 +336,14 @@ mod tests {
 
     #[test]
     fn postings_roundtrip_unicode_and_dedup() {
-        let strings = ["hollywood walk", "walk hollywood", "東京駅", "Bruxelles Brussel",
-                       "hollywood hollywood", "القاهرة"];
+        let strings = [
+            "hollywood walk",
+            "walk hollywood",
+            "東京駅",
+            "Bruxelles Brussel",
+            "hollywood hollywood",
+            "القاهرة",
+        ];
         let mut bytes = Vec::new();
         let mut offsets = vec![0];
         for s in strings {
@@ -298,13 +351,28 @@ mod tests {
             offsets.push(bytes.len() as u32);
         }
         let temp = tempfile::tempdir().unwrap();
-        let file = temp.path().join(cypress::models::token_index::TOKEN_INDEX_FILE);
+        let file = temp
+            .path()
+            .join(cypress::models::token_index::TOKEN_INDEX_FILE);
         build_token_index(&offsets, &bytes, temp.path(), &file).unwrap();
         let stored = fs::read(file).unwrap();
         let view = TokenIndexView::parse(&stored).unwrap();
-        assert_eq!(view.lookup("hollywood").unwrap().unwrap().decode_ids().unwrap(),
-                   vec![0, 1, 4]);
-        assert_eq!(view.lookup("東京駅").unwrap().unwrap().decode_ids().unwrap(), vec![2]);
+        assert_eq!(
+            view.lookup("hollywood")
+                .unwrap()
+                .unwrap()
+                .decode_ids()
+                .unwrap(),
+            vec![0, 1, 4]
+        );
+        assert_eq!(
+            view.lookup("東京駅")
+                .unwrap()
+                .unwrap()
+                .decode_ids()
+                .unwrap(),
+            vec![2]
+        );
         assert!(view.lookup("القاھرة").unwrap().is_none());
         assert!(view.matches_dictionary(&bytes, &offsets));
         assert!(!view.matches_dictionary(b"X", &[0, 1]));

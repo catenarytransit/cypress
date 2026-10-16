@@ -28,7 +28,10 @@ pub struct BigramIndexView<'a> {
 impl<'a> BigramIndexView<'a> {
     pub fn parse(data: &'a [u8]) -> Result<Self> {
         ensure!(data.len() >= BIGRAM_HEADER_SIZE, "truncated bigram sidecar");
-        ensure!(&data[..8] == BIGRAM_INDEX_MAGIC, "bigram sidecar magic mismatch");
+        ensure!(
+            &data[..8] == BIGRAM_INDEX_MAGIC,
+            "bigram sidecar magic mismatch"
+        );
         ensure!(
             u32::from_le_bytes(data[8..12].try_into()?) == BIGRAM_INDEX_VERSION,
             "unsupported bigram sidecar version"
@@ -37,20 +40,32 @@ impl<'a> BigramIndexView<'a> {
         let string_count = u64::from_le_bytes(data[16..24].try_into()?);
         let posting_count = u64::from_le_bytes(data[24..32].try_into()?);
         let fingerprint = u64::from_le_bytes(data[32..40].try_into()?);
-        let bytes_len = usize::try_from(posting_count)?.checked_mul(4)
+        let bytes_len = usize::try_from(posting_count)?
+            .checked_mul(4)
             .ok_or_else(|| anyhow::anyhow!("bigram sidecar size overflow"))?;
         ensure!(
-            data.len() == BIGRAM_HEADER_SIZE.checked_add(bytes_len)
-                .ok_or_else(|| anyhow::anyhow!("bigram sidecar length overflow"))?,
+            data.len()
+                == BIGRAM_HEADER_SIZE
+                    .checked_add(bytes_len)
+                    .ok_or_else(|| anyhow::anyhow!("bigram sidecar length overflow"))?,
             "bigram sidecar posting length mismatch"
         );
-        ensure!(cfg!(target_endian = "little"), "bigram sidecar requires little-endian host");
+        ensure!(
+            cfg!(target_endian = "little"),
+            "bigram sidecar requires little-endian host"
+        );
         let postings = bytemuck::try_cast_slice::<u8, u32>(&data[BIGRAM_HEADER_SIZE..])
             .map_err(|e| anyhow::anyhow!("unaligned bigram mmap data: {e:?}"))?;
-        Ok(Self { postings, string_count, fingerprint })
+        Ok(Self {
+            postings,
+            string_count,
+            fingerprint,
+        })
     }
 
-    pub fn len(&self) -> usize { self.postings.len() }
+    pub fn len(&self) -> usize {
+        self.postings.len()
+    }
 
     pub fn postings(&self, start: usize, end: usize) -> Option<&'a [u32]> {
         self.postings.get(start..end)
@@ -64,14 +79,26 @@ impl<'a> BigramIndexView<'a> {
     /// Validate the legacy offset array against the sidecar. This is O(65536)
     /// only at startup/hot reload, not for each user request.
     pub fn validate_offsets(&self, offsets: &[u32]) -> Result<()> {
-        ensure!(offsets.len() == 65537, "bigram offset directory wrong length");
-        ensure!(offsets.first() == Some(&0), "bigram offsets must start at zero");
+        ensure!(
+            offsets.len() == 65537,
+            "bigram offset directory wrong length"
+        );
+        ensure!(
+            offsets.first() == Some(&0),
+            "bigram offsets must start at zero"
+        );
         let mut last = 0;
         for &end in offsets {
-            ensure!(end >= last && end as usize <= self.len(), "invalid bigram offsets");
+            ensure!(
+                end >= last && end as usize <= self.len(),
+                "invalid bigram offsets"
+            );
             last = end;
         }
-        ensure!(last as usize == self.len(), "bigram sidecar count disagrees with offsets");
+        ensure!(
+            last as usize == self.len(),
+            "bigram sidecar count disagrees with offsets"
+        );
         Ok(())
     }
 }
@@ -88,7 +115,9 @@ mod tests {
         buf.extend_from_slice(&(counts.len() as u64).to_le_bytes());
         buf.extend_from_slice(&(ids.len() as u64).to_le_bytes());
         buf.extend_from_slice(&name_fingerprint(names, counts).to_le_bytes());
-        for &x in ids { buf.extend_from_slice(&x.to_le_bytes()); }
+        for &x in ids {
+            buf.extend_from_slice(&x.to_le_bytes());
+        }
         buf
     }
 

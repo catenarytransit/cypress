@@ -4,9 +4,9 @@
 //! blocking pool: each OS thread retains a potentially large GuessContext
 //! cache. Canceled requests cannot release a running worker permit early.
 
+use rayon::{ThreadPool, ThreadPoolBuilder};
 use std::sync::Arc;
 use std::time::Duration;
-use rayon::{ThreadPool, ThreadPoolBuilder};
 use tokio::sync::{oneshot, Semaphore};
 
 #[derive(Debug, thiserror::Error)]
@@ -59,13 +59,10 @@ impl SearchCpu {
             .clone()
             .try_acquire_owned()
             .map_err(|_| SearchCpuError::Saturated)?;
-        let worker = tokio::time::timeout(
-            self.wait_timeout,
-            self.workers.clone().acquire_owned(),
-        )
-        .await
-        .map_err(|_| SearchCpuError::WaitTimedOut)?
-        .map_err(|_| SearchCpuError::Saturated)?;
+        let worker = tokio::time::timeout(self.wait_timeout, self.workers.clone().acquire_owned())
+            .await
+            .map_err(|_| SearchCpuError::WaitTimedOut)?
+            .map_err(|_| SearchCpuError::Saturated)?;
         drop(waiting);
 
         // The permit lives inside the OS-thread job: canceling the HTTP

@@ -11,17 +11,25 @@ pub const HEADER_SIZE: usize = 24 + SECTION_COUNT * 16;
 
 /// The order is part of the disk format, not an enum derived from Rust layout.
 pub const SECTION_NAMES: [&str; SECTION_COUNT] = [
-    "place_latitudes", "place_longitudes", "place_importances",
-    "place_source_id_offsets", "place_source_id_bytes",
-    "place_layer_ranks", "place_populations",
-    "house_street_groups", "house_number_offsets", "house_number_bytes",
-    "house_postcode_offsets", "house_postcode_bytes", "house_place_ids",
-    "place_address_house_indices", "place_area_sets", "string_to_places_data",
+    "place_latitudes",
+    "place_longitudes",
+    "place_importances",
+    "place_source_id_offsets",
+    "place_source_id_bytes",
+    "place_layer_ranks",
+    "place_populations",
+    "house_street_groups",
+    "house_number_offsets",
+    "house_number_bytes",
+    "house_postcode_offsets",
+    "house_postcode_bytes",
+    "house_place_ids",
+    "place_address_house_indices",
+    "place_area_sets",
+    "string_to_places_data",
 ];
 
-pub const ELEMENT_BYTES: [usize; SECTION_COUNT] = [
-    4, 4, 4, 4, 1, 1, 4, 4, 8, 1, 8, 1, 4, 4, 4, 4,
-];
+pub const ELEMENT_BYTES: [usize; SECTION_COUNT] = [4, 4, 4, 4, 1, 1, 4, 4, 8, 1, 8, 1, 4, 4, 4, 4];
 
 pub struct DenseColumnsView<'a> {
     pub place_latitudes: &'a [f32],
@@ -45,13 +53,20 @@ pub struct DenseColumnsView<'a> {
 
 impl<'a> DenseColumnsView<'a> {
     pub fn parse(data: &'a [u8]) -> Result<Self> {
-        ensure!(cfg!(target_endian = "little"), "dense sidecar requires little-endian");
+        ensure!(
+            cfg!(target_endian = "little"),
+            "dense sidecar requires little-endian"
+        );
         ensure!(data.len() >= HEADER_SIZE, "truncated dense column header");
         ensure!(&data[0..8] == DENSE_MAGIC, "bad dense sidecar magic");
-        ensure!(u32::from_le_bytes(data[8..12].try_into()?) == DENSE_VERSION,
-                "unsupported dense sidecar version");
-        ensure!(u32::from_le_bytes(data[12..16].try_into()?) == SECTION_COUNT as u32,
-                "incorrect dense sidecar section count");
+        ensure!(
+            u32::from_le_bytes(data[8..12].try_into()?) == DENSE_VERSION,
+            "unsupported dense sidecar version"
+        );
+        ensure!(
+            u32::from_le_bytes(data[12..16].try_into()?) == SECTION_COUNT as u32,
+            "incorrect dense sidecar section count"
+        );
         let fingerprint = u64::from_le_bytes(data[16..24].try_into()?);
         let mut ranges = [(0usize, 0usize); SECTION_COUNT];
         let mut cursor = HEADER_SIZE;
@@ -59,15 +74,25 @@ impl<'a> DenseColumnsView<'a> {
             let pos = 24 + i * 16;
             let offset = usize::try_from(u64::from_le_bytes(data[pos..pos + 8].try_into()?))?;
             let count = usize::try_from(u64::from_le_bytes(data[pos + 8..pos + 16].try_into()?))?;
-            let bytes = count.checked_mul(ELEMENT_BYTES[i]).ok_or_else(|| anyhow!("dense column size overflow"))?;
-            let end = offset.checked_add(bytes).ok_or_else(|| anyhow!("dense column range overflow"))?;
+            let bytes = count
+                .checked_mul(ELEMENT_BYTES[i])
+                .ok_or_else(|| anyhow!("dense column size overflow"))?;
+            let end = offset
+                .checked_add(bytes)
+                .ok_or_else(|| anyhow!("dense column range overflow"))?;
             ensure!(offset == cursor, "dense sections not contiguous/aligned");
             ensure!(end <= data.len(), "truncated dense column");
             *range = (offset, end);
-            cursor = end.checked_add(7).ok_or_else(|| anyhow!("dense alignment overflow"))? & !7;
+            cursor = end
+                .checked_add(7)
+                .ok_or_else(|| anyhow!("dense alignment overflow"))?
+                & !7;
             ensure!(cursor >= end, "dense alignment overflow");
         }
-        ensure!(cursor == data.len(), "dense sidecar has trailing or missing data");
+        ensure!(
+            cursor == data.len(),
+            "dense sidecar has trailing or missing data"
+        );
 
         fn cast<'b, T: bytemuck::Pod>(data: &'b [u8], pair: (usize, usize)) -> Result<&'b [T]> {
             bytemuck::try_cast_slice(&data[pair.0..pair.1])
@@ -100,23 +125,57 @@ impl<'a> DenseColumnsView<'a> {
         let n = self.place_latitudes.len();
         let h = self.house_place_ids.len();
         for count in [
-            self.place_longitudes.len(), self.place_importances.len(),
-            self.place_layer_ranks.len(), self.place_populations.len(),
-            self.place_address_house_indices.len(), self.place_area_sets.len(),
-        ] { ensure!(count == n, "inconsistent dense place count"); }
-        ensure!(self.place_source_id_offsets.len() == n + 1, "invalid source offsets");
-        ensure!(self.house_street_groups.len() == h, "invalid house street count");
-        ensure!(self.house_number_offsets.len() == h + 1, "invalid number offsets");
-        ensure!(self.house_postcode_offsets.len() == h + 1, "invalid postcode offsets");
-        ensure!(self.place_source_id_offsets.first() == Some(&0), "invalid source start");
-        ensure!(self.house_number_offsets.first() == Some(&0), "invalid number start");
-        ensure!(self.house_postcode_offsets.first() == Some(&0), "invalid postcode start");
-        ensure!(self.place_source_id_offsets.last().map(|&x| u64::from(x)) == Some(self.place_source_id_bytes.len() as u64),
-                "invalid source byte length");
-        ensure!(self.house_number_offsets.last().copied() == Some(self.house_number_bytes.len() as u64),
-                "invalid number byte length");
-        ensure!(self.house_postcode_offsets.last().copied() == Some(self.house_postcode_bytes.len() as u64),
-                "invalid postcode byte length");
+            self.place_longitudes.len(),
+            self.place_importances.len(),
+            self.place_layer_ranks.len(),
+            self.place_populations.len(),
+            self.place_address_house_indices.len(),
+            self.place_area_sets.len(),
+        ] {
+            ensure!(count == n, "inconsistent dense place count");
+        }
+        ensure!(
+            self.place_source_id_offsets.len() == n + 1,
+            "invalid source offsets"
+        );
+        ensure!(
+            self.house_street_groups.len() == h,
+            "invalid house street count"
+        );
+        ensure!(
+            self.house_number_offsets.len() == h + 1,
+            "invalid number offsets"
+        );
+        ensure!(
+            self.house_postcode_offsets.len() == h + 1,
+            "invalid postcode offsets"
+        );
+        ensure!(
+            self.place_source_id_offsets.first() == Some(&0),
+            "invalid source start"
+        );
+        ensure!(
+            self.house_number_offsets.first() == Some(&0),
+            "invalid number start"
+        );
+        ensure!(
+            self.house_postcode_offsets.first() == Some(&0),
+            "invalid postcode start"
+        );
+        ensure!(
+            self.place_source_id_offsets.last().map(|&x| u64::from(x))
+                == Some(self.place_source_id_bytes.len() as u64),
+            "invalid source byte length"
+        );
+        ensure!(
+            self.house_number_offsets.last().copied() == Some(self.house_number_bytes.len() as u64),
+            "invalid number byte length"
+        );
+        ensure!(
+            self.house_postcode_offsets.last().copied()
+                == Some(self.house_postcode_bytes.len() as u64),
+            "invalid postcode byte length"
+        );
         Ok(())
     }
 }

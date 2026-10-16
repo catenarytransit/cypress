@@ -40,7 +40,9 @@ fn read_pair<R: Read>(reader: &mut R) -> Result<Option<(u32, u32)>> {
     while read_bytes < raw.len() {
         let n = reader.read(&mut raw[read_bytes..])?;
         if n == 0 {
-            if read_bytes == 0 { return Ok(None); }
+            if read_bytes == 0 {
+                return Ok(None);
+            }
             return Err(anyhow!("truncated spatial pair"));
         }
         read_bytes += n;
@@ -52,8 +54,11 @@ fn read_pair<R: Read>(reader: &mut R) -> Result<Option<(u32, u32)>> {
 }
 
 fn verify_pair_file(path: &Path) -> Result<()> {
-    ensure!(fs::metadata(path)?.len() % PAIR_BYTES == 0,
-            "spatial pair file is not a multiple of eight bytes: {}", path.display());
+    ensure!(
+        fs::metadata(path)?.len() % PAIR_BYTES == 0,
+        "spatial pair file is not a multiple of eight bytes: {}",
+        path.display()
+    );
     Ok(())
 }
 
@@ -69,10 +74,7 @@ fn sort_one_run(records: &mut Vec<(u32, u32)>, dir: &Path, serial: usize) -> Res
 }
 
 /// Merge sorted runs without materializing the union of their records.
-fn merge_runs(
-    paths: &[PathBuf],
-    mut write: impl FnMut(u32, u32) -> Result<()>,
-) -> Result<()> {
+fn merge_runs(paths: &[PathBuf], mut write: impl FnMut(u32, u32) -> Result<()>) -> Result<()> {
     let mut readers = paths
         .iter()
         .map(|p| File::open(p).map(BufReader::new))
@@ -87,8 +89,10 @@ fn merge_runs(
     let mut previous: Option<(u32, u32)> = None;
     while let Some(Reverse((cell, place, source))) = heap.pop() {
         if let Some(prev) = previous {
-            ensure!((cell, place) > prev,
-                    "spatial pairs are duplicated or out of order");
+            ensure!(
+                (cell, place) > prev,
+                "spatial pairs are duplicated or out of order"
+            );
         }
         write(cell, place)?;
         previous = Some((cell, place));
@@ -111,7 +115,9 @@ fn coalesce_runs(mut runs: Vec<PathBuf>, dir: &Path) -> Result<Vec<PathBuf>> {
             writer.flush()?;
             new_runs.push(path);
         }
-        for old in runs { fs::remove_file(old)?; }
+        for old in runs {
+            fs::remove_file(old)?;
+        }
         runs = new_runs;
         pass += 1;
     }
@@ -129,7 +135,10 @@ fn build_with_pairs(
     chunk_capacity: usize,
 ) -> Result<SpatialBuildStats> {
     ensure!(chunk_capacity > 0, "spatial sort buffer must be positive");
-    ensure!(output_path != pairs_path, "spatial input cannot equal output");
+    ensure!(
+        output_path != pairs_path,
+        "spatial input cannot equal output"
+    );
     verify_pair_file(pairs_path)?;
     ensure!(
         fs::metadata(pairs_path)?.len() == expected_places as u64 * PAIR_BYTES,
@@ -145,7 +154,10 @@ fn build_with_pairs(
         for _ in 0..chunk_capacity {
             match read_pair(&mut reader)? {
                 Some(pair) => records.push(pair),
-                None => { eof = true; break; }
+                None => {
+                    eof = true;
+                    break;
+                }
             }
         }
         if !records.is_empty() {
@@ -169,15 +181,18 @@ fn build_with_pairs(
     merge_runs(&runs, |cell, place| {
         ensure!(place < expected_places, "out-of-range spatial place ID");
         if last_cell != Some(cell) {
-            ensure!(last_cell.map_or(true, |previous| cell > previous),
-                    "spatial cells are not increasing");
+            ensure!(
+                last_cell.map_or(true, |previous| cell > previous),
+                "spatial cells are not increasing"
+            );
             cells.write_all(&cell.to_le_bytes())?;
             offsets.write_all(&place_count.to_le_bytes())?;
             cell_count += 1;
             last_cell = Some(cell);
         }
         places.write_all(&place.to_le_bytes())?;
-        place_count = place_count.checked_add(1)
+        place_count = place_count
+            .checked_add(1)
             .ok_or_else(|| anyhow!("spatial place count overflow"))?;
         Ok(())
     })?;
@@ -188,7 +203,10 @@ fn build_with_pairs(
     drop(cells);
     drop(offsets);
     drop(places);
-    ensure!(place_count == expected_places, "incomplete spatial grid output");
+    ensure!(
+        place_count == expected_places,
+        "incomplete spatial grid output"
+    );
 
     // Stream the three finalized columns to a single mmap-compatible file.
     let pending = workspace.join("cypress_grid.pending");
@@ -211,13 +229,21 @@ fn build_with_pairs(
     let file = File::open(&pending)?;
     let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
     let view = SpatialGridView::validate(&mmap)?;
-    ensure!(view.place_count == expected_places as usize, "invalid spatial place count");
+    ensure!(
+        view.place_count == expected_places as usize,
+        "invalid spatial place count"
+    );
     drop(mmap);
     drop(file);
     fs::rename(&pending, output_path).with_context(|| {
-        format!("Failed to publish staged spatial grid {}", output_path.display())
+        format!(
+            "Failed to publish staged spatial grid {}",
+            output_path.display()
+        )
     })?;
-    for path in runs { fs::remove_file(path)?; }
+    for path in runs {
+        fs::remove_file(path)?;
+    }
     fs::remove_file(cells_path)?;
     fs::remove_file(offsets_path)?;
     fs::remove_file(places_path)?;
@@ -236,9 +262,14 @@ pub fn build_spatial_grid(
     expected_places: u32,
     sort_buffer_mib: usize,
 ) -> Result<SpatialBuildStats> {
-    ensure!(sort_buffer_mib > 0, "--grid-sort-buffer-mib must be at least one");
-    let cap = sort_buffer_mib.checked_mul(1024 * 1024)
-        .ok_or_else(|| anyhow!("sort buffer size overflow"))? / 8;
+    ensure!(
+        sort_buffer_mib > 0,
+        "--grid-sort-buffer-mib must be at least one"
+    );
+    let cap = sort_buffer_mib
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| anyhow!("sort buffer size overflow"))?
+        / 8;
     build_with_pairs(pairs_path, workspace, output_path, expected_places, cap)
 }
 
@@ -258,14 +289,16 @@ mod tests {
         writer.flush().unwrap();
         drop(writer);
         let output = temp.path().join("grid.bin");
-        let stats = build_with_pairs(&input, &temp.path().join("scratch"),
-                                     &output, 6, 2).unwrap();
+        let stats = build_with_pairs(&input, &temp.path().join("scratch"), &output, 6, 2).unwrap();
         assert_eq!(stats.initial_runs, 3);
         let bytes = fs::read(&output).unwrap();
         let view = SpatialGridView::validate(&bytes).unwrap();
         assert_eq!(view.cell_places(2).unwrap().collect::<Vec<_>>(), vec![1, 4]);
         assert_eq!(view.cell_places(9).unwrap().collect::<Vec<_>>(), vec![2, 5]);
-        assert_eq!(view.cell_places(12).unwrap().collect::<Vec<_>>(), vec![0, 3]);
+        assert_eq!(
+            view.cell_places(12).unwrap().collect::<Vec<_>>(),
+            vec![0, 3]
+        );
     }
 
     #[test]
@@ -279,8 +312,7 @@ mod tests {
         writer.flush().unwrap();
         drop(writer);
         let output = temp.path().join("grid.bin");
-        let stats = build_with_pairs(&input, &temp.path().join("scratch"),
-                                     &output, 96, 2).unwrap();
+        let stats = build_with_pairs(&input, &temp.path().join("scratch"), &output, 96, 2).unwrap();
         assert!(stats.initial_runs > MAX_MERGE_FAN_IN);
         let bytes = fs::read(&output).unwrap();
         let view = SpatialGridView::validate(&bytes).unwrap();
@@ -295,9 +327,12 @@ mod tests {
         let input = temp.path().join("input.bin");
         File::create(&input).unwrap();
         let output = temp.path().join("grid.bin");
-        build_with_pairs(&input, &temp.path().join("scratch"),
-                         &output, 0, 2).unwrap();
-        assert_eq!(SpatialGridView::validate(&fs::read(output).unwrap())
-                   .unwrap().place_count, 0);
+        build_with_pairs(&input, &temp.path().join("scratch"), &output, 0, 2).unwrap();
+        assert_eq!(
+            SpatialGridView::validate(&fs::read(output).unwrap())
+                .unwrap()
+                .place_count,
+            0
+        );
     }
 }

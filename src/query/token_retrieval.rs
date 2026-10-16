@@ -20,7 +20,9 @@ pub struct RetrievalStats {
 fn decode_varint(bytes: &[u8], cursor: &mut usize) -> Result<u32> {
     let mut value = 0u32;
     for shift in (0..=28).step_by(7) {
-        let byte = *bytes.get(*cursor).ok_or_else(|| anyhow!("truncated posting"))?;
+        let byte = *bytes
+            .get(*cursor)
+            .ok_or_else(|| anyhow!("truncated posting"))?;
         *cursor += 1;
         ensure!(shift != 28 || byte & 0xf0 == 0, "invalid varint");
         value |= ((byte & 0x7f) as u32) << shift;
@@ -46,7 +48,10 @@ fn skips(posting: &TokenPostingList<'_>) -> Result<Vec<Skip>> {
         let byte_end = usize::try_from(absolute_end)?
             .checked_sub(usize::try_from(posting.posting_start)?)
             .ok_or_else(|| anyhow!("invalid skip pointer"))?;
-        ensure!(byte_end <= posting.bytes.len(), "skip pointer beyond posting");
+        ensure!(
+            byte_end <= posting.bytes.len(),
+            "skip pointer beyond posting"
+        );
         out.push(Skip { last_id, byte_end });
     }
     Ok(out)
@@ -54,14 +59,19 @@ fn skips(posting: &TokenPostingList<'_>) -> Result<Vec<Skip>> {
 
 /// Sequential postings scan for one chosen low-frequency anchor.
 fn read_anchor(posting: &TokenPostingList<'_>, stats: &mut RetrievalStats) -> Result<Vec<u32>> {
-    ensure!(posting.document_frequency <= MAX_ANCHOR_DF, "anchor over limit");
+    ensure!(
+        posting.document_frequency <= MAX_ANCHOR_DF,
+        "anchor over limit"
+    );
     let mut result = Vec::with_capacity(posting.document_frequency as usize);
     let mut pos = 0usize;
     let mut prev = 0u32;
     for i in 0..posting.document_frequency {
         let delta = decode_varint(posting.bytes, &mut pos)?;
         ensure!(i == 0 || delta > 0, "unordered posting");
-        prev = prev.checked_add(delta).ok_or_else(|| anyhow!("ID overflow"))?;
+        prev = prev
+            .checked_add(delta)
+            .ok_or_else(|| anyhow!("ID overflow"))?;
         result.push(prev);
         stats.posting_entries_examined += 1;
     }
@@ -79,18 +89,34 @@ fn contains(
     stats: &mut RetrievalStats,
 ) -> Result<bool> {
     let block = table.partition_point(|entry| entry.last_id < target);
-    if block == table.len() { return Ok(false); }
+    if block == table.len() {
+        return Ok(false);
+    }
     stats.block_seeks += 1;
-    let start = if block == 0 { 0 } else { table[block - 1].byte_end };
+    let start = if block == 0 {
+        0
+    } else {
+        table[block - 1].byte_end
+    };
     let end = table[block].byte_end;
-    let mut prev = if block == 0 { 0 } else { table[block - 1].last_id };
+    let mut prev = if block == 0 {
+        0
+    } else {
+        table[block - 1].last_id
+    };
     let mut pos = start;
     while pos < end {
         let delta = decode_varint(posting.bytes, &mut pos)?;
-        prev = prev.checked_add(delta).ok_or_else(|| anyhow!("posting overflow"))?;
+        prev = prev
+            .checked_add(delta)
+            .ok_or_else(|| anyhow!("posting overflow"))?;
         stats.posting_entries_examined += 1;
-        if prev == target { return Ok(true); }
-        if prev > target { return Ok(false); }
+        if prev == target {
+            return Ok(true);
+        }
+        if prev > target {
+            return Ok(false);
+        }
     }
     Ok(false)
 }
@@ -105,16 +131,28 @@ pub fn retrieve(
     let mut tokens: Vec<&str> = tokenize_name(normalized_query).collect();
     tokens.sort_unstable();
     tokens.dedup();
-    if tokens.is_empty() || tokens.len() > 8 { return Ok(None); }
+    if tokens.is_empty() || tokens.len() > 8 {
+        return Ok(None);
+    }
     let mut postings = Vec::with_capacity(tokens.len());
     for token in &tokens {
-        let Some(posting) = index.lookup(token)? else { return Ok(None); };
-        if posting.document_frequency == 0 { return Ok(None); }
+        let Some(posting) = index.lookup(token)? else {
+            return Ok(None);
+        };
+        if posting.document_frequency == 0 {
+            return Ok(None);
+        }
         postings.push(posting);
     }
-    let best = postings.iter().enumerate()
-        .min_by_key(|(_, p)| p.document_frequency).map(|(i, _)| i).unwrap();
-    if postings[best].document_frequency > MAX_ANCHOR_DF { return Ok(None); }
+    let best = postings
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, p)| p.document_frequency)
+        .map(|(i, _)| i)
+        .unwrap();
+    if postings[best].document_frequency > MAX_ANCHOR_DF {
+        return Ok(None);
+    }
     let mut stats = RetrievalStats {
         tokens: tokens.len(),
         anchor_df: postings[best].document_frequency,
@@ -126,7 +164,9 @@ pub fn retrieve(
     for id in anchor {
         let mut ok = true;
         for (i, posting) in postings.iter().enumerate() {
-            if i == best { continue; }
+            if i == best {
+                continue;
+            }
             if !contains(posting, &skip_tables[i], id, &mut stats)? {
                 ok = false;
                 break;
@@ -134,7 +174,9 @@ pub fn retrieve(
         }
         if ok {
             matched.push(id);
-            if matched.len() >= MAX_CANDIDATES { return Ok(None); }
+            if matched.len() >= MAX_CANDIDATES {
+                return Ok(None);
+            }
         }
     }
     stats.candidates = matched.len();
@@ -154,12 +196,17 @@ mod tests {
             skip_bytes.extend_from_slice(&end.to_le_bytes());
         }
         let posting = TokenPostingList {
-            document_frequency: 5, posting_start: 0,
-            bytes: &bytes, skip_bytes: &skip_bytes
+            document_frequency: 5,
+            posting_start: 0,
+            bytes: &bytes,
+            skip_bytes: &skip_bytes,
         };
         let table = skips(&posting).unwrap();
         let mut stats = RetrievalStats::default();
-        assert_eq!(read_anchor(&posting, &mut stats).unwrap(), vec![1, 4, 9, 100, 200]);
+        assert_eq!(
+            read_anchor(&posting, &mut stats).unwrap(),
+            vec![1, 4, 9, 100, 200]
+        );
         assert!(contains(&posting, &table, 100, &mut stats).unwrap());
         assert!(!contains(&posting, &table, 10, &mut stats).unwrap());
         assert!(!contains(&posting, &table, 201, &mut stats).unwrap());
@@ -168,7 +215,16 @@ mod tests {
 
     #[test]
     fn skip_partition_picks_first_possible_block() {
-        let table = [Skip {last_id: 10, byte_end: 5}, Skip {last_id: 35, byte_end: 12}];
+        let table = [
+            Skip {
+                last_id: 10,
+                byte_end: 5,
+            },
+            Skip {
+                last_id: 35,
+                byte_end: 12,
+            },
+        ];
         assert_eq!(table.partition_point(|s| s.last_id < 11), 1);
         assert_eq!(table.partition_point(|s| s.last_id < 36), 2);
     }

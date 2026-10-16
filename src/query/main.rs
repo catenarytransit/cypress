@@ -14,7 +14,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use axum::{
     extract::{Query, State},
     http::StatusCode,
@@ -24,6 +23,7 @@ use axum::{
 };
 use clap::Parser;
 use serde::{Deserialize, Serialize};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -104,7 +104,9 @@ async fn main() -> Result<()> {
     // DEBUG tracing on every ranking phase serializes huge amounts of log I/O
     // under load. Operators can opt in with RUST_LOG when benchmarking.
     let subscriber = FmtSubscriber::builder()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
@@ -126,7 +128,9 @@ async fn main() -> Result<()> {
             .unwrap_or(2)
             .min(4)
     });
-    let queue = args.search_queue.unwrap_or_else(|| workers.saturating_mul(4));
+    let queue = args
+        .search_queue
+        .unwrap_or_else(|| workers.saturating_mul(4));
     anyhow::ensure!(workers > 0, "--search-workers must be positive");
     anyhow::ensure!(queue > 0, "--search-queue must be positive");
     anyhow::ensure!(args.search_wait_ms > 0, "--search-wait-ms must be positive");
@@ -134,7 +138,12 @@ async fn main() -> Result<()> {
         args.max_inflight_requests > 0,
         "--max-inflight-requests must be positive"
     );
-    info!(workers, queue, max_inflight = args.max_inflight_requests, "Search admission limits");
+    info!(
+        workers,
+        queue,
+        max_inflight = args.max_inflight_requests,
+        "Search admission limits"
+    );
 
     let state = Arc::new(AppState {
         scylla_client,
@@ -195,30 +204,36 @@ async fn autocomplete_handler(
             };
         let weight = params.focus_point_weight.unwrap_or(50.0);
 
-        state.cpu.run(move || {
-            let scored_places =
-                search::search_place_ids(&memdb, &text, focus_point, weight, None, size);
-            let memdb_data = memdb.get_data();
-            scored_places
-                .into_iter()
-                .filter_map(|(place_id, _)| memdb_data.get_place(place_id as usize))
-                .map(|place| AutocompleteFeature {
-                    result_type: "Feature".to_string(),
-                    geometry: search::Geometry {
-                        geo_type: "Point".to_string(),
-                        coordinates: [place.lon as f64, place.lat as f64],
-                    },
-                    properties: AutocompleteProperties {
-                        id: String::from_utf8_lossy(
-                            &place.source_id_bytes[..place.source_id_len as usize],
-                        )
-                        .into_owned(),
-                        name: String::from_utf8_lossy(&place.name_bytes[..place.name_len as usize])
+        state
+            .cpu
+            .run(move || {
+                let scored_places =
+                    search::search_place_ids(&memdb, &text, focus_point, weight, None, size);
+                let memdb_data = memdb.get_data();
+                scored_places
+                    .into_iter()
+                    .filter_map(|(place_id, _)| memdb_data.get_place(place_id as usize))
+                    .map(|place| AutocompleteFeature {
+                        result_type: "Feature".to_string(),
+                        geometry: search::Geometry {
+                            geo_type: "Point".to_string(),
+                            coordinates: [place.lon as f64, place.lat as f64],
+                        },
+                        properties: AutocompleteProperties {
+                            id: String::from_utf8_lossy(
+                                &place.source_id_bytes[..place.source_id_len as usize],
+                            )
                             .into_owned(),
-                    },
-                })
-                .collect::<Vec<_>>()
-        }).await.map_err(|error| map_search_error(error.into()))?
+                            name: String::from_utf8_lossy(
+                                &place.name_bytes[..place.name_len as usize],
+                            )
+                            .into_owned(),
+                        },
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .map_err(|error| map_search_error(error.into()))?
     } else {
         Vec::new()
     };
@@ -249,12 +264,17 @@ async fn search_handler(
         size: params.size.unwrap_or(10).min(40),
     };
 
-    let results = search::execute_search(&state.scylla_client, &state.memdb, &state.cpu, search_params)
-        .await
-        .map_err(|e| {
-            tracing::error!("Search execution failed: {}", e);
-            map_search_error(e)
-        })?;
+    let results = search::execute_search(
+        &state.scylla_client,
+        &state.memdb,
+        &state.cpu,
+        search_params,
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!("Search execution failed: {}", e);
+        map_search_error(e)
+    })?;
 
     Ok(Json(SearchResponse {
         features: results.results,
@@ -282,12 +302,17 @@ async fn search_v2_handler(
         size: params.size.unwrap_or(10).min(40),
     };
 
-    let results = search::execute_search_v2(&state.scylla_client, &state.memdb, &state.cpu, search_params)
-        .await
-        .map_err(|e| {
-            tracing::error!("Search V2 execution failed: {}", e);
-            map_search_error(e)
-        })?;
+    let results = search::execute_search_v2(
+        &state.scylla_client,
+        &state.memdb,
+        &state.cpu,
+        search_params,
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!("Search V2 execution failed: {}", e);
+        map_search_error(e)
+    })?;
 
     Ok(Json(SearchResponseV2 {
         features: results.results,
