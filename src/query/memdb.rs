@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use memmap2::Mmap;
+use std::ops::Deref;
+use cypress::models::dense_columns::{DenseColumnsView, DENSE_FILE};
+use cypress::models::bigram_index::name_fingerprint;
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -412,6 +415,7 @@ thread_local! {
 
 pub struct MemdbData {
     pub index_mmap: Mmap,
+    pub dense_mmap: Option<Mmap>,
     pub places_mmap: Mmap,
     pub token_mmap: Option<Mmap>,
     pub grid_mmap: Option<Mmap>,
@@ -419,9 +423,83 @@ pub struct MemdbData {
     pub version: String,
 }
 
+/// Backward-compatible view: legacy rkyv arrays for old datasets, mmap slices
+/// for new compilations. Existing string/admin fields transparently deref.
+pub struct QueryDbView<'a> {
+    archived: &'a ArchivedCypressMemDb,
+    pub place_latitudes: &'a [f32],
+    pub place_longitudes: &'a [f32],
+    pub place_importances: &'a [f32],
+    pub place_source_id_offsets: &'a [u32],
+    pub place_source_id_bytes: &'a [u8],
+    pub place_layer_ranks: &'a [u8],
+    pub place_populations: &'a [u32],
+    pub place_area_sets: &'a [u32],
+    pub house_street_groups: &'a [u32],
+    pub house_number_bytes: &'a [u8],
+    pub house_postcode_bytes: &'a [u8],
+    pub house_place_ids: &'a [u32],
+    pub place_address_house_indices: &'a [u32],
+    dense_house_number_offsets: Option<&'a [u64]>,
+    dense_house_postcode_offsets: Option<&'a [u64]>,
+}
+
+impl<'a> Deref for QueryDbView<'a> {
+    type Target = ArchivedCypressMemDb;
+    fn deref(&self) -> &Self::Target { self.archived }
+}
+
+impl QueryDbView<'_> {
+    pub fn house_number_range(&self, idx: usize) -> Option<(usize, usize)> {
+        if let Some(offsets) = self.dense_house_number_offsets {
+            let start = usize::try_from(*offsets.get(idx)?).ok()?;
+            let end = usize::try_from(*offsets.get(idx + 1)?).ok()?;
+            Some((start,end))
+        } else {
+            Some((*self.archived.house_number_offsets.get(idx)? as usize,
+                  *self.archived.house_number_offsets.get(idx + 1)? as usize))
+        }
+    }
+    pub fn house_postcode_range(&self, idx: usize) -> Option<(usize, usize)> {
+        if let Some(offsets) = self.dense_house_postcode_offsets {
+            let start = usize::try_from(*offsets.get(idx)?).ok()?;
+            let end = usize::try_from(*offsets.get(idx + 1)?).ok()?;
+            Some((start,end))
+        } else {
+            Some((*self.archived.house_postcode_offsets.get(idx)? as usize,
+                  *self.archived.house_postcode_offsets.get(idx + 1)? as usize))
+        }
+    }
+}
+
 impl MemdbData {
     pub fn get_archived(&self) -> &ArchivedCypressMemDb {
         unsafe { rkyv::archived_root::<CypressMemDb>(&self.index_mmap) }
+    }
+
+    pub fn get_view(&self) -> QueryDbView<'_> {
+        let db = self.get_archived();
+        // Validated during generation load; parsing is constant-time metadata work.
+        let dense = self.dense_mmap.as_ref().map(|m| DenseColumnsView::parse(m)
+            .expect("dense sidecar was validated on generation load"));
+        QueryDbView {
+            archived: db,
+            place_latitudes: dense.as_ref().map_or(&db.place_latitudes[..], |v| v.place_latitudes),
+            place_longitudes: dense.as_ref().map_or(&db.place_longitudes[..], |v| v.place_longitudes),
+            place_importances: dense.as_ref().map_or(&db.place_importances[..], |v| v.place_importances),
+            place_source_id_offsets: dense.as_ref().map_or(&db.place_source_id_offsets[..], |v| v.place_source_id_offsets),
+            place_source_id_bytes: dense.as_ref().map_or(&db.place_source_id_bytes[..], |v| v.place_source_id_bytes),
+            place_layer_ranks: dense.as_ref().map_or(&db.place_layer_ranks[..], |v| v.place_layer_ranks),
+            place_populations: dense.as_ref().map_or(&db.place_populations[..], |v| v.place_populations),
+            place_area_sets: dense.as_ref().map_or(&db.place_area_sets[..], |v| v.place_area_sets),
+            house_street_groups: dense.as_ref().map_or(&db.house_street_groups[..], |v| v.house_street_groups),
+            house_number_bytes: dense.as_ref().map_or(&db.house_number_bytes[..], |v| v.house_number_bytes),
+            house_postcode_bytes: dense.as_ref().map_or(&db.house_postcode_bytes[..], |v| v.house_postcode_bytes),
+            house_place_ids: dense.as_ref().map_or(&db.house_place_ids[..], |v| v.house_place_ids),
+            place_address_house_indices: dense.as_ref().map_or(&db.place_address_house_indices[..], |v| v.place_address_house_indices),
+            dense_house_number_offsets: dense.as_ref().map(|v| v.house_number_offsets),
+            dense_house_postcode_offsets: dense.as_ref().map(|v| v.house_postcode_offsets),
+        }
     }
 
     pub fn get_place(&self, place_id: usize) -> Option<PlaceRecord> {
@@ -435,7 +513,7 @@ impl MemdbData {
     }
 
     pub fn get_place_source_id(&self, place_id: usize) -> Option<String> {
-        let db = self.get_archived();
+        let db = self.get_view();
         let start = *db.place_source_id_offsets.get(place_id)? as usize;
         let end = *db.place_source_id_offsets.get(place_id + 1)? as usize;
 
@@ -446,17 +524,7 @@ impl MemdbData {
         Some(String::from_utf8_lossy(&db.place_source_id_bytes[start..end]).into_owned())
     }
 
-    pub fn get_string_name(&self, string_id: usize) -> Option<&[u8]> {
-        let db = self.get_archived();
-        let start = *db.string_name_offsets.get(string_id)? as usize;
-        let end = *db.string_name_offsets.get(string_id + 1)? as usize;
 
-        if start > end || end > db.string_name_bytes.len() {
-            return None;
-        }
-
-        Some(&db.string_name_bytes[start..end])
-    }
 }
 
 pub struct Memdb {
@@ -506,6 +574,38 @@ impl Memdb {
             ));
         }
 
+        let db = unsafe { rkyv::archived_root::<CypressMemDb>(&index_mmap) };
+        let dense_path = out_dir.join(DENSE_FILE);
+        let dense_mmap = if dense_path.exists() {
+            let file = File::open(&dense_path)?;
+            let mmap = unsafe { Mmap::map(&file)? };
+            let view = DenseColumnsView::parse(&mmap)
+                .context("Invalid dense column sidecar")?;
+            anyhow::ensure!(
+                view.dictionary_fingerprint == name_fingerprint(
+                    &db.string_name_bytes[..], &db.string_bigram_counts[..]),
+                "Dense sidecar dictionary fingerprint mismatch"
+            );
+            anyhow::ensure!(
+                view.place_latitudes.len() == places_mmap.len() / PLACE_RECORD_DISK_BYTES,
+                "Dense sidecar place count differs from place records"
+            );
+            anyhow::ensure!(db.place_latitudes.is_empty() &&
+                db.house_place_ids.is_empty() && db.place_area_sets.is_empty(),
+                "Dense sidecar must not coexist with nonempty embedded columns");
+            Some(mmap)
+        } else {
+            anyhow::ensure!(
+                !db.place_latitudes.is_empty() ||
+                places_mmap.is_empty(),
+                "Missing cypress_dense.bin for disk-backed dense columns"
+            );
+            None
+        };
+        let dense_place_count = dense_mmap.as_ref()
+            .map(|m| DenseColumnsView::parse(m).expect("validated").place_latitudes.len())
+            .unwrap_or(db.place_latitudes.len());
+
         let token_path = out_dir.join(TOKEN_INDEX_FILE);
         let token_mmap = if token_path.exists() {
             let file = File::open(&token_path)?;
@@ -532,13 +632,13 @@ impl Memdb {
             let grid = SpatialGridView::validate(&mmap)
                 .context("Invalid disk-backed spatial grid")?;
             anyhow::ensure!(
-                grid.place_count == db.place_latitudes.len(),
+                grid.place_count == dense_place_count,
                 "Spatial grid place count does not match index"
             );
             Some(mmap)
         } else {
             anyhow::ensure!(
-                !db.active_cells.is_empty() || db.place_latitudes.is_empty(),
+                !db.active_cells.is_empty() || dense_place_count == 0,
                 "Missing cypress_grid.bin for disk-backed spatial index"
             );
             None
@@ -567,7 +667,7 @@ impl Memdb {
             None
         };
         Ok(MemdbData {
-            index_mmap, places_mmap, token_mmap, grid_mmap, bigram_mmap, version,
+            index_mmap, dense_mmap, places_mmap, token_mmap, grid_mmap, bigram_mmap, version,
         })
     }
 
