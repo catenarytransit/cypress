@@ -68,7 +68,7 @@ pub fn exact_admin_areas(
     Some(areas)
 }
 
-fn in_area(index: &JoinIndex<'_>, set_id: u32, candidate_areas: &[u32]) -> bool {
+pub fn in_area(index: &JoinIndex<'_>, set_id: u32, candidate_areas: &[u32]) -> bool {
     if set_id == u32::MAX {
         return false;
     }
