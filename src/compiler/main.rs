@@ -819,12 +819,21 @@ async fn main() -> Result<()> {
     place_source_id_offsets.finish()?;
     let lat_file = File::open(dense_dir.join("place_latitudes.bin"))?;
     let lon_file = File::open(dense_dir.join("place_longitudes.bin"))?;
-    let lat_mmap = unsafe { MmapOptions::new().map(&lat_file)? };
-    let lon_mmap = unsafe { MmapOptions::new().map(&lon_file)? };
-    let place_latitudes = bytemuck::try_cast_slice::<u8,f32>(&lat_mmap)
-        .map_err(|e| anyhow!("latitude mmap alignment: {e:?}"))?;
-    let place_longitudes = bytemuck::try_cast_slice::<u8,f32>(&lon_mmap)
-        .map_err(|e| anyhow!("longitude mmap alignment: {e:?}"))?;
+    // Mapping an empty file is invalid on Linux; empty datasets use slices.
+    let lat_mmap = if total_places == 0 { None }
+        else { Some(unsafe { MmapOptions::new().map(&lat_file)? }) };
+    let lon_mmap = if total_places == 0 { None }
+        else { Some(unsafe { MmapOptions::new().map(&lon_file)? }) };
+    let place_latitudes: &[f32] = match lat_mmap.as_ref() {
+        Some(m) => bytemuck::try_cast_slice::<u8, f32>(m)
+            .map_err(|e| anyhow!("latitude mmap alignment: {e:?}"))?,
+        None => &[],
+    };
+    let place_longitudes: &[f32] = match lon_mmap.as_ref() {
+        Some(m) => bytemuck::try_cast_slice::<u8, f32>(m)
+            .map_err(|e| anyhow!("longitude mmap alignment: {e:?}"))?,
+        None => &[],
+    };
     // No subsequent pass needs the giant place record mmap.
     drop(places_mmap);
 
