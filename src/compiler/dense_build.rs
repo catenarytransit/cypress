@@ -64,15 +64,15 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().join("columns");
         fs::create_dir(&dir).unwrap();
-        let fields: [&[u8]; SECTION_COUNT] = [
-            &le_f32(&[34.0,35.0]), &le_f32(&[-118.0,-119.0]),
-            &le_f32(&[1.0,2.0]), &le_u32(&[0,1,3]),
-            b"abc", &[0u8,1], &le_u32(&[5,6]),
-            &le_u32(&[0]), &le_u64(&[0,2]), b"12",
-            &le_u64(&[0,5]), b"90210", &le_u32(&[1]),
-            &le_u32(&[u32::MAX,0]), &le_u32(&[1,2]),
+        let fields = [
+            le_f32(&[34.0,35.0]), le_f32(&[-118.0,-119.0]),
+            le_f32(&[1.0,2.0]), le_u32(&[0,1,3]),
+            b"abc".to_vec(), vec![0u8,1], le_u32(&[5,6]),
+            le_u32(&[0]), le_u64(&[0,2]), b"12".to_vec(),
+            le_u64(&[0,5]), b"90210".to_vec(), le_u32(&[1]),
+            le_u32(&[u32::MAX,0]), le_u32(&[1,2]),
         ];
-        for (name,data) in SECTION_NAMES.iter().zip(fields) {
+        for (name,data) in SECTION_NAMES.iter().zip(fields.iter()) {
             fs::write(dir.join(format!("{name}.bin")),data).unwrap();
         }
         let path=temp.path().join("dense.bin");
