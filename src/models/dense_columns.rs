@@ -50,7 +50,6 @@ impl<'a> DenseColumnsView<'a> {
                 "unsupported dense sidecar version");
         ensure!(u32::from_le_bytes(data[12..16].try_into()?) == SECTION_COUNT as u32,
                 "incorrect dense sidecar section count");
-        ensure!(data[16..24].len() == 8, "missing dense dictionary fingerprint");
         let fingerprint = u64::from_le_bytes(data[16..24].try_into()?);
         let mut ranges = [(0usize, 0usize); SECTION_COUNT];
         let mut cursor = HEADER_SIZE;
@@ -63,7 +62,7 @@ impl<'a> DenseColumnsView<'a> {
             ensure!(offset == cursor, "dense sections not contiguous/aligned");
             ensure!(end <= data.len(), "truncated dense column");
             *range = (offset, end);
-            cursor = (end + 7) & !7;
+            cursor = end.checked_add(7).ok_or_else(|| anyhow!("dense alignment overflow"))? & !7;
             ensure!(cursor >= end, "dense alignment overflow");
         }
         ensure!(cursor == data.len(), "dense sidecar has trailing or missing data");
@@ -108,7 +107,7 @@ impl<'a> DenseColumnsView<'a> {
         ensure!(self.place_source_id_offsets.first() == Some(&0), "invalid source start");
         ensure!(self.house_number_offsets.first() == Some(&0), "invalid number start");
         ensure!(self.house_postcode_offsets.first() == Some(&0), "invalid postcode start");
-        ensure!(self.place_source_id_offsets.last().copied() == Some(self.place_source_id_bytes.len() as u32),
+        ensure!(self.place_source_id_offsets.last().map(|&x| u64::from(x)) == Some(self.place_source_id_bytes.len() as u64),
                 "invalid source byte length");
         ensure!(self.house_number_offsets.last().copied() == Some(self.house_number_bytes.len() as u64),
                 "invalid number byte length");
