@@ -43,7 +43,7 @@ pub fn suffix_splits(tokens: &[&[u8]]) -> Vec<(Vec<u8>, Vec<u8>)> {
     (1..tokens.len())
         .rev()
         .map(|split| {
-            (tokens[..split].join(&b' '), tokens[split..].join(&b' '))
+            (tokens[..split].join(&[b' '][..]), tokens[split..].join(&[b' '][..]))
         })
         .collect()
 }
