@@ -23,6 +23,7 @@ mod address_sort;
 mod bigram_index;
 mod dense_build;
 mod disk_columns;
+mod publish;
 mod reverse_index;
 mod spatial_grid;
 mod token_index;
@@ -1768,13 +1769,7 @@ async fn main() -> Result<()> {
     drop(merged_places_file);
 
     let final_places_path = out_dir.join("cypress_places.bin");
-    fs::rename(&merged_places_path, &final_places_path).with_context(|| {
-        format!(
-            "Failed to move merged places file {} -> {}",
-            merged_places_path.display(),
-            final_places_path.display()
-        )
-    })?;
+    publish::publish_file(&merged_places_path, &final_places_path)?;
 
     // A new generation without --token-index must not leave an obsolete
     // sidecar from a previous compiled dictionary beside the new MemDB.
@@ -1782,11 +1777,11 @@ async fn main() -> Result<()> {
         fs::remove_file(&token_path).context("Removing obsolete optional token sidecar")?;
     }
     // Publish sidecars after the main index has been serialized.
-    fs::rename(&staged_grid_path, &grid_path)?;
+    publish::publish_file(&staged_grid_path, &grid_path)?;
     let dense_path = out_dir.join(cypress::models::dense_columns::DENSE_FILE);
-    fs::rename(&dense_stage_path, &dense_path)?;
+    publish::publish_file(&dense_stage_path, &dense_path)?;
     let bigram_path = out_dir.join(cypress::models::bigram_index::BIGRAM_INDEX_FILE);
-    fs::rename(&bigram_stage_path, &bigram_path)?;
+    publish::publish_file(&bigram_stage_path, &bigram_path)?;
     let spatial_grid_bytes = fs::metadata(&grid_path)?.len();
     let bigram_index_bytes = fs::metadata(&bigram_path)?.len();
     let old_index_bytes = fs::metadata(&db_path)?.len();
