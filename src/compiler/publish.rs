@@ -12,7 +12,7 @@ use tempfile::NamedTempFile;
 
 /// Publish a completed scratch file without exposing a partially copied output.
 pub(super) fn publish_file(source: &Path, destination: &Path) -> Result<()> {
-    publish_with_rename(source, destination, fs::rename)
+    publish_with_rename(source, destination, |from, to| fs::rename(from, to))
 }
 
 fn publish_with_rename(
