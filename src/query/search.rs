@@ -1747,11 +1747,15 @@ pub fn search_place_ids(
                 let (Some(&start), Some(&end)) = (
                     db.string_name_offsets.get(pos),
                     db.string_name_offsets.get(pos + 1),
-                ) else { return false; };
+                ) else {
+                    return false;
+                };
                 let (Some(&p_start), Some(&p_end)) = (
                     db.string_to_places_offsets.get(pos),
                     db.string_to_places_offsets.get(pos + 1),
-                ) else { return false; };
+                ) else {
+                    return false;
+                };
                 (start as usize) <= (end as usize)
                     && (end as usize) <= db.string_name_bytes.len()
                     && (p_start as usize) <= (p_end as usize)
@@ -1838,7 +1842,9 @@ pub fn search_place_ids(
         // expanding into thousands of unrelated place scoring candidates.
         // Independent of token conjunction success and shortlist mode.
         let area_gate_mode = super::area_fanout::Mode::from_env(
-            std::env::var("CYPRESS_AREA_FANOUT").unwrap_or_default().as_str(),
+            std::env::var("CYPRESS_AREA_FANOUT")
+                .unwrap_or_default()
+                .as_str(),
         );
         let mut area_gate_plan = if area_gate_mode != super::area_fanout::Mode::Off {
             if let (Some(name_fst), Some(area_fst)) =
@@ -1846,7 +1852,8 @@ pub fn search_place_ids(
             {
                 let selected: Vec<u32> = match_snapshot.iter().map(|m| m.0).collect();
                 super::area_fanout::build(
-                    name_fst, area_fst,
+                    name_fst,
+                    area_fst,
                     &db.admin_alias_area_offsets[..],
                     &db.admin_alias_area_data[..],
                     &query_tokens,
@@ -1921,9 +1928,8 @@ pub fn search_place_ids(
                 }
 
                 if let Some(&area_set) = db.place_area_sets.get(place_idx) {
-                    if let Some(in_area) = area_gate_plan.check(
-                        *string_idx, area_set, &join_index,
-                    ) {
+                    if let Some(in_area) = area_gate_plan.check(*string_idx, area_set, &join_index)
+                    {
                         area_gate_checked += 1;
                         if !in_area {
                             area_gate_rejected += 1;

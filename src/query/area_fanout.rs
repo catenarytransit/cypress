@@ -6,9 +6,9 @@
 //! name evidence and DP scoring. The full literal query and other candidates
 //! remain eligible. All filtering is opt-in; shadow mode changes no results.
 
-use std::collections::HashMap;
-use fst::Map;
 use super::field_aware::{self, JoinIndex};
+use fst::Map;
+use std::collections::HashMap;
 
 /// Low-fanout names do not justify a restrictive geographic interpretation.
 pub const MIN_SCOPED_NAME_FANOUT: usize = 64;
@@ -37,9 +37,10 @@ struct Gate {
 
 impl Gate {
     fn matches(&mut self, area_set: u32, index: &JoinIndex<'_>) -> bool {
-        *self.cached_sets.entry(area_set).or_insert_with(||
-            field_aware::in_area(index, area_set, &self.areas)
-        )
+        *self
+            .cached_sets
+            .entry(area_set)
+            .or_insert_with(|| field_aware::in_area(index, area_set, &self.areas))
     }
 }
 
@@ -53,12 +54,15 @@ pub struct Plan {
 }
 
 impl Plan {
-    pub fn gated_names(&self) -> usize { self.gates.len() }
+    pub fn gated_names(&self) -> usize {
+        self.gates.len()
+    }
 
     /// None: the StringId has no geographic constraint.
     /// Some(false): may exclude this mapping in "on" mode only.
     pub fn check(&mut self, string_id: u32, area_set: u32, index: &JoinIndex<'_>) -> Option<bool> {
-        self.gates.get_mut(&string_id)
+        self.gates
+            .get_mut(&string_id)
             .map(|gate| gate.matches(area_set, index))
     }
 }
@@ -89,23 +93,34 @@ pub fn build(
         let lhs = tokens[..split].join(&[b' '][..]);
         let rhs = tokens[split..].join(&[b' '][..]);
         for (name, admin) in [(&lhs[..], &rhs[..]), (&rhs[..], &lhs[..])] {
-            let Some(raw_sid) = name_fst.get(name) else { continue; };
-            let Ok(sid) = u32::try_from(raw_sid) else { continue; };
-            if selected_string_ids.binary_search(&sid).is_err() { continue; }
+            let Some(raw_sid) = name_fst.get(name) else {
+                continue;
+            };
+            let Ok(sid) = u32::try_from(raw_sid) else {
+                continue;
+            };
+            if selected_string_ids.binary_search(&sid).is_err() {
+                continue;
+            }
 
             let pos = sid as usize;
             let (Some(&start), Some(&end)) = (
                 index.string_place_offsets.get(pos),
                 index.string_place_offsets.get(pos + 1),
-            ) else { continue; };
-            if start > end || (end as usize) > index.string_place_ids.len()
+            ) else {
+                continue;
+            };
+            if start > end
+                || (end as usize) > index.string_place_ids.len()
                 || ((end - start) as usize) < MIN_SCOPED_NAME_FANOUT
             {
                 continue;
             }
-            let Some(areas) = field_aware::exact_admin_areas(
-                area_fst, alias_offsets, alias_data, admin,
-            ) else { continue; };
+            let Some(areas) =
+                field_aware::exact_admin_areas(area_fst, alias_offsets, alias_data, admin)
+            else {
+                continue;
+            };
             plan.interpretations += 1;
             candidates.entry(sid).or_default().extend(areas);
         }
@@ -118,16 +133,25 @@ pub fn build(
         let (Some(&start), Some(&end)) = (
             index.string_place_offsets.get(pos),
             index.string_place_offsets.get(pos + 1),
-        ) else { continue; };
-        if start > end { continue; }
+        ) else {
+            continue;
+        };
+        if start > end {
+            continue;
+        }
         let Some(postings) = index.string_place_ids.get(start as usize..end as usize) else {
             continue;
         };
 
-        let mut gate = Gate { areas, cached_sets: HashMap::new() };
+        let mut gate = Gate {
+            areas,
+            cached_sets: HashMap::new(),
+        };
         let any_in_area = postings.iter().any(|&place_id| {
             plan.preflight_links += 1;
-            index.place_area_sets.get(place_id as usize)
+            index
+                .place_area_sets
+                .get(place_id as usize)
                 .is_some_and(|&set| gate.matches(set, index))
         });
         if any_in_area {
@@ -179,8 +203,13 @@ mod tests {
             area_set_data: &[55, 88],
         };
         let mut plan = build(
-            &name_fst, &area_fst, &offsets, &areas,
-            &[b"starbucks", b"chicago"], &[1, 2], &index,
+            &name_fst,
+            &area_fst,
+            &offsets,
+            &areas,
+            &[b"starbucks", b"chicago"],
+            &[1, 2],
+            &index,
         );
         assert_eq!(plan.gated_names(), 1);
         assert_eq!(plan.check(1, 0, &index), Some(true));
@@ -188,8 +217,13 @@ mod tests {
         assert_eq!(plan.check(2, 1, &index), None);
         assert_eq!(plan.check(0, 1, &index), None);
         let mut reverse = build(
-            &name_fst, &area_fst, &offsets, &areas,
-            &[b"chicago", b"starbucks"], &[1], &index,
+            &name_fst,
+            &area_fst,
+            &offsets,
+            &areas,
+            &[b"chicago", b"starbucks"],
+            &[1],
+            &index,
         );
         assert_eq!(reverse.check(1, 0, &index), Some(true));
         assert_eq!(reverse.check(1, 1, &index), Some(false));
@@ -213,12 +247,45 @@ mod tests {
             area_set_offsets: &[0, 1, 2],
             area_set_data: &[55, 88],
         };
-        assert_eq!(build(&name_fst, &area_fst, &offsets, &areas,
-            &[b"starbucks", b"chicago"], &[1], &index).gated_names(), 0);
-        assert_eq!(build(&name_fst, &area_fst, &offsets, &areas,
-            &[b"starbucks", b"chic"], &[1], &index).gated_names(), 0);
-        assert_eq!(build(&name_fst, &area_fst, &offsets, &areas,
-            &[b"starbucks", b"chicago"], &[], &index).gated_names(), 0);
+        assert_eq!(
+            build(
+                &name_fst,
+                &area_fst,
+                &offsets,
+                &areas,
+                &[b"starbucks", b"chicago"],
+                &[1],
+                &index
+            )
+            .gated_names(),
+            0
+        );
+        assert_eq!(
+            build(
+                &name_fst,
+                &area_fst,
+                &offsets,
+                &areas,
+                &[b"starbucks", b"chic"],
+                &[1],
+                &index
+            )
+            .gated_names(),
+            0
+        );
+        assert_eq!(
+            build(
+                &name_fst,
+                &area_fst,
+                &offsets,
+                &areas,
+                &[b"starbucks", b"chicago"],
+                &[],
+                &index
+            )
+            .gated_names(),
+            0
+        );
     }
 
     #[test]
