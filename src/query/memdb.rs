@@ -429,6 +429,8 @@ pub struct QueryDbView<'a> {
     archived: &'a ArchivedCypressMemDb,
     pub place_latitudes: &'a [f32],
     pub place_longitudes: &'a [f32],
+    /// Dense columns take precedence over the empty legacy rkyv column.
+    pub place_importances: &'a [f32],
     pub place_source_id_offsets: &'a [u32],
     pub place_source_id_bytes: &'a [u8],
     pub place_layer_ranks: &'a [u8],
@@ -497,6 +499,9 @@ impl MemdbData {
             place_longitudes: dense
                 .as_ref()
                 .map_or(&db.place_longitudes[..], |v| v.place_longitudes),
+            place_importances: dense
+                .as_ref()
+                .map_or(&db.place_importances[..], |v| v.place_importances),
             place_source_id_offsets: dense.as_ref().map_or(&db.place_source_id_offsets[..], |v| {
                 v.place_source_id_offsets
             }),
