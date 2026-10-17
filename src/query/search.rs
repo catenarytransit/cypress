@@ -1739,6 +1739,24 @@ pub fn search_place_ids(
                 .and_then(|n| n.parse::<usize>().ok())
                 .unwrap_or(256)
                 .clamp(32, 4096);
+            // A StringId from any retrieval path must have valid dictionary
+            // ranges before entering an optional optimization. Ignore malformed
+            // entries rather than crashing a search worker.
+            current_ids.retain(|&sid| {
+                let pos = sid as usize;
+                let (Some(&start), Some(&end)) = (
+                    db.string_name_offsets.get(pos),
+                    db.string_name_offsets.get(pos + 1),
+                ) else { return false; };
+                let (Some(&p_start), Some(&p_end)) = (
+                    db.string_to_places_offsets.get(pos),
+                    db.string_to_places_offsets.get(pos + 1),
+                ) else { return false; };
+                (start as usize) <= (end as usize)
+                    && (end as usize) <= db.string_name_bytes.len()
+                    && (p_start as usize) <= (p_end as usize)
+                    && (p_end as usize) <= db.string_to_places_data.len()
+            });
             let chosen = super::candidate_budget::select(&current_ids, budget, |sid| {
                 let pos = sid as usize;
                 let start = db.string_name_offsets[pos] as usize;
@@ -1752,14 +1770,14 @@ pub fn search_place_ids(
                     .any(|p| name.starts_with(&p.bytes));
                 let begin = db.string_to_places_offsets[pos] as usize;
                 let finish = db.string_to_places_offsets[pos + 1] as usize;
-                let mut importance = 0f32;
-                for &place_id in db.string_to_places_data[begin..finish].iter().take(32) {
-                    let p = place_id as usize;
-                    if p < place_count {
-                        importance =
-                            importance.max(place_prior_bonus(db, p) + db.place_importances[p]);
-                    }
-                }
+                // Do not dereference db's archived Vec directly: the latest
+                // compiler keeps place_importances in cypress_dense.bin.
+                let importance = super::candidate_budget::best_mapped_importance(
+                    &db.string_to_places_data[begin..finish],
+                    db.place_importances,
+                    place_count,
+                    |p| place_prior_bonus(db, p),
+                );
                 super::candidate_budget::Quality {
                     full_exact: name == query_bytes,
                     phrase_exact,
@@ -2332,19 +2350,15 @@ pub fn search_place_ids(
         // name alias for each baseline final result. A missing alias is
         // a potential recall regression, NOT proof of an altered top-K.
         if let Some(ids) = shadow_shortlist.as_ref() {
-            let mut covered = 0usize;
-            for (place_id, _) in &results {
-                // A place can also be admitted via a street/house match.
-                // This counts name aliases only, so report it as an estimate.
-                if ids.iter().any(|sid| {
-                    let ix = *sid as usize;
-                    let lo = db.string_to_places_offsets[ix] as usize;
-                    let hi = db.string_to_places_offsets[ix + 1] as usize;
-                    db.string_to_places_data[lo..hi].contains(place_id)
-                }) {
-                    covered += 1;
-                }
-            }
+            // Query baseline results against the shortlisted name mappings.
+            // Compiler place-postings are sorted, so each membership check is
+            // O(log postings) instead of a full linear scan.
+            let covered = super::candidate_budget::shadow_name_coverage(
+                ids,
+                &db.string_to_places_offsets,
+                db.string_to_places_data,
+                results.iter().map(|(place_id, _)| *place_id),
+            );
             debug!(target: "cypress::query::timing",
                 baseline_topk = results.len(), covered,
                 potentially_missing = results.len()-covered,
