@@ -11,7 +11,11 @@
 use std::cmp::Ordering;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ShortlistMode { Off, Shadow, On }
+pub enum ShortlistMode {
+    Off,
+    Shadow,
+    On,
+}
 
 impl ShortlistMode {
     pub fn from_env(value: &str) -> Self {
@@ -40,7 +44,8 @@ pub struct Quality {
 }
 impl Quality {
     pub fn compare(&self, other: &Self) -> Ordering {
-        self.full_exact.cmp(&other.full_exact)
+        self.full_exact
+            .cmp(&other.full_exact)
             .then(self.phrase_exact.cmp(&other.phrase_exact))
             .then(self.full_prefix.cmp(&other.full_prefix))
             .then(self.multiword_prefix.cmp(&other.multiword_prefix))
@@ -60,49 +65,64 @@ pub fn select(
     budget: usize,
     mut quality: impl FnMut(u32) -> Quality,
 ) -> Selection {
-    let mut ranked: Vec<(u32, Quality)> =
-        candidates.iter().copied().map(|id| (id, quality(id))).collect();
-    ranked.sort_unstable_by(|(a,qa),(b,qb)| qb.compare(qa).then(a.cmp(b)));
+    let mut ranked: Vec<(u32, Quality)> = candidates
+        .iter()
+        .copied()
+        .map(|id| (id, quality(id)))
+        .collect();
+    ranked.sort_unstable_by(|(a, qa), (b, qb)| qb.compare(qa).then(a.cmp(b)));
     // Preserve every exact name/phrase regardless of the ordinary budget;
     // this is essential for ambiguous languages and duplicate locality names.
-    let exact_retained = ranked.iter()
+    let exact_retained = ranked
+        .iter()
         .take_while(|(_, q)| q.phrase_exact || q.full_exact)
         .count();
     let retain = budget.max(exact_retained).min(ranked.len());
-    let mut ids: Vec<u32> = ranked.iter().take(retain).map(|&(id,_)| id).collect();
+    let mut ids: Vec<u32> = ranked.iter().take(retain).map(|&(id, _)| id).collect();
     ids.sort_unstable();
     ids.dedup();
-    Selection { ids, exact_retained, candidates_before: candidates.len() }
+    Selection {
+        ids,
+        exact_retained,
+        candidates_before: candidates.len(),
+    }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
     fn q(phrase: bool, priority: f32) -> Quality {
-        Quality {full_exact: false,phrase_exact: phrase,multiword_prefix: false,
-                 full_prefix: false,importance:priority,bytes:10}
+        Quality {
+            full_exact: false,
+            phrase_exact: phrase,
+            multiword_prefix: false,
+            full_prefix: false,
+            importance: priority,
+            bytes: 10,
+        }
     }
     #[test]
     fn exact_hits_cannot_be_evicted_by_common_prefixes() {
-        let items=[0,1,2,3,4];
-        let s=select(&items, 2, |id| match id {
-            3|4=>q(true, 0.), _=>q(false,1000.)
+        let items = [0, 1, 2, 3, 4];
+        let s = select(&items, 2, |id| match id {
+            3 | 4 => q(true, 0.),
+            _ => q(false, 1000.),
         });
-        assert_eq!(s.ids, vec![3,4]);
-        assert_eq!(s.exact_retained,2);
+        assert_eq!(s.ids, vec![3, 4]);
+        assert_eq!(s.exact_retained, 2);
     }
     #[test]
     fn exact_matches_can_exceed_budget() {
-        let s=select(&[5,3,1],1,|_| q(true, 0.));
-        assert_eq!(s.ids,vec![1,3,5]);
+        let s = select(&[5, 3, 1], 1, |_| q(true, 0.));
+        assert_eq!(s.ids, vec![1, 3, 5]);
     }
     #[test]
     fn cheap_importance_sort_is_stable() {
-        let s=select(&[11,12,13],1, |id| q(false,id as f32));
-        assert_eq!(s.ids,vec![13]);
+        let s = select(&[11, 12, 13], 1, |id| q(false, id as f32));
+        assert_eq!(s.ids, vec![13]);
     }
     #[test]
     fn mode_default_is_safe() {
-        assert_eq!(ShortlistMode::from_env(""),ShortlistMode::Off);
-        assert_eq!(ShortlistMode::from_env("shadow"),ShortlistMode::Shadow);
+        assert_eq!(ShortlistMode::from_env(""), ShortlistMode::Off);
+        assert_eq!(ShortlistMode::from_env("shadow"), ShortlistMode::Shadow);
     }
 }

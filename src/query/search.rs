@@ -1724,49 +1724,51 @@ pub fn search_place_ids(
         // compares against the final ranked place IDs, without changing results.
         let shortlist_mode = super::candidate_budget::ShortlistMode::from_env(
             std::env::var("CYPRESS_CANDIDATE_SHORTLIST")
-                .unwrap_or_default().as_str()
+                .unwrap_or_default()
+                .as_str(),
         );
         let mut shadow_shortlist = None::<Vec<u32>>;
         if shortlist_mode != super::candidate_budget::ShortlistMode::Off {
             let query_bytes = query.as_bytes();
-            let mut current_ids: Vec<u32> = ctx.string_matches.iter()
-                .map(|m| m.string_idx).collect();
+            let mut current_ids: Vec<u32> =
+                ctx.string_matches.iter().map(|m| m.string_idx).collect();
             current_ids.sort_unstable();
             current_ids.dedup();
             let budget: usize = std::env::var("CYPRESS_CANDIDATE_BUDGET")
-                .ok().and_then(|n| n.parse::<usize>().ok())
-                .unwrap_or(256).clamp(32, 4096);
-            let chosen = super::candidate_budget::select(
-                &current_ids, budget, |sid| {
-                    let pos = sid as usize;
-                    let start = db.string_name_offsets[pos] as usize;
-                    let end = db.string_name_offsets[pos + 1] as usize;
-                    let name = &db.string_name_bytes[start..end];
-                    let phrase_exact = phrases.iter()
-                        .any(|p| p.bytes.as_slice() == name);
-                    let full_prefix = name.starts_with(query_bytes);
-                    let multiword_prefix = phrases.iter()
-                        .filter(|p| p.mask.count_ones() > 1)
-                        .any(|p| name.starts_with(&p.bytes));
-                    let begin = db.string_to_places_offsets[pos] as usize;
-                    let finish = db.string_to_places_offsets[pos + 1] as usize;
-                    let mut importance = 0f32;
-                    for &place_id in db.string_to_places_data[begin..finish]
-                        .iter().take(32)
-                    {
-                        let p = place_id as usize;
-                        if p < place_count {
-                            importance = importance.max(place_prior_bonus(db,p)
-                                + db.place_importances[p]);
-                        }
-                    }
-                    super::candidate_budget::Quality {
-                        full_exact: name == query_bytes,
-                        phrase_exact, multiword_prefix, full_prefix,
-                        importance, bytes: name.len()
+                .ok()
+                .and_then(|n| n.parse::<usize>().ok())
+                .unwrap_or(256)
+                .clamp(32, 4096);
+            let chosen = super::candidate_budget::select(&current_ids, budget, |sid| {
+                let pos = sid as usize;
+                let start = db.string_name_offsets[pos] as usize;
+                let end = db.string_name_offsets[pos + 1] as usize;
+                let name = &db.string_name_bytes[start..end];
+                let phrase_exact = phrases.iter().any(|p| p.bytes.as_slice() == name);
+                let full_prefix = name.starts_with(query_bytes);
+                let multiword_prefix = phrases
+                    .iter()
+                    .filter(|p| p.mask.count_ones() > 1)
+                    .any(|p| name.starts_with(&p.bytes));
+                let begin = db.string_to_places_offsets[pos] as usize;
+                let finish = db.string_to_places_offsets[pos + 1] as usize;
+                let mut importance = 0f32;
+                for &place_id in db.string_to_places_data[begin..finish].iter().take(32) {
+                    let p = place_id as usize;
+                    if p < place_count {
+                        importance =
+                            importance.max(place_prior_bonus(db, p) + db.place_importances[p]);
                     }
                 }
-            );
+                super::candidate_budget::Quality {
+                    full_exact: name == query_bytes,
+                    phrase_exact,
+                    multiword_prefix,
+                    full_prefix,
+                    importance,
+                    bytes: name.len(),
+                }
+            });
             debug!(
                 target: "cypress::query::timing",
                 mode = ?shortlist_mode,
@@ -1777,9 +1779,8 @@ pub fn search_place_ids(
                 "experimental ranked shortlist"
             );
             if shortlist_mode == super::candidate_budget::ShortlistMode::On {
-                ctx.string_matches.retain(|m|
-                    chosen.ids.binary_search(&m.string_idx).is_ok()
-                );
+                ctx.string_matches
+                    .retain(|m| chosen.ids.binary_search(&m.string_idx).is_ok());
             } else {
                 shadow_shortlist = Some(chosen.ids);
             }
@@ -2338,9 +2339,11 @@ pub fn search_place_ids(
                 if ids.iter().any(|sid| {
                     let ix = *sid as usize;
                     let lo = db.string_to_places_offsets[ix] as usize;
-                    let hi = db.string_to_places_offsets[ix+1] as usize;
+                    let hi = db.string_to_places_offsets[ix + 1] as usize;
                     db.string_to_places_data[lo..hi].contains(place_id)
-                }) { covered += 1; }
+                }) {
+                    covered += 1;
+                }
             }
             debug!(target: "cypress::query::timing",
                 baseline_topk = results.len(), covered,
