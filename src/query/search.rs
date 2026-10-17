@@ -2355,7 +2355,7 @@ pub fn search_place_ids(
             // O(log postings) instead of a full linear scan.
             let covered = super::candidate_budget::shadow_name_coverage(
                 ids,
-                &db.string_to_places_offsets,
+                &db.string_to_places_offsets[..],
                 db.string_to_places_data,
                 results.iter().map(|(place_id, _)| *place_id),
             );
