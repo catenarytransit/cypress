@@ -184,10 +184,7 @@ mod tests {
     #[test]
     fn old_or_missing_importance_column_never_panics() {
         let legacy = [0.5, 1.5, 2.5];
-        assert_eq!(
-            best_mapped_importance(&[0, 2], &legacy, 3, |_| 5.0),
-            7.5
-        );
+        assert_eq!(best_mapped_importance(&[0, 2], &legacy, 3, |_| 5.0), 7.5);
         // Defensive fallback covers malformed/missing vectors, even though
         // valid compiled generations have a full importance column.
         assert_eq!(
@@ -210,14 +207,8 @@ mod tests {
             shadow_name_coverage(&[0, 999], &offsets, &postings, [7, 8]),
             1
         );
-        assert_eq!(
-            shadow_name_coverage(&[1], &offsets, &postings, [3, 8]),
-            1
-        );
-        assert_eq!(
-            shadow_name_coverage(&[], &offsets, &postings, [3, 8]),
-            0
-        );
+        assert_eq!(shadow_name_coverage(&[1], &offsets, &postings, [3, 8]), 1);
+        assert_eq!(shadow_name_coverage(&[], &offsets, &postings, [3, 8]), 0);
     }
 
     #[test]

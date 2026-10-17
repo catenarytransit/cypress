@@ -32,6 +32,7 @@ use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 use cypress::scylla::ScyllaClient;
 
+mod area_fanout;
 mod candidate_budget;
 mod cpu;
 mod field_aware;

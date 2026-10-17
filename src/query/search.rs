@@ -1747,11 +1747,15 @@ pub fn search_place_ids(
                 let (Some(&start), Some(&end)) = (
                     db.string_name_offsets.get(pos),
                     db.string_name_offsets.get(pos + 1),
-                ) else { return false; };
+                ) else {
+                    return false;
+                };
                 let (Some(&p_start), Some(&p_end)) = (
                     db.string_to_places_offsets.get(pos),
                     db.string_to_places_offsets.get(pos + 1),
-                ) else { return false; };
+                ) else {
+                    return false;
+                };
                 (start as usize) <= (end as usize)
                     && (end as usize) <= db.string_name_bytes.len()
                     && (p_start as usize) <= (p_end as usize)
@@ -1834,6 +1838,36 @@ pub fn search_place_ids(
             .map(|m| (m.string_idx, m.cos_sim))
             .collect();
 
+        // Exact name + area evidence can prevent worldwide brand names from
+        // expanding into thousands of unrelated place scoring candidates.
+        // Independent of token conjunction success and shortlist mode.
+        let area_gate_mode = super::area_fanout::Mode::from_env(
+            std::env::var("CYPRESS_AREA_FANOUT")
+                .unwrap_or_default()
+                .as_str(),
+        );
+        let mut area_gate_plan = if area_gate_mode != super::area_fanout::Mode::Off {
+            if let (Some(name_fst), Some(area_fst)) =
+                (prefix_fst.as_ref(), admin_alias_fst.as_ref())
+            {
+                let selected: Vec<u32> = match_snapshot.iter().map(|m| m.0).collect();
+                super::area_fanout::build(
+                    name_fst,
+                    area_fst,
+                    &db.admin_alias_area_offsets[..],
+                    &db.admin_alias_area_data[..],
+                    &query_tokens,
+                    &selected,
+                    &join_index,
+                )
+            } else {
+                super::area_fanout::Plan::default()
+            }
+        } else {
+            super::area_fanout::Plan::default()
+        };
+        let mut area_gate_checked = 0usize;
+        let mut area_gate_rejected = 0usize;
         let mut name_evidence = Vec::<NameEvidence>::new();
         let mut street_evidence = Vec::<StreetEvidence>::new();
         let mut component_options = Vec::<ComponentMatchOption>::with_capacity(36);
@@ -1891,6 +1925,19 @@ pub fn search_place_ids(
                 let place_idx = place_id as usize;
                 if place_idx >= place_count {
                     continue;
+                }
+
+                if let Some(&area_set) = db.place_area_sets.get(place_idx) {
+                    if let Some(in_area) = area_gate_plan.check(*string_idx, area_set, &join_index)
+                    {
+                        area_gate_checked += 1;
+                        if !in_area {
+                            area_gate_rejected += 1;
+                            if area_gate_mode == super::area_fanout::Mode::On {
+                                continue;
+                            }
+                        }
+                    }
                 }
 
                 for option in &component_options {
@@ -1996,6 +2043,18 @@ pub fn search_place_ids(
                     }
                 }
             }
+        }
+        if area_gate_mode != super::area_fanout::Mode::Off {
+            debug!(
+                target: "cypress::query::timing",
+                mode = ?area_gate_mode,
+                exact_name_area_interpretations = area_gate_plan.interpretations,
+                gated_name_strings = area_gate_plan.gated_names(),
+                preflight_place_links = area_gate_plan.preflight_links,
+                checked_place_links = area_gate_checked,
+                would_reject_place_links = area_gate_rejected,
+                "area-aware place fanout plan"
+            );
         }
         log_phase_timing("search_place_ids", "sift4_rescore_places", phase_started);
         let first_pass_sift4_calls = sift4_guard.count() - sift4_first_pass_before;
