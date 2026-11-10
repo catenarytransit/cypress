@@ -105,6 +105,10 @@ impl<'a> SpatialGridView<'a> {
         Ok(grid)
     }
 
+    pub fn cells(&self) -> impl Iterator<Item = u32> + '_ {
+        (0..self.cell_count).map(|i| at(self.cells, i))
+    }
+
     pub fn cell_places(&self, wanted: u32) -> Option<SpatialPlaceIter<'a>> {
         let mut low = 0;
         let mut high = self.cell_count;

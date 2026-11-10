@@ -37,6 +37,7 @@ mod candidate_budget;
 mod cpu;
 mod field_aware;
 mod memdb;
+mod reverse;
 mod search;
 mod token_retrieval;
 use cpu::{SearchCpu, SearchCpuError};
@@ -328,6 +329,8 @@ async fn reverse_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ReverseQueryParams>,
 ) -> Result<Json<SearchResponse>, (StatusCode, String)> {
+    params.validate()?;
+    let started = std::time::Instant::now();
     let _admission = admit(&state)?;
     let results = search::execute_reverse(
         &state.scylla_client,
@@ -349,7 +352,7 @@ async fn reverse_handler(
 
     Ok(Json(SearchResponse {
         features: results,
-        took_ms: 0,
+        took_ms: started.elapsed().as_millis(),
     }))
 }
 
@@ -358,6 +361,8 @@ async fn reverse_v2_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ReverseQueryParams>,
 ) -> Result<Json<SearchResponseV2>, (StatusCode, String)> {
+    params.validate()?;
+    let started = std::time::Instant::now();
     let _admission = admit(&state)?;
     let results = search::execute_reverse_v2(
         &state.scylla_client,
@@ -380,7 +385,7 @@ async fn reverse_v2_handler(
 
     Ok(Json(SearchResponseV2 {
         features: results,
-        took_ms: 0,
+        took_ms: started.elapsed().as_millis(),
     }))
 }
 
@@ -458,10 +463,10 @@ struct SearchQueryParams {
 #[derive(Deserialize)]
 struct ReverseQueryParams {
     /// Point longitude
-    #[serde(rename = "point.lon")]
+    #[serde(rename = "lon", alias = "point.lon")]
     point_lon: f64,
     /// Point latitude
-    #[serde(rename = "point.lat")]
+    #[serde(rename = "lat", alias = "point.lat")]
     point_lat: f64,
     /// Preferred language for results
     lang: Option<String>,
@@ -493,4 +498,53 @@ fn parse_bbox(bbox: &Option<String>) -> Option<[f64; 4]> {
             None
         }
     })
+}
+
+impl ReverseQueryParams {
+    fn validate(&self) -> Result<(), (StatusCode, String)> {
+        if !self.point_lat.is_finite()
+            || !self.point_lon.is_finite()
+            || !(-90.0..=90.0).contains(&self.point_lat)
+            || !(-180.0..=180.0).contains(&self.point_lon)
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "lat must be finite and within [-90, 90]; lon within [-180, 180]".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod reverse_parameter_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_short_and_legacy_parameters() {
+        for query in ["lat=47.37&lon=8.54", "point.lat=47.37&point.lon=8.54"] {
+            let uri = format!("/v2/reverse?{query}").parse().unwrap();
+            let Query(params) = Query::<ReverseQueryParams>::try_from_uri(&uri).unwrap();
+            params.validate().unwrap();
+            assert_eq!((params.point_lat, params.point_lon), (47.37, 8.54));
+        }
+    }
+
+    #[test]
+    fn rejects_missing_duplicate_and_invalid_coordinates() {
+        for query in ["lat=1", "lon=1", "lat=1&point.lat=2&lon=1", "lat=abc&lon=1"] {
+            let uri = format!("/v1/reverse?{query}").parse().unwrap();
+            assert!(Query::<ReverseQueryParams>::try_from_uri(&uri).is_err());
+        }
+        for query in [
+            "lat=91&lon=0",
+            "lat=0&lon=-181",
+            "lat=NaN&lon=1",
+            "lat=1&lon=inf",
+        ] {
+            let uri = format!("/v1/reverse?{query}").parse().unwrap();
+            let Query(params) = Query::<ReverseQueryParams>::try_from_uri(&uri).unwrap();
+            assert_eq!(params.validate().unwrap_err().0, StatusCode::BAD_REQUEST);
+        }
+    }
 }
