@@ -419,6 +419,7 @@ pub struct MemdbData {
     pub places_mmap: Mmap,
     pub token_mmap: Option<Mmap>,
     pub grid_mmap: Option<Mmap>,
+    pub reverse_tree: rstar::RTree<super::reverse::Cell>,
     pub bigram_mmap: Option<Mmap>,
     pub version: String,
 }
@@ -724,12 +725,27 @@ impl Memdb {
             );
             None
         };
+        let cells: Vec<_> = if let Some(mmap) = &grid_mmap {
+            SpatialGridView::from_validated(mmap)?
+                .cells()
+                .map(super::reverse::Cell::new)
+                .collect()
+        } else {
+            db.active_cells
+                .iter()
+                .copied()
+                .map(super::reverse::Cell::new)
+                .collect()
+        };
+        let reverse_tree = rstar::RTree::bulk_load(cells);
+        info!(cells = reverse_tree.size(), "Built reverse cell R-tree");
         Ok(MemdbData {
             index_mmap,
             dense_mmap,
             places_mmap,
             token_mmap,
             grid_mmap,
+            reverse_tree,
             bigram_mmap,
             version,
         })

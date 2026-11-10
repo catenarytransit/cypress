@@ -161,8 +161,27 @@ curl "http://localhost:3000/v1/search?text=restaurant&focus.point.lat=47.37&focu
 ### Reverse Geocoding
 
 ```bash
-curl "http://localhost:3000/v1/reverse?point.lat=47.37&point.lon=8.54"
+curl "http://localhost:3000/v1/reverse?lat=47.37&lon=8.54"
+curl "http://localhost:3000/v2/reverse?lat=47.37&lon=8.54&size=10&lang=de"
 ```
+
+Both versions accept `lat` and `lon`; the legacy `point.lat` and `point.lon`
+names remain aliases. Coordinates must be finite, with latitude in [-90, 90]
+and longitude in [-180, 180]; invalid values return HTTP 400. Results are the
+nearest `size` places within 1 km (default 10, maximum 40). `took_ms` includes
+CPU queueing, spatial lookup, database hydration, and response construction.
+
+Reverse lookup bulk-loads an R-tree of occupied grid cells once per generation,
+including hot reloads. The tree uses conservative 3D unit-sphere bounds, so it
+also handles the date line and poles. Nearest-first traversal stops when no
+unvisited cell can improve the bounded result heap. Coordinates and cell
+postings remain memory mapped; heap/sort work is bounded by the result limit.
+The resident tree adds memory proportional to occupied cells, not place count,
+and temporarily overlaps with the previous generation during a hot reload.
+No compiler rebuild is needed for existing compiled datasets. Dense individual
+cells still require scanning their postings, and Scylla hydration remains a
+separate source of latency.
+
 
 ### Autocomplete
 

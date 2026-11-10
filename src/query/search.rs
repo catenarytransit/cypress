@@ -10,7 +10,6 @@ use std::sync::OnceLock;
 use std::time::Instant;
 use tracing::{debug, warn};
 
-use cypress::models::memdb::CypressMemDb;
 use cypress::models::normalized::NormalizedPlace;
 use cypress::models::place::Layer;
 use cypress::models::sift4::Sift4CountGuard;
@@ -2500,105 +2499,7 @@ fn bigram_search(
     results
 }
 
-/// Use the spatial grid for reverse geocoding — find places near a coordinate.
-fn spatial_search_place_ids(
-    memdb: &Memdb,
-    lon: f64,
-    lat: f64,
-    max_results: usize,
-    radius_km: f64,
-) -> Vec<(u32, f64)> {
-    let total_started = Instant::now();
-    debug!(
-        target: "cypress::query::timing",
-        op = "spatial_search_place_ids",
-        lon,
-        lat,
-        max_results,
-        radius_km,
-        "reverse search start"
-    );
-
-    let memdb_data = memdb.get_data();
-    let db = &memdb_data.get_view();
-
-    let delta_deg = (radius_km / 111.0) as f32;
-    let min_lat = (lat as f32 - delta_deg).max(-90.0);
-    let max_lat = (lat as f32 + delta_deg).min(89.999);
-    let min_lon = (lon as f32 - delta_deg).max(-180.0);
-    let max_lon = (lon as f32 + delta_deg).min(179.999);
-
-    let cell_size = CypressMemDb::GRID_CELL_SIZE;
-    let cols = CypressMemDb::GRID_COLS;
-
-    let row_start = ((min_lat + 90.0) / cell_size) as usize;
-    let row_end = ((max_lat + 90.0) / cell_size) as usize;
-    let col_start = ((min_lon + 180.0) / cell_size) as usize;
-    let col_end = ((max_lon + 180.0) / cell_size) as usize;
-
-    debug!(
-        target: "cypress::query::timing",
-        op = "spatial_search_place_ids",
-        row_start,
-        row_end,
-        col_start,
-        col_end,
-        "grid bounds"
-    );
-
-    let phase_started = Instant::now();
-    let mut candidates: Vec<(u32, f64)> = Vec::new();
-
-    let grid = memdb_data.grid_mmap.as_ref().map(|mmap| {
-        cypress::models::spatial_grid::SpatialGridView::from_validated(mmap)
-            .expect("spatial grid validated during generation load")
-    });
-    for row in row_start..=row_end {
-        for col in col_start..=col_end {
-            let cell_id = (row * cols + col) as u32;
-            let ids: Box<dyn Iterator<Item = u32> + '_> = if let Some(grid) = &grid {
-                match grid.cell_places(cell_id) {
-                    Some(places) => Box::new(places),
-                    None => continue,
-                }
-            } else if let Ok(pos) = db.active_cells.binary_search_by(|c| c.cmp(&cell_id)) {
-                let start = db.cell_offsets[pos] as usize;
-                let end = db.cell_offsets[pos + 1] as usize;
-                Box::new(db.cell_places[start..end].iter().copied())
-            } else {
-                continue;
-            };
-            for place_id in ids {
-                let place_idx = place_id as usize;
-                if place_idx >= db.place_latitudes.len() {
-                    continue;
-                }
-
-                let place_lat = db.place_latitudes[place_idx] as f64;
-                let place_lon = db.place_longitudes[place_idx] as f64;
-
-                let dist = haversine_distance_km((lat, lon), (place_lat, place_lon));
-                if dist <= radius_km {
-                    candidates.push((place_id, dist));
-                }
-            }
-        }
-    }
-    log_phase_timing("spatial_search_place_ids", "scan_grid_cells", phase_started);
-
-    let phase_started = Instant::now();
-    candidates.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-    candidates.truncate(max_results);
-    log_phase_timing(
-        "spatial_search_place_ids",
-        "sort_and_truncate",
-        phase_started,
-    );
-    log_total_timing("spatial_search_place_ids", total_started, candidates.len());
-    candidates
-}
-
-/// Use the spatial grid for reverse geocoding — find places near a coordinate.
+/// Resolve IDs against the same generation used for spatial lookup.
 fn spatial_search(
     memdb: &Memdb,
     lon: f64,
@@ -2606,26 +2507,48 @@ fn spatial_search(
     max_results: usize,
     radius_km: f64,
 ) -> Vec<(String, f64)> {
-    let total_started = Instant::now();
-
-    let phase_started = Instant::now();
-    let nearby = spatial_search_place_ids(memdb, lon, lat, max_results, radius_km);
-    log_phase_timing("spatial_search", "spatial_search_place_ids", phase_started);
-
-    let memdb_data = memdb.get_data();
-
-    let phase_started = Instant::now();
-    let mut resolved = Vec::with_capacity(nearby.len());
-    for (place_id, dist) in nearby {
-        let Some(source_id) = memdb_data.get_place_source_id(place_id as usize) else {
-            continue;
-        };
-        resolved.push((source_id, dist));
-    }
-    log_phase_timing("spatial_search", "resolve_source_ids", phase_started);
-    log_total_timing("spatial_search", total_started, resolved.len());
-
-    resolved
+    let data = memdb.get_data();
+    let db = data.get_view();
+    let grid = data.grid_mmap.as_ref().map(|m| {
+        cypress::models::spatial_grid::SpatialGridView::from_validated(m)
+            .expect("grid validated at load")
+    });
+    super::reverse::nearest(
+        &data.reverse_tree,
+        lat,
+        lon,
+        max_results,
+        radius_km,
+        |cell, emit| {
+            let mut visit = |id: u32| {
+                if let (Some(&lat), Some(&lon)) = (
+                    db.place_latitudes.get(id as usize),
+                    db.place_longitudes.get(id as usize),
+                ) {
+                    emit(id, lat as f64, lon as f64);
+                }
+            };
+            if let Some(grid) = &grid {
+                if let Some(ids) = grid.cell_places(cell) {
+                    for id in ids {
+                        visit(id);
+                    }
+                }
+            } else if let Ok(pos) = db.active_cells.binary_search(&cell) {
+                for &id in &db.cell_places
+                    [db.cell_offsets[pos] as usize..db.cell_offsets[pos + 1] as usize]
+                {
+                    visit(id);
+                }
+            }
+        },
+    )
+    .into_iter()
+    .filter_map(|(id, distance)| {
+        data.get_place_source_id(id as usize)
+            .map(|source| (source, distance))
+    })
+    .collect()
 }
 
 pub async fn execute_search(
