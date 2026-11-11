@@ -13,6 +13,11 @@ on:
         required: false
         default: '11'
         type: string
+      scylla_memory_mib:
+        description: 'Scylla memory in MiB (1536 default; increase only on larger runners)'
+        required: false
+        default: '1536'
+        type: string
 
 permissions:
   contents: read
@@ -30,6 +35,7 @@ jobs:
       CARGO_BUILD_JOBS: '2'
       CARGO_INCREMENTAL: '0'
       BENCHMARK_CYCLES: ${{ inputs.cycles || '11' }}
+      BENCHMARK_SCYLLA_MEMORY_MIB: ${{ inputs.scylla_memory_mib || '1536' }}
     steps:
       - name: Checkout experimental branch
         uses: actions/checkout@v4
@@ -46,6 +52,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y osmium-tool curl
+
+      - name: Validate benchmark files and scripts
+        shell: bash
+        run: |
+          if [[ ! -f benchmarks/switzerland_ab/run.sh ]]; then
+            echo "::error::Select branch bench/switzerland-open-geocode-ab in Run workflow."
+            exit 1
+          fi
+          bash -n benchmarks/switzerland_ab/run.sh
+          python3 -m py_compile benchmarks/switzerland_ab/compare.py
 
       - name: Compare pinned main and experiment on identical Switzerland data
         shell: bash
