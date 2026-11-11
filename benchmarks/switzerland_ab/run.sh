@@ -5,6 +5,9 @@ ROOT="$(pwd)"
 DATA="$ROOT/.swiss-ab-data"
 RESULTS="$ROOT/benchmark_results/switzerland_ab"
 mkdir -p "$DATA" "$RESULTS" "$DATA/compiled" "$DATA/tmp"
+# Share Cargo dependencies between the pinned-main and experimental worktrees
+# to keep two release builds within the standard public runner disk budget.
+export CARGO_TARGET_DIR="$DATA/cargo-target"
 exec > >(tee -a "$RESULTS/run.log") 2>&1
 
 echo "Baseline: cypress/main at workflow start"
@@ -38,21 +41,21 @@ fi
 # need the database. This avoids Rust builds competing with Scylla on CI.
 echo "Building control from pinned main SHA $BASE_SHA"
 ( cd "$DATA/main" && cargo build --locked --release --bin ingest --bin compiler --bin query )
-cp "$DATA/main/target/release/query" "$DATA/main-query"
-cp "$DATA/main/target/release/ingest" "$DATA/main-ingest"
-cp "$DATA/main/target/release/compiler" "$DATA/main-compiler"
+cp "$CARGO_TARGET_DIR/release/query" "$DATA/main-query"
+cp "$CARGO_TARGET_DIR/release/ingest" "$DATA/main-ingest"
+cp "$CARGO_TARGET_DIR/release/compiler" "$DATA/main-compiler"
 echo "Building experimental query binary"
 cargo build --locked --release --bin query
-cp target/release/query "$DATA/experimental-query"
+cp "$CARGO_TARGET_DIR/release/query" "$DATA/experimental-query"
 
 # Dedicated, disposable Scylla instance. Never point fixture ingest at production.
 # Seastar subtracts a default OS reservation (at least ~1.5 GiB) from the
 # *container* memory limit before checking the configured --memory heap.
 # A 2 GiB Docker cap and --memory 1536M therefore left only 500 MB usable,
-# even on a runner with 14 GiB available. Keep an additional 1 GiB of headroom
-# beyond that reservation; for 1536 MiB Scylla this yields a 4 GiB Docker cap.
-# Larger dedicated runners can override BENCHMARK_SCYLLA_MEMORY_MIB.
-SCYLLA_MEMORY_MIB="${BENCHMARK_SCYLLA_MEMORY_MIB:-1536}"
+# even on a runner with 14 GiB available. The public ubuntu-latest runner has
+# 16 GiB RAM, so use 3072 MiB for Scylla and a 5632 MiB Docker cap by default.
+# This leaves memory for the import/compiler/query processes outside Docker.
+SCYLLA_MEMORY_MIB="${BENCHMARK_SCYLLA_MEMORY_MIB:-3072}"
 if [[ ! "$SCYLLA_MEMORY_MIB" =~ ^[0-9]+$ ]] || (( SCYLLA_MEMORY_MIB < 1024 )); then
   echo "BENCHMARK_SCYLLA_MEMORY_MIB must be an integer >= 1024" >&2
   exit 1
@@ -62,12 +65,13 @@ fi
 SCYLLA_SEASTAR_RESERVE_MIB=1536
 SCYLLA_CONTAINER_HEADROOM_MIB=1024
 SCYLLA_DOCKER_LIMIT_MIB=$(( SCYLLA_MEMORY_MIB + SCYLLA_SEASTAR_RESERVE_MIB + SCYLLA_CONTAINER_HEADROOM_MIB ))
-echo "Scylla: ${SCYLLA_MEMORY_MIB} MiB heap, ${SCYLLA_DOCKER_LIMIT_MIB} MiB Docker limit, 1 shard"
+echo "Scylla: ${SCYLLA_MEMORY_MIB} MiB heap, ${SCYLLA_DOCKER_LIMIT_MIB} MiB Docker limit, 2 shards"
 echo "Including ${SCYLLA_SEASTAR_RESERVE_MIB} MiB Seastar OS reserve and ${SCYLLA_CONTAINER_HEADROOM_MIB} MiB headroom."
 free -h || true
+df -h "$ROOT" || true
 docker run -d --name cypress-swiss-ab-scylla --memory="${SCYLLA_DOCKER_LIMIT_MIB}m" \
   -p 127.0.0.1:9042:9042 scylladb/scylla:5.4 \
-  --smp 1 --memory "${SCYLLA_MEMORY_MIB}M" --overprovisioned 1
+  --smp 2 --memory "${SCYLLA_MEMORY_MIB}M" --overprovisioned 1
 
 SCYLLA_READY=false
 for i in $(seq 1 120); do
