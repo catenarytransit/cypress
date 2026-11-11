@@ -34,18 +34,8 @@ if [[ -n "${BENCHMARK_MIN_RAM_GIB:-}" ]]; then
   fi
 fi
 
-# Dedicated, disposable Scylla instance. Never point the fixture ingest at production.
-docker run -d --name cypress-swiss-ab-scylla --memory=4g \
-  -p 127.0.0.1:9042:9042 scylladb/scylla:5.4 \
-  --smp 2 --memory 3G --overprovisioned 1
-for i in $(seq 1 120); do
-  if docker exec cypress-swiss-ab-scylla cqlsh -e 'DESCRIBE KEYSPACES' >/dev/null 2>&1; then
-    break
-  fi
-  if (( i == 120 )); then docker logs cypress-swiss-ab-scylla; exit 1; fi
-  sleep 5
-done
-
+# Build the binaries before Scylla reserves memory; only ingest and query
+# need the database. This avoids Rust builds competing with Scylla on CI.
 echo "Building control from pinned main SHA $BASE_SHA"
 ( cd "$DATA/main" && cargo build --locked --release --bin ingest --bin compiler --bin query )
 cp "$DATA/main/target/release/query" "$DATA/main-query"
@@ -55,6 +45,44 @@ echo "Building experimental query binary"
 cargo build --locked --release --bin query
 cp target/release/query "$DATA/experimental-query"
 
+# Dedicated, disposable Scylla instance. Never point fixture ingest at production.
+# GitHub's standard runner may have <3 GiB available after checkout/filtering.
+# Scylla's --memory reserves its own heap; asking for 3G caused Seastar startup
+# to fail before any benchmark query could run. Keep the default modest and
+# allow larger dedicated runners to override it.
+SCYLLA_MEMORY_MIB="${BENCHMARK_SCYLLA_MEMORY_MIB:-1536}"
+if [[ ! "$SCYLLA_MEMORY_MIB" =~ ^[0-9]+$ ]] || (( SCYLLA_MEMORY_MIB < 1024 )); then
+  echo "BENCHMARK_SCYLLA_MEMORY_MIB must be an integer >= 1024" >&2
+  exit 1
+fi
+SCYLLA_DOCKER_LIMIT_MIB=$(( SCYLLA_MEMORY_MIB + 512 ))
+echo "Scylla: ${SCYLLA_MEMORY_MIB} MiB heap, ${SCYLLA_DOCKER_LIMIT_MIB} MiB Docker limit, 1 shard"
+free -h || true
+docker run -d --name cypress-swiss-ab-scylla --memory="${SCYLLA_DOCKER_LIMIT_MIB}m" \
+  -p 127.0.0.1:9042:9042 scylladb/scylla:5.4 \
+  --smp 1 --memory "${SCYLLA_MEMORY_MIB}M" --overprovisioned 1
+
+SCYLLA_READY=false
+for i in $(seq 1 120); do
+  if docker exec cypress-swiss-ab-scylla cqlsh -e 'DESCRIBE KEYSPACES' >/dev/null 2>&1; then
+    SCYLLA_READY=true
+    break
+  fi
+  if docker logs cypress-swiss-ab-scylla 2>&1 | grep -Eq 'insufficient physical memory|gave up: scylla entered FATAL state'; then
+    echo "Scylla failed to start due to resource constraints." >&2
+    echo "Try a larger runner or BENCHMARK_SCYLLA_MEMORY_MIB=1024." >&2
+    docker logs --tail 100 cypress-swiss-ab-scylla
+    exit 1
+  fi
+  sleep 5
+done
+if [[ "$SCYLLA_READY" != true ]]; then
+  echo "Scylla did not become CQL-ready within 10 minutes" >&2
+  docker logs --tail 100 cypress-swiss-ab-scylla
+  exit 1
+fi
+
+
 echo "Importing Switzerland once from identical unfiltered-source subset"
 time "$DATA/main-ingest" single \
   --file "$DATA/switzerland-filtered.osm.pbf" \
@@ -63,7 +91,7 @@ time "$DATA/main-ingest" single \
 echo "Compiling common generation with token FST/postings enabled"
 time "$DATA/main-compiler" --scylla-url 127.0.0.1 \
   --out-dir "$DATA/compiled" --tmp-dir "$DATA/tmp" \
-  --concurrency 4 --token-index
+  --concurrency "${BENCHMARK_COMPILER_CONCURRENCY:-2}" --token-index
 du -sh "$DATA/compiled" | tee "$RESULTS/index-size.txt"
 find "$DATA/compiled" -type f -printf '%P %s bytes\n' | sort > "$RESULTS/index-files.txt"
 
