@@ -1,0 +1,71 @@
+name: Switzerland Cypress retrieval A/B (main vs experimental)
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'Runner label (16+ GiB RAM recommended, 32+ GiB disk)'
+        required: false
+        default: 'ubuntu-latest'
+        type: string
+      cycles:
+        description: 'Measured cycles per query'
+        required: false
+        default: '11'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: switzerland-retrieval-ab
+  cancel-in-progress: false
+
+jobs:
+  switzerland:
+    # Use a larger dedicated runner for reliable full-country ingest + Scylla
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 360
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      BENCHMARK_CYCLES: ${{ inputs.cycles || '11' }}
+    steps:
+      - name: Checkout experimental branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install osmium and benchmark prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y osmium-tool curl
+
+      - name: Compare pinned main and experiment on identical Switzerland data
+        shell: bash
+        run: bash benchmarks/switzerland_ab/run.sh
+
+      - name: Publish A/B report to Actions summary
+        if: always()
+        shell: bash
+        run: |
+          if test -f benchmark_results/switzerland_ab/summary.md; then
+            cat benchmark_results/switzerland_ab/summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "The A/B runner did not finish. See uploaded logs." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload metrics, per-query results and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: swiss-cypress-main-vs-open-geocode-inspired
+          path: benchmark_results/switzerland_ab/
+          retention-days: 30
+          if-no-files-found: warn
