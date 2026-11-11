@@ -1426,7 +1426,7 @@ pub fn search_place_ids(
                             token_candidate_ids = Some(joined);
                         }
                     }
-                    debug!
+                    debug!(
                         target: "cypress::query::timing",
                         splits_attempted, splits_matched,
                         matching_strings = token_candidate_ids.as_ref().map_or(0, Vec::len),
