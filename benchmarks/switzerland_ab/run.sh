@@ -46,17 +46,24 @@ cargo build --locked --release --bin query
 cp target/release/query "$DATA/experimental-query"
 
 # Dedicated, disposable Scylla instance. Never point fixture ingest at production.
-# GitHub's standard runner may have <3 GiB available after checkout/filtering.
-# Scylla's --memory reserves its own heap; asking for 3G caused Seastar startup
-# to fail before any benchmark query could run. Keep the default modest and
-# allow larger dedicated runners to override it.
+# Seastar subtracts a default OS reservation (at least ~1.5 GiB) from the
+# *container* memory limit before checking the configured --memory heap.
+# A 2 GiB Docker cap and --memory 1536M therefore left only 500 MB usable,
+# even on a runner with 14 GiB available. Keep an additional 1 GiB of headroom
+# beyond that reservation; for 1536 MiB Scylla this yields a 4 GiB Docker cap.
+# Larger dedicated runners can override BENCHMARK_SCYLLA_MEMORY_MIB.
 SCYLLA_MEMORY_MIB="${BENCHMARK_SCYLLA_MEMORY_MIB:-1536}"
 if [[ ! "$SCYLLA_MEMORY_MIB" =~ ^[0-9]+$ ]] || (( SCYLLA_MEMORY_MIB < 1024 )); then
   echo "BENCHMARK_SCYLLA_MEMORY_MIB must be an integer >= 1024" >&2
   exit 1
 fi
-SCYLLA_DOCKER_LIMIT_MIB=$(( SCYLLA_MEMORY_MIB + 512 ))
+# Allow Seastar's implicit 1.5 GiB reservation plus 1 GiB operational headroom.
+# Do not equate the Docker cgroup hard limit with Seastar's requested heap.
+SCYLLA_SEASTAR_RESERVE_MIB=1536
+SCYLLA_CONTAINER_HEADROOM_MIB=1024
+SCYLLA_DOCKER_LIMIT_MIB=$(( SCYLLA_MEMORY_MIB + SCYLLA_SEASTAR_RESERVE_MIB + SCYLLA_CONTAINER_HEADROOM_MIB ))
 echo "Scylla: ${SCYLLA_MEMORY_MIB} MiB heap, ${SCYLLA_DOCKER_LIMIT_MIB} MiB Docker limit, 1 shard"
+echo "Including ${SCYLLA_SEASTAR_RESERVE_MIB} MiB Seastar OS reserve and ${SCYLLA_CONTAINER_HEADROOM_MIB} MiB headroom."
 free -h || true
 docker run -d --name cypress-swiss-ab-scylla --memory="${SCYLLA_DOCKER_LIMIT_MIB}m" \
   -p 127.0.0.1:9042:9042 scylladb/scylla:5.4 \
@@ -69,8 +76,11 @@ for i in $(seq 1 120); do
     break
   fi
   if docker logs cypress-swiss-ab-scylla 2>&1 | grep -Eq 'insufficient physical memory|gave up: scylla entered FATAL state'; then
-    echo "Scylla failed to start due to resource constraints." >&2
-    echo "Try a larger runner or BENCHMARK_SCYLLA_MEMORY_MIB=1024." >&2
+    echo "Scylla failed startup. Check Docker cgroup memory and Seastar's OS reserve." >&2
+    echo "Docker cap: ${SCYLLA_DOCKER_LIMIT_MIB} MiB; Scylla heap: ${SCYLLA_MEMORY_MIB} MiB." >&2
+    echo "Runner memory (Docker may have a separate cgroup limit):" >&2
+    free -h >&2 || true
+    docker inspect --format 'Docker memory limit: {{.HostConfig.Memory}} bytes' cypress-swiss-ab-scylla >&2 || true
     docker logs --tail 100 cypress-swiss-ab-scylla
     exit 1
   fi
