@@ -37,6 +37,7 @@ mod candidate_budget;
 mod cpu;
 mod field_aware;
 mod memdb;
+mod open_geocode_retrieval;
 mod reverse;
 mod search;
 mod token_retrieval;
