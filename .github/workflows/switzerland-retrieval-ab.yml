@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       runner:
-        description: 'Runner label (16+ GiB RAM recommended, 32+ GiB disk)'
+        description: 'Runner label (public ubuntu-latest has 16 GiB RAM)'
         required: false
         default: 'ubuntu-latest'
         type: string
@@ -14,9 +14,9 @@ on:
         default: '11'
         type: string
       scylla_memory_mib:
-        description: 'Scylla memory in MiB (1536 default; increase only on larger runners)'
+        description: 'Scylla memory MiB (3072 default on public ubuntu-latest)'
         required: false
-        default: '1536'
+        default: '3072'
         type: string
 
 permissions:
@@ -28,19 +28,30 @@ concurrency:
 
 jobs:
   switzerland:
-    # Use a larger dedicated runner for reliable full-country ingest + Scylla
+    # Public ubuntu-latest already has 4 vCPUs / 16 GiB RAM.
+    # Provision more disk space by deleting unused hosted-runner toolchains below.
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 360
     env:
       CARGO_BUILD_JOBS: '2'
       CARGO_INCREMENTAL: '0'
       BENCHMARK_CYCLES: ${{ inputs.cycles || '11' }}
-      BENCHMARK_SCYLLA_MEMORY_MIB: ${{ inputs.scylla_memory_mib || '1536' }}
+      BENCHMARK_SCYLLA_MEMORY_MIB: ${{ inputs.scylla_memory_mib || '3072' }}
     steps:
       - name: Checkout experimental branch
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Reclaim unused GitHub-hosted Linux toolchains
+        if: ${{ runner.environment == 'github-hosted' && runner.os == 'Linux' }}
+        shell: bash
+        run: |
+          echo "Disk space before cleanup:"
+          df -h /
+          sudo rm -rf /usr/local/lib/android/sdk /usr/share/dotnet /opt/hostedtoolcache/CodeQL
+          echo "Disk space after cleanup:"
+          df -h /
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
