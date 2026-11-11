@@ -247,6 +247,7 @@ enum TokenRetrievalMode {
     Legacy,
     Shadow,
     Token,
+    OpenGeocode,
 }
 
 fn token_retrieval_mode() -> TokenRetrievalMode {
@@ -258,6 +259,7 @@ fn token_retrieval_mode() -> TokenRetrievalMode {
         {
             "shadow" => TokenRetrievalMode::Shadow,
             "token" => TokenRetrievalMode::Token,
+            "open-geocode" => TokenRetrievalMode::OpenGeocode,
             "legacy" => TokenRetrievalMode::Legacy,
             other => {
                 warn!(target: "cypress::query::timing", %other,
@@ -1319,7 +1321,13 @@ pub fn search_place_ids(
     if token_mode != TokenRetrievalMode::Legacy {
         if let Some(sidecar) = memdb_data.token_mmap.as_ref() {
             match cypress::models::token_index::TokenIndexView::view_validated(sidecar)
-                .and_then(|index| token_retrieval::retrieve(&index, &query))
+                .and_then(|index| {
+                    if token_mode == TokenRetrievalMode::OpenGeocode {
+                        super::open_geocode_retrieval::retrieve(&index, &query)
+                    } else {
+                        token_retrieval::retrieve(&index, &query)
+                    }
+                })
             {
                 Ok(Some((ids, stats))) => {
                     if !ids.is_empty() && ids.len() <= MAX_STRING_MATCHES {
@@ -1335,7 +1343,9 @@ pub fn search_place_ids(
             }
         }
 
-        if token_candidate_ids.is_none() && (2..=8).contains(&query_tokens.len()) {
+        if (token_candidate_ids.is_none() || token_mode == TokenRetrievalMode::OpenGeocode)
+            && (2..=8).contains(&query_tokens.len())
+        {
             if let (Some(sidecar), Some(admin_fst)) =
                 (memdb_data.token_mmap.as_ref(), admin_alias_fst.as_ref())
             {
@@ -1403,9 +1413,20 @@ pub fn search_place_ids(
                             .filter(|sid| prefix_string_ids.binary_search(sid).is_err())
                             .collect();
                         field_join_areas = areas;
-                        token_candidate_ids = Some(joined);
+                        if token_mode == TokenRetrievalMode::OpenGeocode {
+                            let candidates = token_candidate_ids.get_or_insert_with(Vec::new);
+                            candidates.extend(joined);
+                            candidates.sort_unstable();
+                            candidates.dedup();
+                            if candidates.len() > MAX_STRING_MATCHES {
+                                // Too many candidate strings: avoid a silent truncation.
+                                token_candidate_ids = None;
+                            }
+                        } else {
+                            token_candidate_ids = Some(joined);
+                        }
                     }
-                    debug!(
+                    debug!
                         target: "cypress::query::timing",
                         splits_attempted, splits_matched,
                         matching_strings = token_candidate_ids.as_ref().map_or(0, Vec::len),
@@ -1419,7 +1440,11 @@ pub fn search_place_ids(
         }
         debug!(
             target: "cypress::query::timing",
-            mode = if token_mode == TokenRetrievalMode::Shadow { "shadow" } else { "token" },
+            mode = match token_mode {
+                TokenRetrievalMode::Shadow => "shadow",
+                TokenRetrievalMode::OpenGeocode => "open-geocode",
+                _ => "token",
+            },
             has_sidecar = memdb_data.token_mmap.is_some(),
             token_candidates = token_candidate_ids.as_ref().map_or(0, Vec::len),
             token_count = token_candidate_stats.as_ref().map_or(0, |x| x.tokens),
@@ -1433,7 +1458,8 @@ pub fn search_place_ids(
         );
     }
     let use_token_fast_path =
-        token_mode == TokenRetrievalMode::Token && token_candidate_ids.is_some();
+        matches!(token_mode, TokenRetrievalMode::Token | TokenRetrievalMode::OpenGeocode)
+            && token_candidate_ids.is_some();
 
     let mut results = Vec::<(u32, f64)>::new();
 
