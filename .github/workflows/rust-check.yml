@@ -37,10 +37,10 @@ jobs:
       - name: Check library, compiler, ingest, query, and test targets
         run: cargo check --locked --all-targets
 
-      - name: Test packed mmap index encoding and query
+      - name: Test Roaring hybrid mmap index and query
         run: |
-          cargo test --locked --lib packed_token
-          cargo test --locked --bin compiler packed_token
+          cargo test --locked --lib roaring_token
+          cargo test --locked --bin compiler roaring_token
           cargo test --locked --bin query
 
       - name: Validate Europe benchmark scripts and workload
