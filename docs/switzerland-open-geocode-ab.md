@@ -1,55 +1,78 @@
-# Switzerland experiment: production main vs FST/packed-postings retrieval
+# Europe A/B: baseline Cypress vs an alternate packed-memory token index
 
-This is a **Cypress-vs-Cypress** experiment. It does **not** launch the open-geocode HTTP server. The control builds from the current `main` SHA at benchmark execution time. The experiment builds this branch and activates `CYPRESS_TOKEN_RETRIEVAL_MODE=open-geocode`.
+## Hypothesis and scope
 
-## Production baseline (identical except retrieval mode)
+The first FST-prefix expansion experiment appeared slower in the full Switzerland benchmark. Its query-time expansion, repeated posting intersections and unconditional admin-field joins increased CPU work while leaving the original memory layout unchanged. **The second experiment removes that prefix expansion entirely and compiles a genuinely different on-disk posting representation.** Results have not yet been measured for this revision.
 
-```ini
-RUST_LOG=debug,cypress=debug,cypress::query::timing=debug
-CYPRESS_AREA_FANOUT=on
-CYPRESS_CANDIDATE_SHORTLIST=on
-CYPRESS_CANDIDATE_BUDGET=256
-CYPRESS_TOKEN_RETRIEVAL_MODE=token
+This remains a **Cypress-vs-Cypress** experiment. It does not run or claim parity with the open-geocode server. The experiment borrows the idea of an mmap-addressable, FST-keyed packed index, rather than copying open-geocode's Tantivy storage, Hilbert R-tree or complete Pack format.
+
+## What is different in the experimental memory index
+
+The baseline compiler on the pinned `main` revision builds the existing `cypress_tokens.bin` FST with **delta-varint StringId postings** and skip metadata.
+
+The branch compiler, invoked with `--packed-token-index`, creates `cypress_token_pack.bin` from the **same canonical multilingual StringIds**, then discards the intermediate v1 token file. The experimental file has:
+
+- A generation-bound versioned header with string-count and dictionary fingerprint.
+- The canonical lexical FST mapping a Unicode token to its ordinal.
+- **16-byte fixed-width metadata per token**: absolute posting offset (`u64`), document frequency (`u32`), reserved (`u32`).
+- Directly mmap-addressable **sorted `u32` StringId postings**. The posting arena is physically **grouped by eight document-frequency buckets**, with 4096-byte bucket alignment, instead of lexical posting order.
+- An index reader that binary-searches the other posting arrays directly against the rarest anchor, without allocating a skip table or decoding delta-varints during each query.
+
+This trades a larger raw posting footprint for more predictable indexed reads and fewer query-time allocations. It is a measurable tradeoff, not a presupposed speedup. The extra sidecar is experimental only and cannot be accidentally loaded as a v1 token index.
+
+The production admin names, multilingual aliases, address anchors, scoring, place priorities, name normalization, global bigram fallback, and Scylla hydration remain in the existing Cypress pipeline. **The experiment uses the packed index for both standard retrieval and admin-area name joins**, and only falls back to the original fuzzy path when there is no complete selective plan. Unlike the first prototype, it does not perform broad prefix completion or unconditional join merging.
+
+**Not implemented in this iteration:** reordering all place records by a geographic Hilbert key, changing the base rkyv place dictionary, Tantivy, or a full replica of open-geocode's Pack format. Those are separate experiments; this one isolates postings encoding and physical ordering.
+
+## Input data: Switzerland, Germany, France
+
+The benchmark downloads the **full Geofabrik country extracts**:
+
+- `https://download.geofabrik.de/europe/switzerland-latest.osm.pbf`
+- `https://download.geofabrik.de/europe/germany-latest.osm.pbf`
+- `https://download.geofabrik.de/europe/france-latest.osm.pbf`
+
+It records the SHA256 of each PBF. Each country is filtered, imported and its temporary PBF files deleted before fetching the next country. **Only Switzerland performs `ingest single --create-index`; Germany and France are appended without truncation**, producing one shared Scylla dataset.
+
+The benchmark builds binaries from both revisions:
+
+| Variant | Binary | Compiler | Memory index |
+|---|---|---|---|
+| A | pinned upstream `main` query | pinned upstream `main` compiler | `--token-index`, old FST + varint postings |
+| B | experimental branch query | experimental branch compiler | `--packed-token-index`, new FST + bucketed `u32` postings |
+
+Both indexes are compiled **independently from the same completed Scylla dataset**, in different output directories. To conserve runner disk, A is measured and its compiled files are removed before B is compiled and measured. All raw HTTP responses/measurements remain as artifacts. Each build is recorded separately, including index file sizes.
+
+The workload contains **184 queries: Switzerland 81, Germany 50, France 53**. It includes cities, multilingual exonyms and aliases, train stations, airports, landmarks, attractions, hotels, restaurants, streets and house numbers, plus autocomplete. A/B result equality compares stable *source IDs* returned by the API, never internal StringId or PlaceId ordinals from separately compiled generations.
+
+Outputs include cross-country p50/p95/p99 HTTP timings, per-country p50/p95 and top-1/top-5 geographic hit counts, failure counts, ordered result drift and per-query CSV. A faster experiment with worse ranking or multilingual recall is a regression.
+
+## Run
+
+Go to **Actions → European Cypress memory layout A/B (CH DE FR) → Run workflow**, selecting branch `bench/switzerland-open-geocode-ab`.
+
+Current defaults: `runner=ubuntu-latest`, `cycles=11`, `scylla_memory_mib=3072`. This keeps the 16 GiB public runner's heap allocation at 3 GiB for Scylla with a 5632 MiB Docker cgroup limit (including Seastar reserve/headroom), leaving memory for the importer/compiler/query. The job clears unused Android/.NET/CodeQL tools and uses a shared Cargo build directory.
+
+**Disk warning:** Standard Linux hosted runners have about **14 GB of SSD**; full Germany + France + Switzerland together may require more storage once Scylla and compiled indexes are included. The workflow processes one PBF at a time and deletes A's compiled index before compiling B to reduce peak usage, but this may still be insufficient. A custom/larger runner with **at least 50 GiB free disk** is advisable for reliable full-country imports. Do not interpret a storage failure as an indexing-performance result. Also note the 360-minute GitHub-hosted job limit.
+
+Run locally (with separate scratch directories and the same provisioned Scylla host) using:
+```sh
+bash benchmarks/switzerland_ab/run.sh
 ```
 
-The experiment inherits every setting above and changes only the last one to `open-geocode`. It retains the Cypress API, multilingual search-key dictionary, administrative-place priors, area-aware name joins, candidate shortlist, SIFT4/structured scoring, and Scylla response hydration. The production mode is unchanged.
-
-## What is borrowed from open-geocode
-
-open-geocode uses memory-mapped, compressed indexes with FST vocabulary traversal, Tantivy-based fuzzy search, and spatial index packing. This **initial prototype** explores its FST-based term/prefix candidate-retrieval strategy with Cypress's existing generation-bound `cypress_tokens.bin` packed postings sidecar. It computes bounded prefix expansions and intersects token postings, then passes matching original Cypress StringIds through the existing place/admin ranker.
-
-**This is not an implementation of open-geocode's proprietary Pack format or Tantivy index**; it is a deliberate first-stage adaptation. Cypress already uses mmap and FSTs. The experiment does not test whether copying open-geocode's entire file layout, page organization, Tantivy engine or Hilbert R-tree will be faster. Follow-on work should isolate storage layout and spatial indexing if this experiment indicates useful gains.
-
-The experimental mode refuses broad prefixes, missing terms, invalid sidecars, and overlarge candidate sets and falls back to the baseline bigram path. Some token matches still cannot substitute for Cypress's multilingual cross-field semantics. In this experiment the normal ranker and administrative field joins remain active.
-
-## Running
-
-Open **Actions → Switzerland Cypress retrieval A/B (main vs experimental) → Run workflow**, select this PR branch. For a public repository, `ubuntu-latest` already provides **4 vCPUs and 16 GiB RAM**, as shown in GitHub's runner specifications, so a paid larger runner is not necessary for the memory limit observed in the logs. The Actions form defaults to `scylla_memory_mib=3072` (3 GiB Scylla heap) with **two shards**. The benchmark assigns the Scylla Docker container a **5632 MiB (5.5 GiB) cgroup limit**, calculated as the requested 3072 MiB heap + 1536 MiB Seastar OS reservation + 1024 MiB headroom. The extra cgroup capacity addresses the prior Seastar startup error despite the runner having plenty of RAM. Scylla runs alongside Swiss import, compilation, and HTTP measurement, so keeping its allocation below the runner's full 16 GiB preserves capacity for the other processes. On a larger runner, the input can be raised to `4096` MiB, giving a 6656 MiB Docker cap.
-
-The standard public runner's stated storage is **14 GiB**, which can be a tighter constraint than RAM for two Rust release builds plus Scylla. The workflow now reclaims unused Android/.NET/CodeQL toolchains on ephemeral GitHub-hosted Linux workers, and uses a common `CARGO_TARGET_DIR` so the control and experimental builds share cached dependencies instead of producing two separate full build trees. Rust binaries are built before Scylla starts, and compiler concurrency defaults to two. Benchmarks still need to run successfully before any claim about search speed or memory benefit is justified.
-
-The workflow:
-1. Pins the baseline `main` commit SHA when it starts; builds its `ingest`, `compiler`, and `query` binaries.
-2. Downloads exactly one `switzerland-latest.osm.pbf` from [Geofabrik](https://download.geofabrik.de/europe/switzerland-latest.osm.pbf), records SHA256 and metadata, then filters data using Cypress's existing filter scripts.
-3. Imports the filtered source once into a **disposable** Scylla instance; compiles one shared memdb generation with `--token-index`.
-4. Builds and runs the PR's query binary separately, retaining all production flags except the experimental mode.
-5. Warmups, then performs 11 deterministic randomized cycles over Swiss cities, stations, tourist attractions, addresses, hotels, restaurants, and autocomplete prefixes, including German, French, Italian, English and Romansh names.
-6. Exports raw per-request measurements, query-level p50/p95, total p50/p95/p99, HTTP failures, ordered result ID drift, top-five overlap, and approximate geographic hit@1/hit@5.
-
-Both variants serve `/v2/search` or `/v1/autocomplete` with identical parameters. Results share the same content generation, so record IDs are comparable. The query-level JSON/CSV is uploaded as an Actions artifact and the Markdown report is posted to the job summary. Differences in correct results **must** be considered regressions until investigated, even if an alternative path is faster.
-
-The test is end-to-end HTTP latency (including Scylla hydration). It is **not** a format-only microbenchmark and cannot be used to attribute all speedup to the memory layout. Query-server RSS and Scylla memory are recorded separately. Because the control runs first, CPU, page-cache and order effects can influence results; for publication, rerun on a dedicated runner, reverse A/B order, and repeat.
-
-## Build checks
+## Checks
 
 ```sh
 cargo fmt --all -- --check
 cargo check --locked --all-targets
+cargo test --bin compiler packed_token
 cargo test --bin query
+python3 -m py_compile benchmarks/switzerland_ab/compare.py
+bash -n benchmarks/switzerland_ab/run.sh
 ```
 
-This experimental retrieval mode must never become the production default until parity and multilingual/admin ranking are demonstrated. In particular, inspect all changed results for Zürich / Zurich / Zurigo / Turitg, Genève / Geneva / Genf / Ginevra, Bâle / Basel / Basilea, station aliases, and queries composed of place plus municipality.
+The PR's Rust compiler checks run automatically. The full three-country benchmark is manually dispatched because of its ingest and disk cost. We do not promote this mode to production until both latency and multilingual/admin ranking are validated.
 
-## Next steps
+## Follow-on experiments
 
-If significant gains hold with acceptable recall, test a second alternative storage backend using a dedicated Tantivy index and open-geocode-style packed sections, keeping the Cypress data model and ranker. A separate ranking-stage/hydration timing breakdown will help identify which bottleneck actually dominates.
+If fixed-width frequency-bucket postings do not produce an advantage, measure compact block-packed / SIMD-searchable postings, independent large-block locality for fuzzy candidates, then consider a separate **Hilbert-ordered place-record sidecar with an explicit PlaceId permutation**. Keep ranking and the imported dataset unchanged for each A/B stage.
