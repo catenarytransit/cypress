@@ -164,6 +164,28 @@ def summarize(args):
             cid for cid in country_ids if cid in mismatches)
         by_country[country] = country_result
     report["by_country"] = by_country
+    # Physical index size is especially important when changing compression.
+    # The baseline generation may already have been removed to conserve disk,
+    # so derive sizes from the compiler's archived file manifests.
+    sizes = {}
+    rss_snapshots = {}
+    for label in ("baseline", "experiment"):
+        manifest = args.output / f"index-files-{label}.txt"
+        if manifest.exists():
+            sizes[label] = sum(int(line.rsplit(" ", 2)[1])
+                               for line in manifest.read_text().splitlines()
+                               if line.rstrip().endswith(" bytes"))
+        rss_rows = []
+        for stage in ("start", "end"):
+            file = args.output / f"{label}-process-{stage}.txt"
+            if file.exists():
+                columns = file.read_text().split()
+                if len(columns) >= 3:
+                    rss_rows.append(int(columns[1]))
+        if rss_rows:
+            rss_snapshots[label] = rss_rows
+    report["index_bytes"] = sizes
+    report["query_process_rss_snapshot_kib"] = rss_snapshots
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / "summary.json").write_text(json.dumps(
         report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -193,6 +215,18 @@ def summarize(args):
                          ("Geographically correct top-1", "hit1_cases"),
                          ("Geographically correct top-5", "hit5_cases")]:
         md.append(f"| {title} | {b[field]} | {e[field]} |")
+    if sizes:
+        md.extend(["", "## Compiled index sizes", "",
+                   "| Variant | Total compiled bytes |",
+                   "|---|---:|"])
+        for label in ("baseline", "experiment"):
+            if label in sizes:
+                md.append(f"| {label} | {sizes[label]:,} |")
+    if rss_snapshots:
+        md.extend(["", "## Query process RSS snapshots (KiB)", "",
+                   "| Variant | Start | End |", "|---|---:|---:|"])
+        for label, rows in rss_snapshots.items():
+            md.append(f"| {label} | {rows[0]:,} | {rows[-1]:,} |")
     md.extend(["", "## By country", "",
                "| Country | Queries | main p50 ms | experiment p50 ms | p50 speedup | ID mismatches |",
                "|---|---:|---:|---:|---:|---:|"])
