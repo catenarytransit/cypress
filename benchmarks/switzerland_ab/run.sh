@@ -188,7 +188,8 @@ run_engine experiment "$DATA/experimental-query" open-geocode
 python3 benchmarks/switzerland_ab/compare.py summarize \
   --baseline "$RESULTS/baseline.json" \
   --experiment "$RESULTS/experiment.json" --output "$RESULTS"
-git rev-parse HEAD > "$RESULTS/experiment.sha"\nprintf '%s\\n' "switzerland germany france" > "$RESULTS/imported-regions.txt"
+git rev-parse HEAD > "$RESULTS/experiment.sha"
+printf '%s\n' "switzerland germany france" > "$RESULTS/imported-regions.txt"
 printf '%s\n' "$BASE_SHA" > "$RESULTS/main.sha"
 docker stats --no-stream cypress-swiss-ab-scylla > "$RESULTS/scylla-memory.txt"
 echo "Saved summary: $RESULTS/summary.md"
