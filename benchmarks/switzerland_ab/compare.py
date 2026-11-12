@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark identical Cypress APIs, main vs experimental, with deterministic query order."""
+"""Benchmark identical Cypress APIs, main vs packed-memory experiment, across CH/DE/FR."""
 import argparse
 import csv
 import json
@@ -139,26 +139,51 @@ def summarize(args):
               "mean_top5_overlap": round(statistics.mean(overlap), 4) if overlap else None,
               "p50_speedup": round(b["p50_ms"] / e["p50_ms"], 3) if e["p50_ms"] else None,
               "p95_speedup": round(b["p95_ms"] / e["p95_ms"], 3) if e["p95_ms"] else None}
+    # Per-country distributions preserve query mix and allow regressions to be
+    # identified separately in Switzerland, Germany, and France.
+    by_country = {}
+    for country in sorted({c.get("country", "CH") for c in cases.values()}):
+        country_ids = {cid for cid, c in cases.items()
+                       if c.get("country", "CH") == country}
+        country_result = {"cases": len(country_ids)}
+        for label in (base["engine"], exp["engine"]):
+            rows = [m for m in outputs[label]["observations"]
+                    if m["id"] in country_ids]
+            successful = [m["wall_ms"] for m in rows if m["status"] == 200]
+            country_result[label] = {
+                "p50_ms": percentile(successful, 50),
+                "p95_ms": percentile(successful, 95),
+                "failed_requests": len(rows) - len(successful),
+                "hit1_cases": sum(details[label][cid]["hit1"] for cid in country_ids),
+                "hit5_cases": sum(details[label][cid]["hit5"] for cid in country_ids)}
+        old_p50 = country_result[base["engine"]]["p50_ms"]
+        new_p50 = country_result[exp["engine"]]["p50_ms"]
+        country_result["p50_speedup"] = (
+            round(old_p50 / new_p50, 3) if old_p50 and new_p50 else None)
+        country_result["ordered_id_mismatches"] = sorted(
+            cid for cid in country_ids if cid in mismatches)
+        by_country[country] = country_result
+    report["by_country"] = by_country
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / "summary.json").write_text(json.dumps(
         report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     with (args.output / "per_query.csv").open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["id", "query", "category", "language", "baseline_p50_ms",
+        writer.writerow(["id", "country", "query", "category", "language", "baseline_p50_ms",
                          "experiment_p50_ms", "baseline_hit1", "experiment_hit1",
                          "baseline_hit5", "experiment_hit5", "baseline_ids",
                          "experiment_ids"])
         for cid, case in cases.items():
             x, y = details[base["engine"]][cid], details[exp["engine"]][cid]
-            writer.writerow([cid, case["text"], case["category"], case["language"],
+            writer.writerow([cid, case.get("country", "CH"), case["text"], case["category"], case["language"],
                              x["p50_ms"], y["p50_ms"], x["hit1"], y["hit1"],
                              x["hit5"], y["hit5"], json.dumps(x["ids"]),
                              json.dumps(y["ids"])])
     md = [
-        "# Switzerland: Cypress main vs FST/packed-postings experiment", "",
+        "# Switzerland, Germany, France: Cypress main vs packed posting index", "",
         "Both binaries use identical production settings, except the experiment",
         "selects `CYPRESS_TOKEN_RETRIEVAL_MODE=open-geocode`.",
-        "Both run against the **same Scylla database and same compiled index generation**.",
+        "Each binary runs an independently compiled index from the **same imported Scylla dataset**.",
         "", "| Metric | main | experiment |", "|---|---:|---:|"]
     for title, field in [("p50 HTTP latency ms", "p50_ms"),
                          ("p95 HTTP latency ms", "p95_ms"),
@@ -168,14 +193,24 @@ def summarize(args):
                          ("Geographically correct top-1", "hit1_cases"),
                          ("Geographically correct top-5", "hit5_cases")]:
         md.append(f"| {title} | {b[field]} | {e[field]} |")
+    md.extend(["", "## By country", "",
+               "| Country | Queries | main p50 ms | experiment p50 ms | p50 speedup | ID mismatches |",
+               "|---|---:|---:|---:|---:|---:|"])
+    for country, stats in by_country.items():
+        md.append(
+            f"| {country} | {stats['cases']} | "
+            f"{stats[base['engine']]['p50_ms']} | "
+            f"{stats[exp['engine']]['p50_ms']} | "
+            f"{stats['p50_speedup']}x | "
+            f"{len(stats['ordered_id_mismatches'])} |")
     md.extend(["", f"p50 speedup: {report['p50_speedup']}x",
                f"p95 speedup: {report['p95_speedup']}x",
                f"Ordered result-ID differences: {len(mismatches)} / {len(cases)}",
                f"Mean top-5 ID overlap: {report['mean_top5_overlap']}",
                "", "## Interpretation", "",
                "The upstream open-geocode binary is NOT benchmarked. The experiment",
-               "adapts its vocabulary-FST and indexed-postings candidate approach",
-               "to Cypress's existing memory-mapped multilingual dictionary.",
+               "tests an independent, frequency-bucketed fixed-width posting memory format",
+               "while preserving Cypress's memory-mapped multilingual StringIds.",
                "The existing Cypress scoring, area fanout, and importance model remain active.",
                "Incorrect or missing top results are regressions even when latency improves.",
                "Coordinates are approximate fixtures; review misses before deciding.",
