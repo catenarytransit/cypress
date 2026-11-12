@@ -6,6 +6,7 @@ pub mod dense_columns;
 pub mod memdb;
 pub mod normalized;
 pub mod place;
+pub mod packed_token;
 pub mod population;
 pub mod scoring;
 pub mod sift4;
