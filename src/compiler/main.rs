@@ -21,7 +21,7 @@ use cypress::models::token_index::TOKEN_INDEX_FILE;
 
 mod address_sort;
 mod bigram_index;
-mod packed_token;
+mod roaring_token;
 mod dense_build;
 mod disk_columns;
 mod publish;
@@ -70,10 +70,10 @@ struct Args {
     #[arg(long, default_value_t = false)]
     token_index: bool,
 
-    /// Build an alternative mmap posting pack ordered by document-frequency bucket.
-    /// The canonical token sidecar is used as an intermediate and can be discarded.
+    /// Compile Roaring-inspired hybrid u16-array/dense-bitmap StringId postings.
+    /// The canonical v1 token index is used only as a temporary intermediate.
     #[arg(long, default_value_t = false)]
-    packed_token_index: bool,
+    roaring_token_index: bool,
 
     /// Maximum sort-run memory for the on-disk spatial grid (MiB).
     #[arg(long, default_value_t = 128)]
@@ -1736,7 +1736,7 @@ async fn main() -> Result<()> {
     // Compute it before publishing current_version.txt; a failed build must
     // not commit a new generation.
     let token_path = out_dir.join(TOKEN_INDEX_FILE);
-    if args.token_index || args.packed_token_index {
+    if args.token_index || args.roaring_token_index {
         let report = token_index::build_token_index(
             &memdb.string_name_offsets,
             &memdb.string_name_bytes,
@@ -1755,29 +1755,24 @@ async fn main() -> Result<()> {
         );
     }
 
-    let pack_path = out_dir.join(cypress::models::packed_token::PACK_FILE);
-    if args.packed_token_index {
-        let pack = packed_token::build_from_token_index(
-            &token_path,
-            &pack_path,
-            &run_tmp_dir,
-        )?;
+    let roaring_path = out_dir.join(cypress::models::roaring_token::FILE);
+    if args.roaring_token_index {
+        let report = roaring_token::build(&token_path, &roaring_path, &run_tmp_dir)?;
         info!(
-            tokens = pack.tokens,
-            postings = pack.postings,
-            sidecar_mib = format!("{:.2}", pack.file_bytes as f64 / 1_048_576.0),
-            bucket_bytes = ?pack.bucket_bytes,
-            "frequency-ordered mmap posting pack compiled"
+            tokens = report.tokens,
+            postings = report.postings,
+            array_containers = report.arrays,
+            bitmap_containers = report.bitmaps,
+            roaring_bytes = report.bytes,
+            "Roaring-inspired multilingual token index compiled"
         );
-    } else if pack_path.exists() {
-        fs::remove_file(&pack_path).context("Removing stale packed token sidecar")?;
+    } else if roaring_path.exists() {
+        fs::remove_file(&roaring_path).context("Removing stale Roaring token sidecar")?;
     }
-    if args.packed_token_index && !args.token_index {
-        // The v1 token sidecar was only an intermediate, not part of the
-        // experimental mmap layout. Keep a completely independent pack.
+    if args.roaring_token_index && !args.token_index {
+        // Never mmap the temporary v1 representation beside the new index.
         fs::remove_file(&token_path)?;
     }
-
     info!("Serialising index to rkyv binary (streaming writer)...");
 
     let db_path = out_dir.join("cypress_index.bin");
@@ -1815,8 +1810,8 @@ async fn main() -> Result<()> {
     let bigram_index_bytes = fs::metadata(&bigram_path)?.len();
     let old_index_bytes = fs::metadata(&db_path)?.len();
     let places_bytes = fs::metadata(&final_places_path)?.len();
-    let added_pack_bytes = if args.packed_token_index {
-        fs::metadata(&pack_path)?.len()
+    let added_roaring_bytes = if args.roaring_token_index {
+        fs::metadata(&roaring_path)?.len()
     } else { 0 };
     let added_token_bytes = if args.token_index {
         fs::metadata(&token_path)?.len()
@@ -1830,9 +1825,9 @@ async fn main() -> Result<()> {
         spatial_grid_bytes,
         bigram_index_bytes,
         new_token_sidecar_bytes = added_token_bytes,
-        new_packed_sidecar_bytes = added_pack_bytes,
+        new_roaring_sidecar_bytes = added_roaring_bytes,
         additional_percent = if base_bytes > 0 {
-            (added_token_bytes + added_pack_bytes) as f64 * 100.0 / base_bytes as f64
+            (added_token_bytes + added_roaring_bytes) as f64 * 100.0 / base_bytes as f64
         } else {
             0.0
         },
