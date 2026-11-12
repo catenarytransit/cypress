@@ -1,10 +1,10 @@
-name: Switzerland Cypress retrieval A/B (main vs experimental)
+name: European Cypress memory layout A/B (CH DE FR)
 
 on:
   workflow_dispatch:
     inputs:
       runner:
-        description: 'Runner label (public ubuntu-latest has 16 GiB RAM)'
+        description: 'Runner label (ubuntu-latest: 16 GiB RAM, 14 GB disk)'
         required: false
         default: 'ubuntu-latest'
         type: string
@@ -27,8 +27,8 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  switzerland:
-    # Public ubuntu-latest already has 4 vCPUs / 16 GiB RAM.
+  europe:
+    # Public ubuntu-latest has 4 vCPUs / 16 GiB RAM, but only ~14 GB disk.
     # Provision more disk space by deleting unused hosted-runner toolchains below.
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 360
@@ -73,8 +73,18 @@ jobs:
           fi
           bash -n benchmarks/switzerland_ab/run.sh
           python3 -m py_compile benchmarks/switzerland_ab/compare.py
+          python3 - <<'PY'
+          from collections import Counter
+          import json
+          from pathlib import Path
+          cases = [json.loads(line) for line in Path('benchmarks/switzerland_ab/workload.jsonl').read_text().splitlines() if line.strip()]
+          counts = Counter(case.get('country') for case in cases)
+          assert {'CH', 'DE', 'FR'} <= set(counts), counts
+          assert len({case['id'] for case in cases}) == len(cases)
+          print('Three-country benchmark workload:', dict(counts))
+          PY
 
-      - name: Compare pinned main and experiment on identical Switzerland data
+      - name: Import CH DE FR then compare independent A/B mmap indexes
         shell: bash
         run: bash benchmarks/switzerland_ab/run.sh
 
@@ -85,14 +95,14 @@ jobs:
           if test -f benchmark_results/switzerland_ab/summary.md; then
             cat benchmark_results/switzerland_ab/summary.md >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "The A/B runner did not finish. See uploaded logs." >> "$GITHUB_STEP_SUMMARY"
+            echo "The three-country A/B runner did not finish. See uploaded logs." >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Upload metrics, per-query results and logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: swiss-cypress-main-vs-open-geocode-inspired
+          name: europe-cypress-main-vs-packed-mmap
           path: benchmark_results/switzerland_ab/
           retention-days: 30
           if-no-files-found: warn
