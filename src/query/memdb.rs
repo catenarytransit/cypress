@@ -17,7 +17,7 @@ use cypress::models::memdb::{
 };
 use cypress::models::spatial_grid::{SpatialGridView, SPATIAL_GRID_FILE};
 use cypress::models::token_index::{TokenIndexView, TOKEN_INDEX_FILE};
-use cypress::models::packed_token::{PackedTokenIndexView, PACK_FILE};
+use cypress::models::roaring_token::{RoaringTokenIndexView, FILE as ROARING_FILE};
 
 pub struct CosSimMatch {
     pub string_idx: u32,
@@ -419,7 +419,7 @@ pub struct MemdbData {
     pub dense_mmap: Option<Mmap>,
     pub places_mmap: Mmap,
     pub token_mmap: Option<Mmap>,
-    pub packed_token_mmap: Option<Mmap>,
+    pub roaring_token_mmap: Option<Mmap>,
     pub grid_mmap: Option<Mmap>,
     pub reverse_tree: rstar::RTree<super::reverse::Cell>,
     pub bigram_mmap: Option<Mmap>,
@@ -686,19 +686,19 @@ impl Memdb {
             None
         };
 
-        let pack_path = out_dir.join(PACK_FILE);
-        let packed_token_mmap = if pack_path.exists() {
-            let file = File::open(&pack_path)?;
+        let roaring_path = out_dir.join(ROARING_FILE);
+        let roaring_token_mmap = if roaring_path.exists() {
+            let file = File::open(&roaring_path)?;
             let mmap = unsafe { Mmap::map(&file)? };
-            let view = PackedTokenIndexView::parse(&mmap)
-                .context("Invalid packed token index; rebuild with compiler --packed-token-index")?;
+            let view = RoaringTokenIndexView::parse(&mmap)
+                .context("Invalid roaring token sidecar; rebuild with compiler --roaring-token-index")?;
             let db = unsafe { rkyv::archived_root::<CypressMemDb>(&index_mmap) };
             let offsets: Vec<u32> = db.string_name_offsets.iter().copied().collect();
             anyhow::ensure!(
                 view.matches_dictionary(&db.string_name_bytes[..], &offsets),
-                "Packed token index does not match the active StringId dictionary"
+                "Roaring token index does not match the active StringId dictionary"
             );
-            info!("Loaded frequency-bucketed packed token sidecar: {} tokens", view.token_count);
+            info!("Loaded verified hybrid posting index: {} terms", view.token_count);
             Some(mmap)
         } else {
             None
@@ -764,7 +764,7 @@ impl Memdb {
             dense_mmap,
             places_mmap,
             token_mmap,
-            packed_token_mmap,
+            roaring_token_mmap,
             grid_mmap,
             reverse_tree,
             bigram_mmap,
