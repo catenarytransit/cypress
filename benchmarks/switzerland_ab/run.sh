@@ -5,9 +5,12 @@ ROOT="$(pwd)"
 DATA="$ROOT/.swiss-ab-data"
 RESULTS="$ROOT/benchmark_results/switzerland_ab"
 mkdir -p "$DATA" "$RESULTS" "$DATA/compiled" "$DATA/tmp"
-# Share Cargo dependencies between the pinned-main and experimental worktrees
-# to keep two release builds within the standard public runner disk budget.
-export CARGO_TARGET_DIR="$DATA/cargo-target"
+# Cargo's shared target/release/compiler path can serve a baseline executable
+# when two worktrees have the same package/bin name. Keep the two build artifacts
+# physically isolated, rather than relying on cross-worktree fingerprinting.
+# The runner actually reported ~145 GiB disk for the previous full run.
+BASE_TARGET="$DATA/target-main"
+EXPERIMENT_TARGET="$DATA/target-experiment"
 exec > >(tee -a "$RESULTS/run.log") 2>&1
 
 echo "Baseline: cypress/main at workflow start"
@@ -35,14 +38,41 @@ fi
 # Build the binaries before Scylla reserves memory; only ingest and query
 # need the database. This avoids Rust builds competing with Scylla on CI.
 echo "Building control from pinned main SHA $BASE_SHA"
-( cd "$DATA/main" && cargo build --locked --release --bin ingest --bin compiler --bin query )
-cp "$CARGO_TARGET_DIR/release/query" "$DATA/main-query"
-cp "$CARGO_TARGET_DIR/release/ingest" "$DATA/main-ingest"
-cp "$CARGO_TARGET_DIR/release/compiler" "$DATA/main-compiler"
-echo "Building experimental compiler and query binaries"
-cargo build --locked --release --bin compiler --bin query
-cp "$CARGO_TARGET_DIR/release/query" "$DATA/experimental-query"
-cp "$CARGO_TARGET_DIR/release/compiler" "$DATA/experimental-compiler"
+cargo build --manifest-path "$DATA/main/Cargo.toml" --target-dir "$BASE_TARGET" \
+  --locked --release --bin ingest --bin compiler --bin query
+cp "$BASE_TARGET/release/query" "$DATA/main-query"
+cp "$BASE_TARGET/release/ingest" "$DATA/main-ingest"
+cp "$BASE_TARGET/release/compiler" "$DATA/main-compiler"
+
+echo "Building experimental compiler and query from $(git rev-parse HEAD)"
+cargo build --manifest-path "$ROOT/Cargo.toml" --target-dir "$EXPERIMENT_TARGET" \
+  --locked --release --bin compiler --bin query
+cp "$EXPERIMENT_TARGET/release/query" "$DATA/experimental-query"
+cp "$EXPERIMENT_TARGET/release/compiler" "$DATA/experimental-compiler"
+
+# Fail before starting Scylla, downloading three country PBFs, or importing.
+# This catches accidentally copying main's compiler into the experiment slot.
+echo "Verifying experimental compiler CLI and binary provenance"
+if ! "$DATA/experimental-compiler" --help | grep -F -- '--packed-token-index'; then
+  echo "ERROR: experiment compiler does not support --packed-token-index." >&2
+  echo "Expected: $ROOT/Cargo.toml at git $(git rev-parse HEAD)" >&2
+  echo "Built into: $EXPERIMENT_TARGET/release/compiler" >&2
+  exit 1
+fi
+if "$DATA/main-compiler" --help | grep -Fq -- '--packed-token-index'; then
+  echo "ERROR: baseline binary unexpectedly has the experimental CLI flag." >&2
+  exit 1
+fi
+sha256sum "$DATA/main-compiler" "$DATA/experimental-compiler" \
+  | tee "$RESULTS/compiler-executables.sha256"
+if cmp -s "$DATA/main-compiler" "$DATA/experimental-compiler"; then
+  echo "ERROR: baseline and experimental compiler binaries are byte-identical." >&2
+  exit 1
+fi
+# The compiled executable is now preserved separately from both Cargo outputs.
+# Reclaim intermediate build outputs before the geodata import/compilation.
+rm -rf "$BASE_TARGET" "$EXPERIMENT_TARGET"
+echo "Independent compiler binaries verified. Proceeding with country import."
 
 # Dedicated, disposable Scylla instance. Never point fixture ingest at production.
 # Seastar subtracts a default OS reservation (at least ~1.5 GiB) from the
