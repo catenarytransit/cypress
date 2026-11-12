@@ -1,4 +1,4 @@
-name: European Cypress memory layout A/B (CH DE FR)
+name: European Cypress hybrid Roaring A/B (CH DE FR)
 
 on:
   workflow_dispatch:
@@ -84,7 +84,7 @@ jobs:
           print('Three-country benchmark workload:', dict(counts))
           PY
 
-      - name: Import CH DE FR then compare independent A/B mmap indexes
+      - name: Import CH DE FR then compare token vs hybrid bitmap index
         shell: bash
         run: bash benchmarks/switzerland_ab/run.sh
 
@@ -102,7 +102,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: europe-cypress-main-vs-packed-mmap
+          name: europe-cypress-main-vs-hybrid-bitmaps
           path: benchmark_results/switzerland_ab/
           retention-days: 30
           if-no-files-found: warn
