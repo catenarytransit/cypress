@@ -1,81 +1,184 @@
-{"id":"city_zurich","text":"Zürich","mode":"place","category":"city","language":"de","lat":47.3769,"lon":8.5417,"radius_m":4500}
-{"id":"city_geneva","text":"Genève","mode":"place","category":"city","language":"fr","lat":46.2044,"lon":6.1432,"radius_m":4500}
-{"id":"city_basel","text":"Basel","mode":"place","category":"city","language":"de","lat":47.5596,"lon":7.5886,"radius_m":4500}
-{"id":"city_bern","text":"Bern","mode":"place","category":"city","language":"de","lat":46.948,"lon":7.4474,"radius_m":4500}
-{"id":"city_lausanne","text":"Lausanne","mode":"place","category":"city","language":"fr","lat":46.5197,"lon":6.6323,"radius_m":4500}
-{"id":"city_lucerne","text":"Luzern","mode":"place","category":"city","language":"de","lat":47.0502,"lon":8.3093,"radius_m":4500}
-{"id":"city_lugano","text":"Lugano","mode":"place","category":"city","language":"it","lat":46.0037,"lon":8.9511,"radius_m":4500}
-{"id":"city_stgallen","text":"St. Gallen","mode":"place","category":"city","language":"de","lat":47.4245,"lon":9.3767,"radius_m":4500}
-{"id":"city_winterthur","text":"Winterthur","mode":"place","category":"city","language":"de","lat":47.4988,"lon":8.7241,"radius_m":4500}
-{"id":"city_interlaken","text":"Interlaken","mode":"place","category":"city","language":"de","lat":46.6863,"lon":7.8632,"radius_m":4500}
-{"id":"city_zermatt","text":"Zermatt","mode":"place","category":"city","language":"de","lat":46.0207,"lon":7.7491,"radius_m":4500}
-{"id":"city_montreux","text":"Montreux","mode":"place","category":"city","language":"fr","lat":46.4312,"lon":6.9107,"radius_m":4500}
-{"id":"city_davos","text":"Davos","mode":"place","category":"city","language":"de","lat":46.8027,"lon":9.836,"radius_m":4500}
-{"id":"city_chur","text":"Chur","mode":"place","category":"city","language":"de","lat":46.8508,"lon":9.5329,"radius_m":4500}
-{"id":"city_locarno","text":"Locarno","mode":"place","category":"city","language":"it","lat":46.169,"lon":8.7995,"radius_m":4500}
-{"id":"city_fribourg","text":"Fribourg","mode":"place","category":"city","language":"fr","lat":46.8065,"lon":7.1619,"radius_m":4500}
-{"id":"city_neuchatel","text":"Neuchâtel","mode":"place","category":"city","language":"fr","lat":46.9896,"lon":6.9293,"radius_m":4500}
-{"id":"city_bellinzona","text":"Bellinzona","mode":"place","category":"city","language":"it","lat":46.1955,"lon":9.0238,"radius_m":4500}
-{"id":"city_sion","text":"Sion","mode":"place","category":"city","language":"fr","lat":46.2331,"lon":7.3606,"radius_m":4500}
-{"id":"city_thun","text":"Thun","mode":"place","category":"city","language":"de","lat":46.759,"lon":7.6296,"radius_m":4500}
-{"id":"zurich_en","text":"Zurich","mode":"place","category":"city","language":"en","lat":47.3769,"lon":8.5417,"radius_m":4000}
-{"id":"zurich_fr","text":"Zurich","mode":"place","category":"city","language":"fr","lat":47.3769,"lon":8.5417,"radius_m":4000}
-{"id":"zurich_it","text":"Zurigo","mode":"place","category":"city","language":"it","lat":47.3769,"lon":8.5417,"radius_m":4000}
-{"id":"zurich_rm","text":"Turitg","mode":"place","category":"city","language":"rm","lat":47.3769,"lon":8.5417,"radius_m":5000}
-{"id":"geneva_en","text":"Geneva","mode":"place","category":"city","language":"en","lat":46.2044,"lon":6.1432,"radius_m":4000}
-{"id":"geneva_de","text":"Genf","mode":"place","category":"city","language":"de","lat":46.2044,"lon":6.1432,"radius_m":4000}
-{"id":"geneva_it","text":"Ginevra","mode":"place","category":"city","language":"it","lat":46.2044,"lon":6.1432,"radius_m":4000}
-{"id":"basel_fr","text":"Bâle","mode":"place","category":"city","language":"fr","lat":47.5596,"lon":7.5886,"radius_m":4000}
-{"id":"basel_it","text":"Basilea","mode":"place","category":"city","language":"it","lat":47.5596,"lon":7.5886,"radius_m":4000}
-{"id":"lucerne_en","text":"Lucerne","mode":"place","category":"city","language":"en","lat":47.0502,"lon":8.3093,"radius_m":4000}
-{"id":"lausanne_de","text":"Lausanne Bahnhof","mode":"place","category":"station","language":"de","lat":46.5169,"lon":6.6294,"radius_m":2000}
-{"id":"zurich_hb","text":"Zürich Hauptbahnhof","mode":"place","category":"station","language":"de","lat":47.3782,"lon":8.5402,"radius_m":1800}
-{"id":"zurich_hb_en","text":"Zurich main station","mode":"place","category":"station","language":"en","lat":47.3782,"lon":8.5402,"radius_m":1800}
-{"id":"geneve_cornavin","text":"Gare de Genève-Cornavin","mode":"place","category":"station","language":"fr","lat":46.2101,"lon":6.1425,"radius_m":1600}
-{"id":"bern_bahnhof","text":"Bern Bahnhof","mode":"place","category":"station","language":"de","lat":46.9488,"lon":7.4391,"radius_m":1800}
-{"id":"basel_sbb","text":"Basel SBB","mode":"place","category":"station","language":"de","lat":47.5473,"lon":7.5896,"radius_m":1500}
-{"id":"lucerne_station","text":"Luzern Bahnhof","mode":"place","category":"station","language":"de","lat":47.0502,"lon":8.3112,"radius_m":1500}
-{"id":"interlaken_ost","text":"Interlaken Ost","mode":"place","category":"station","language":"de","lat":46.6905,"lon":7.869,"radius_m":1200}
-{"id":"lugano_stazione","text":"Stazione di Lugano","mode":"place","category":"station","language":"it","lat":46.0047,"lon":8.9472,"radius_m":1200}
-{"id":"lausanne_gare","text":"Gare de Lausanne","mode":"place","category":"station","language":"fr","lat":46.5168,"lon":6.6291,"radius_m":1200}
-{"id":"chur_bahnhof","text":"Bahnhof Chur","mode":"place","category":"station","language":"de","lat":46.8534,"lon":9.5299,"radius_m":1200}
-{"id":"zurich_airport","text":"Flughafen Zürich","mode":"place","category":"airport","language":"de","lat":47.4581,"lon":8.5555,"radius_m":2500}
-{"id":"geneva_airport","text":"Aéroport de Genève","mode":"place","category":"airport","language":"fr","lat":46.2381,"lon":6.109,"radius_m":2500}
-{"id":"jet_deau","text":"Jet d'eau Genève","mode":"place","category":"landmark","language":"fr","lat":46.2074,"lon":6.1559,"radius_m":1400}
-{"id":"grossmunster","text":"Grossmünster Zürich","mode":"place","category":"landmark","language":"de","lat":47.3701,"lon":8.5443,"radius_m":1000}
-{"id":"kapellbrucke","text":"Kapellbrücke Luzern","mode":"place","category":"landmark","language":"de","lat":47.0515,"lon":8.3073,"radius_m":1000}
-{"id":"chillon","text":"Château de Chillon","mode":"place","category":"attraction","language":"fr","lat":46.4142,"lon":6.9275,"radius_m":1300}
-{"id":"matterhorn","text":"Matterhorn","mode":"place","category":"attraction","language":"de","lat":45.9763,"lon":7.6586,"radius_m":2500}
-{"id":"cervino","text":"Cervino","mode":"place","category":"attraction","language":"it","lat":45.9763,"lon":7.6586,"radius_m":2500}
-{"id":"rheinfall","text":"Rheinfall Schaffhausen","mode":"place","category":"attraction","language":"de","lat":47.6779,"lon":8.6151,"radius_m":2000}
-{"id":"jungfraujoch","text":"Jungfraujoch","mode":"place","category":"attraction","language":"de","lat":46.5474,"lon":7.9853,"radius_m":1600}
-{"id":"bundeshaus","text":"Bundeshaus Bern","mode":"place","category":"landmark","language":"de","lat":46.9467,"lon":7.4442,"radius_m":1000}
-{"id":"united_nations","text":"Palais des Nations Genève","mode":"place","category":"landmark","language":"fr","lat":46.2264,"lon":6.1406,"radius_m":1200}
-{"id":"olympic_museum","text":"Musée Olympique Lausanne","mode":"place","category":"attraction","language":"fr","lat":46.5085,"lon":6.6335,"radius_m":1300}
-{"id":"kunsthaus_zurich","text":"Kunsthaus Zürich","mode":"place","category":"attraction","language":"de","lat":47.3705,"lon":8.5483,"radius_m":1100}
-{"id":"hotel_baur","text":"Baur au Lac Zürich","mode":"place","category":"hotel","language":"de","lat":47.3675,"lon":8.5398,"radius_m":1200}
-{"id":"hotel_dolder","text":"The Dolder Grand","mode":"place","category":"hotel","language":"en","lat":47.3721,"lon":8.5722,"radius_m":1600}
-{"id":"hotel_beau","text":"Beau-Rivage Palace Lausanne","mode":"place","category":"hotel","language":"fr","lat":46.5086,"lon":6.6283,"radius_m":1600}
-{"id":"hotel_des_berges","text":"Four Seasons Hotel des Bergues","mode":"place","category":"hotel","language":"en","lat":46.2062,"lon":6.1465,"radius_m":1500}
-{"id":"hotel_victoria","text":"Victoria-Jungfrau Grand Hotel","mode":"place","category":"hotel","language":"en","lat":46.686,"lon":7.8568,"radius_m":1600}
-{"id":"restaurant_kronenhalle","text":"Kronenhalle Zürich","mode":"place","category":"restaurant","language":"de","lat":47.3686,"lon":8.5461,"radius_m":1500}
-{"id":"restaurant_cheval","text":"Le Cheval Blanc Basel","mode":"place","category":"restaurant","language":"fr","lat":47.5596,"lon":7.5886,"radius_m":4000}
-{"id":"restaurant_blinde","text":"Blindekuh Zürich","mode":"place","category":"restaurant","language":"de","lat":47.381,"lon":8.527,"radius_m":3000}
-{"id":"restaurant_bindschedler","text":"Bindschedler Zürich","mode":"place","category":"restaurant","language":"de","lat":47.3769,"lon":8.5417,"radius_m":5000}
-{"id":"restaurant_chesa","text":"Chesa Veglia St. Moritz","mode":"place","category":"restaurant","language":"rm","lat":46.4966,"lon":9.8382,"radius_m":2300}
-{"id":"address_bahnhofstrasse","text":"Bahnhofstrasse 1 Zürich","mode":"address","category":"address","language":"de","lat":47.3688,"lon":8.5391,"radius_m":2500}
-{"id":"address_geneva","text":"Rue du Rhône 1 Genève","mode":"address","category":"address","language":"fr","lat":46.2048,"lon":6.1482,"radius_m":2500}
-{"id":"address_bern","text":"Spitalgasse 1 Bern","mode":"address","category":"address","language":"de","lat":46.9487,"lon":7.4429,"radius_m":2500}
-{"id":"address_lausanne","text":"Rue de Bourg 1 Lausanne","mode":"address","category":"address","language":"fr","lat":46.5194,"lon":6.6374,"radius_m":2500}
-{"id":"address_lugano","text":"Via Nassa 1 Lugano","mode":"address","category":"address","language":"it","lat":46.0022,"lon":8.9507,"radius_m":2500}
-{"id":"address_basel","text":"Freie Strasse 1 Basel","mode":"address","category":"address","language":"de","lat":47.5599,"lon":7.5894,"radius_m":2500}
-{"id":"address_lucerne","text":"Pilatusstrasse 1 Luzern","mode":"address","category":"address","language":"de","lat":47.0488,"lon":8.3075,"radius_m":2500}
-{"id":"address_stgallen","text":"Marktgasse 1 St. Gallen","mode":"address","category":"address","language":"de","lat":47.4245,"lon":9.3767,"radius_m":2500}
-{"id":"address_fribourg","text":"Rue de Romont 1 Fribourg","mode":"address","category":"address","language":"fr","lat":46.8065,"lon":7.1619,"radius_m":2500}
-{"id":"address_locarno","text":"Piazza Grande 1 Locarno","mode":"address","category":"address","language":"it","lat":46.169,"lon":8.7995,"radius_m":2500}
-{"id":"autocomplete_bahnhof","text":"Zürich Hauptbah","mode":"autocomplete","category":"station","language":"de","lat":47.3782,"lon":8.5402,"radius_m":2000}
-{"id":"autocomplete_jet","text":"Jet d'e","mode":"autocomplete","category":"landmark","language":"fr","lat":46.2074,"lon":6.1559,"radius_m":2500}
-{"id":"autocomplete_mont","text":"Montre","mode":"autocomplete","category":"city","language":"fr","lat":46.4312,"lon":6.9107,"radius_m":6000}
-{"id":"autocomplete_chateau","text":"Château de Chil","mode":"autocomplete","category":"attraction","language":"fr","lat":46.4142,"lon":6.9275,"radius_m":1800}
-{"id":"autocomplete_baur","text":"Baur au","mode":"autocomplete","category":"hotel","language":"de","lat":47.3675,"lon":8.5398,"radius_m":1500}
-{"id":"autocomplete_lugan","text":"Lugan","mode":"autocomplete","category":"city","language":"it","lat":46.0037,"lon":8.9511,"radius_m":5000}
+{"id":"city_zurich","text":"Zürich","mode":"place","category":"city","language":"de","lat":47.3769,"lon":8.5417,"radius_m":4500,"country":"CH"}
+{"id":"city_geneva","text":"Genève","mode":"place","category":"city","language":"fr","lat":46.2044,"lon":6.1432,"radius_m":4500,"country":"CH"}
+{"id":"city_basel","text":"Basel","mode":"place","category":"city","language":"de","lat":47.5596,"lon":7.5886,"radius_m":4500,"country":"CH"}
+{"id":"city_bern","text":"Bern","mode":"place","category":"city","language":"de","lat":46.948,"lon":7.4474,"radius_m":4500,"country":"CH"}
+{"id":"city_lausanne","text":"Lausanne","mode":"place","category":"city","language":"fr","lat":46.5197,"lon":6.6323,"radius_m":4500,"country":"CH"}
+{"id":"city_lucerne","text":"Luzern","mode":"place","category":"city","language":"de","lat":47.0502,"lon":8.3093,"radius_m":4500,"country":"CH"}
+{"id":"city_lugano","text":"Lugano","mode":"place","category":"city","language":"it","lat":46.0037,"lon":8.9511,"radius_m":4500,"country":"CH"}
+{"id":"city_stgallen","text":"St. Gallen","mode":"place","category":"city","language":"de","lat":47.4245,"lon":9.3767,"radius_m":4500,"country":"CH"}
+{"id":"city_winterthur","text":"Winterthur","mode":"place","category":"city","language":"de","lat":47.4988,"lon":8.7241,"radius_m":4500,"country":"CH"}
+{"id":"city_interlaken","text":"Interlaken","mode":"place","category":"city","language":"de","lat":46.6863,"lon":7.8632,"radius_m":4500,"country":"CH"}
+{"id":"city_zermatt","text":"Zermatt","mode":"place","category":"city","language":"de","lat":46.0207,"lon":7.7491,"radius_m":4500,"country":"CH"}
+{"id":"city_montreux","text":"Montreux","mode":"place","category":"city","language":"fr","lat":46.4312,"lon":6.9107,"radius_m":4500,"country":"CH"}
+{"id":"city_davos","text":"Davos","mode":"place","category":"city","language":"de","lat":46.8027,"lon":9.836,"radius_m":4500,"country":"CH"}
+{"id":"city_chur","text":"Chur","mode":"place","category":"city","language":"de","lat":46.8508,"lon":9.5329,"radius_m":4500,"country":"CH"}
+{"id":"city_locarno","text":"Locarno","mode":"place","category":"city","language":"it","lat":46.169,"lon":8.7995,"radius_m":4500,"country":"CH"}
+{"id":"city_fribourg","text":"Fribourg","mode":"place","category":"city","language":"fr","lat":46.8065,"lon":7.1619,"radius_m":4500,"country":"CH"}
+{"id":"city_neuchatel","text":"Neuchâtel","mode":"place","category":"city","language":"fr","lat":46.9896,"lon":6.9293,"radius_m":4500,"country":"CH"}
+{"id":"city_bellinzona","text":"Bellinzona","mode":"place","category":"city","language":"it","lat":46.1955,"lon":9.0238,"radius_m":4500,"country":"CH"}
+{"id":"city_sion","text":"Sion","mode":"place","category":"city","language":"fr","lat":46.2331,"lon":7.3606,"radius_m":4500,"country":"CH"}
+{"id":"city_thun","text":"Thun","mode":"place","category":"city","language":"de","lat":46.759,"lon":7.6296,"radius_m":4500,"country":"CH"}
+{"id":"zurich_en","text":"Zurich","mode":"place","category":"city","language":"en","lat":47.3769,"lon":8.5417,"radius_m":4000,"country":"CH"}
+{"id":"zurich_fr","text":"Zurich","mode":"place","category":"city","language":"fr","lat":47.3769,"lon":8.5417,"radius_m":4000,"country":"CH"}
+{"id":"zurich_it","text":"Zurigo","mode":"place","category":"city","language":"it","lat":47.3769,"lon":8.5417,"radius_m":4000,"country":"CH"}
+{"id":"zurich_rm","text":"Turitg","mode":"place","category":"city","language":"rm","lat":47.3769,"lon":8.5417,"radius_m":5000,"country":"CH"}
+{"id":"geneva_en","text":"Geneva","mode":"place","category":"city","language":"en","lat":46.2044,"lon":6.1432,"radius_m":4000,"country":"CH"}
+{"id":"geneva_de","text":"Genf","mode":"place","category":"city","language":"de","lat":46.2044,"lon":6.1432,"radius_m":4000,"country":"CH"}
+{"id":"geneva_it","text":"Ginevra","mode":"place","category":"city","language":"it","lat":46.2044,"lon":6.1432,"radius_m":4000,"country":"CH"}
+{"id":"basel_fr","text":"Bâle","mode":"place","category":"city","language":"fr","lat":47.5596,"lon":7.5886,"radius_m":4000,"country":"CH"}
+{"id":"basel_it","text":"Basilea","mode":"place","category":"city","language":"it","lat":47.5596,"lon":7.5886,"radius_m":4000,"country":"CH"}
+{"id":"lucerne_en","text":"Lucerne","mode":"place","category":"city","language":"en","lat":47.0502,"lon":8.3093,"radius_m":4000,"country":"CH"}
+{"id":"lausanne_de","text":"Lausanne Bahnhof","mode":"place","category":"station","language":"de","lat":46.5169,"lon":6.6294,"radius_m":2000,"country":"CH"}
+{"id":"zurich_hb","text":"Zürich Hauptbahnhof","mode":"place","category":"station","language":"de","lat":47.3782,"lon":8.5402,"radius_m":1800,"country":"CH"}
+{"id":"zurich_hb_en","text":"Zurich main station","mode":"place","category":"station","language":"en","lat":47.3782,"lon":8.5402,"radius_m":1800,"country":"CH"}
+{"id":"geneve_cornavin","text":"Gare de Genève-Cornavin","mode":"place","category":"station","language":"fr","lat":46.2101,"lon":6.1425,"radius_m":1600,"country":"CH"}
+{"id":"bern_bahnhof","text":"Bern Bahnhof","mode":"place","category":"station","language":"de","lat":46.9488,"lon":7.4391,"radius_m":1800,"country":"CH"}
+{"id":"basel_sbb","text":"Basel SBB","mode":"place","category":"station","language":"de","lat":47.5473,"lon":7.5896,"radius_m":1500,"country":"CH"}
+{"id":"lucerne_station","text":"Luzern Bahnhof","mode":"place","category":"station","language":"de","lat":47.0502,"lon":8.3112,"radius_m":1500,"country":"CH"}
+{"id":"interlaken_ost","text":"Interlaken Ost","mode":"place","category":"station","language":"de","lat":46.6905,"lon":7.869,"radius_m":1200,"country":"CH"}
+{"id":"lugano_stazione","text":"Stazione di Lugano","mode":"place","category":"station","language":"it","lat":46.0047,"lon":8.9472,"radius_m":1200,"country":"CH"}
+{"id":"lausanne_gare","text":"Gare de Lausanne","mode":"place","category":"station","language":"fr","lat":46.5168,"lon":6.6291,"radius_m":1200,"country":"CH"}
+{"id":"chur_bahnhof","text":"Bahnhof Chur","mode":"place","category":"station","language":"de","lat":46.8534,"lon":9.5299,"radius_m":1200,"country":"CH"}
+{"id":"zurich_airport","text":"Flughafen Zürich","mode":"place","category":"airport","language":"de","lat":47.4581,"lon":8.5555,"radius_m":2500,"country":"CH"}
+{"id":"geneva_airport","text":"Aéroport de Genève","mode":"place","category":"airport","language":"fr","lat":46.2381,"lon":6.109,"radius_m":2500,"country":"CH"}
+{"id":"jet_deau","text":"Jet d'eau Genève","mode":"place","category":"landmark","language":"fr","lat":46.2074,"lon":6.1559,"radius_m":1400,"country":"CH"}
+{"id":"grossmunster","text":"Grossmünster Zürich","mode":"place","category":"landmark","language":"de","lat":47.3701,"lon":8.5443,"radius_m":1000,"country":"CH"}
+{"id":"kapellbrucke","text":"Kapellbrücke Luzern","mode":"place","category":"landmark","language":"de","lat":47.0515,"lon":8.3073,"radius_m":1000,"country":"CH"}
+{"id":"chillon","text":"Château de Chillon","mode":"place","category":"attraction","language":"fr","lat":46.4142,"lon":6.9275,"radius_m":1300,"country":"CH"}
+{"id":"matterhorn","text":"Matterhorn","mode":"place","category":"attraction","language":"de","lat":45.9763,"lon":7.6586,"radius_m":2500,"country":"CH"}
+{"id":"cervino","text":"Cervino","mode":"place","category":"attraction","language":"it","lat":45.9763,"lon":7.6586,"radius_m":2500,"country":"CH"}
+{"id":"rheinfall","text":"Rheinfall Schaffhausen","mode":"place","category":"attraction","language":"de","lat":47.6779,"lon":8.6151,"radius_m":2000,"country":"CH"}
+{"id":"jungfraujoch","text":"Jungfraujoch","mode":"place","category":"attraction","language":"de","lat":46.5474,"lon":7.9853,"radius_m":1600,"country":"CH"}
+{"id":"bundeshaus","text":"Bundeshaus Bern","mode":"place","category":"landmark","language":"de","lat":46.9467,"lon":7.4442,"radius_m":1000,"country":"CH"}
+{"id":"united_nations","text":"Palais des Nations Genève","mode":"place","category":"landmark","language":"fr","lat":46.2264,"lon":6.1406,"radius_m":1200,"country":"CH"}
+{"id":"olympic_museum","text":"Musée Olympique Lausanne","mode":"place","category":"attraction","language":"fr","lat":46.5085,"lon":6.6335,"radius_m":1300,"country":"CH"}
+{"id":"kunsthaus_zurich","text":"Kunsthaus Zürich","mode":"place","category":"attraction","language":"de","lat":47.3705,"lon":8.5483,"radius_m":1100,"country":"CH"}
+{"id":"hotel_baur","text":"Baur au Lac Zürich","mode":"place","category":"hotel","language":"de","lat":47.3675,"lon":8.5398,"radius_m":1200,"country":"CH"}
+{"id":"hotel_dolder","text":"The Dolder Grand","mode":"place","category":"hotel","language":"en","lat":47.3721,"lon":8.5722,"radius_m":1600,"country":"CH"}
+{"id":"hotel_beau","text":"Beau-Rivage Palace Lausanne","mode":"place","category":"hotel","language":"fr","lat":46.5086,"lon":6.6283,"radius_m":1600,"country":"CH"}
+{"id":"hotel_des_berges","text":"Four Seasons Hotel des Bergues","mode":"place","category":"hotel","language":"en","lat":46.2062,"lon":6.1465,"radius_m":1500,"country":"CH"}
+{"id":"hotel_victoria","text":"Victoria-Jungfrau Grand Hotel","mode":"place","category":"hotel","language":"en","lat":46.686,"lon":7.8568,"radius_m":1600,"country":"CH"}
+{"id":"restaurant_kronenhalle","text":"Kronenhalle Zürich","mode":"place","category":"restaurant","language":"de","lat":47.3686,"lon":8.5461,"radius_m":1500,"country":"CH"}
+{"id":"restaurant_cheval","text":"Le Cheval Blanc Basel","mode":"place","category":"restaurant","language":"fr","lat":47.5596,"lon":7.5886,"radius_m":4000,"country":"CH"}
+{"id":"restaurant_blinde","text":"Blindekuh Zürich","mode":"place","category":"restaurant","language":"de","lat":47.381,"lon":8.527,"radius_m":3000,"country":"CH"}
+{"id":"restaurant_bindschedler","text":"Bindschedler Zürich","mode":"place","category":"restaurant","language":"de","lat":47.3769,"lon":8.5417,"radius_m":5000,"country":"CH"}
+{"id":"restaurant_chesa","text":"Chesa Veglia St. Moritz","mode":"place","category":"restaurant","language":"rm","lat":46.4966,"lon":9.8382,"radius_m":2300,"country":"CH"}
+{"id":"address_bahnhofstrasse","text":"Bahnhofstrasse 1 Zürich","mode":"address","category":"address","language":"de","lat":47.3688,"lon":8.5391,"radius_m":2500,"country":"CH"}
+{"id":"address_geneva","text":"Rue du Rhône 1 Genève","mode":"address","category":"address","language":"fr","lat":46.2048,"lon":6.1482,"radius_m":2500,"country":"CH"}
+{"id":"address_bern","text":"Spitalgasse 1 Bern","mode":"address","category":"address","language":"de","lat":46.9487,"lon":7.4429,"radius_m":2500,"country":"CH"}
+{"id":"address_lausanne","text":"Rue de Bourg 1 Lausanne","mode":"address","category":"address","language":"fr","lat":46.5194,"lon":6.6374,"radius_m":2500,"country":"CH"}
+{"id":"address_lugano","text":"Via Nassa 1 Lugano","mode":"address","category":"address","language":"it","lat":46.0022,"lon":8.9507,"radius_m":2500,"country":"CH"}
+{"id":"address_basel","text":"Freie Strasse 1 Basel","mode":"address","category":"address","language":"de","lat":47.5599,"lon":7.5894,"radius_m":2500,"country":"CH"}
+{"id":"address_lucerne","text":"Pilatusstrasse 1 Luzern","mode":"address","category":"address","language":"de","lat":47.0488,"lon":8.3075,"radius_m":2500,"country":"CH"}
+{"id":"address_stgallen","text":"Marktgasse 1 St. Gallen","mode":"address","category":"address","language":"de","lat":47.4245,"lon":9.3767,"radius_m":2500,"country":"CH"}
+{"id":"address_fribourg","text":"Rue de Romont 1 Fribourg","mode":"address","category":"address","language":"fr","lat":46.8065,"lon":7.1619,"radius_m":2500,"country":"CH"}
+{"id":"address_locarno","text":"Piazza Grande 1 Locarno","mode":"address","category":"address","language":"it","lat":46.169,"lon":8.7995,"radius_m":2500,"country":"CH"}
+{"id":"autocomplete_bahnhof","text":"Zürich Hauptbah","mode":"autocomplete","category":"station","language":"de","lat":47.3782,"lon":8.5402,"radius_m":2000,"country":"CH"}
+{"id":"autocomplete_jet","text":"Jet d'e","mode":"autocomplete","category":"landmark","language":"fr","lat":46.2074,"lon":6.1559,"radius_m":2500,"country":"CH"}
+{"id":"autocomplete_mont","text":"Montre","mode":"autocomplete","category":"city","language":"fr","lat":46.4312,"lon":6.9107,"radius_m":6000,"country":"CH"}
+{"id":"autocomplete_chateau","text":"Château de Chil","mode":"autocomplete","category":"attraction","language":"fr","lat":46.4142,"lon":6.9275,"radius_m":1800,"country":"CH"}
+{"id":"autocomplete_baur","text":"Baur au","mode":"autocomplete","category":"hotel","language":"de","lat":47.3675,"lon":8.5398,"radius_m":1500,"country":"CH"}
+{"id":"autocomplete_lugan","text":"Lugan","mode":"autocomplete","category":"city","language":"it","lat":46.0037,"lon":8.9511,"radius_m":5000,"country":"CH"}
+{"id":"de_berlin_de","text":"Berlin","mode":"place","category":"city","language":"de","lat":52.52,"lon":13.405,"radius_m":6000,"country":"DE"}
+{"id":"de_berlin_en","text":"Berlin Germany","mode":"place","category":"city","language":"en","lat":52.52,"lon":13.405,"radius_m":8000,"country":"DE"}
+{"id":"de_munich_de","text":"München","mode":"place","category":"city","language":"de","lat":48.1374,"lon":11.5755,"radius_m":5000,"country":"DE"}
+{"id":"de_munich_en","text":"Munich","mode":"place","category":"city","language":"en","lat":48.1374,"lon":11.5755,"radius_m":6000,"country":"DE"}
+{"id":"de_hamburg","text":"Hamburg","mode":"place","category":"city","language":"de","lat":53.5503,"lon":9.992,"radius_m":6000,"country":"DE"}
+{"id":"de_frankfurt","text":"Frankfurt am Main","mode":"place","category":"city","language":"de","lat":50.1109,"lon":8.6821,"radius_m":6000,"country":"DE"}
+{"id":"de_cologne_de","text":"Köln","mode":"place","category":"city","language":"de","lat":50.9384,"lon":6.9599,"radius_m":6000,"country":"DE"}
+{"id":"de_cologne_en","text":"Cologne","mode":"place","category":"city","language":"en","lat":50.9384,"lon":6.9599,"radius_m":6000,"country":"DE"}
+{"id":"de_dusseldorf","text":"Düsseldorf","mode":"place","category":"city","language":"de","lat":51.2277,"lon":6.7735,"radius_m":5000,"country":"DE"}
+{"id":"de_stuttgart","text":"Stuttgart","mode":"place","category":"city","language":"de","lat":48.7758,"lon":9.1829,"radius_m":6000,"country":"DE"}
+{"id":"de_leipzig","text":"Leipzig","mode":"place","category":"city","language":"de","lat":51.3397,"lon":12.3731,"radius_m":5000,"country":"DE"}
+{"id":"de_dresden","text":"Dresden","mode":"place","category":"city","language":"de","lat":51.0504,"lon":13.7373,"radius_m":5000,"country":"DE"}
+{"id":"de_bremen","text":"Bremen","mode":"place","category":"city","language":"de","lat":53.0793,"lon":8.8017,"radius_m":6000,"country":"DE"}
+{"id":"de_nuremberg","text":"Nürnberg","mode":"place","category":"city","language":"de","lat":49.4521,"lon":11.0767,"radius_m":5000,"country":"DE"}
+{"id":"de_nuremberg_en","text":"Nuremberg","mode":"place","category":"city","language":"en","lat":49.4521,"lon":11.0767,"radius_m":7000,"country":"DE"}
+{"id":"de_freiburg","text":"Freiburg im Breisgau","mode":"place","category":"city","language":"de","lat":47.999,"lon":7.8421,"radius_m":6500,"country":"DE"}
+{"id":"de_heidelberg","text":"Heidelberg","mode":"place","category":"city","language":"de","lat":49.3988,"lon":8.6724,"radius_m":6000,"country":"DE"}
+{"id":"de_aachen","text":"Aachen","mode":"place","category":"city","language":"de","lat":50.7753,"lon":6.0839,"radius_m":6000,"country":"DE"}
+{"id":"de_bonn","text":"Bonn","mode":"place","category":"city","language":"de","lat":50.7374,"lon":7.0982,"radius_m":5500,"country":"DE"}
+{"id":"de_potsdam","text":"Potsdam","mode":"place","category":"city","language":"de","lat":52.3906,"lon":13.0645,"radius_m":6000,"country":"DE"}
+{"id":"de_berlin_hbf","text":"Berlin Hauptbahnhof","mode":"place","category":"station","language":"de","lat":52.5251,"lon":13.3694,"radius_m":1600,"country":"DE"}
+{"id":"de_berlin_hbf_en","text":"Berlin Central Station","mode":"place","category":"station","language":"en","lat":52.5251,"lon":13.3694,"radius_m":2000,"country":"DE"}
+{"id":"de_munich_hbf","text":"München Hauptbahnhof","mode":"place","category":"station","language":"de","lat":48.1404,"lon":11.5587,"radius_m":1600,"country":"DE"}
+{"id":"de_hamburg_hbf","text":"Hamburg Hauptbahnhof","mode":"place","category":"station","language":"de","lat":53.5526,"lon":10.0067,"radius_m":1600,"country":"DE"}
+{"id":"de_frankfurt_hbf","text":"Frankfurt Hauptbahnhof","mode":"place","category":"station","language":"de","lat":50.107,"lon":8.6631,"radius_m":1800,"country":"DE"}
+{"id":"de_cologne_hbf","text":"Köln Hauptbahnhof","mode":"place","category":"station","language":"de","lat":50.9423,"lon":6.9584,"radius_m":1600,"country":"DE"}
+{"id":"de_leipzig_hbf","text":"Leipzig Hauptbahnhof","mode":"place","category":"station","language":"de","lat":51.3458,"lon":12.3823,"radius_m":1600,"country":"DE"}
+{"id":"de_berlin_airport","text":"Flughafen Berlin Brandenburg","mode":"place","category":"airport","language":"de","lat":52.3667,"lon":13.5033,"radius_m":3500,"country":"DE"}
+{"id":"de_frankfurt_airport","text":"Frankfurt Flughafen","mode":"place","category":"airport","language":"de","lat":50.0379,"lon":8.5622,"radius_m":4000,"country":"DE"}
+{"id":"de_brandenburg_gate","text":"Brandenburger Tor","mode":"place","category":"landmark","language":"de","lat":52.5163,"lon":13.3777,"radius_m":1600,"country":"DE"}
+{"id":"de_reichstag","text":"Reichstagsgebäude Berlin","mode":"place","category":"landmark","language":"de","lat":52.5186,"lon":13.3761,"radius_m":1600,"country":"DE"}
+{"id":"de_alexanderplatz","text":"Alexanderplatz Berlin","mode":"place","category":"landmark","language":"de","lat":52.5219,"lon":13.4132,"radius_m":2000,"country":"DE"}
+{"id":"de_berlin_cathedral","text":"Berliner Dom","mode":"place","category":"landmark","language":"de","lat":52.5191,"lon":13.401,"radius_m":1500,"country":"DE"}
+{"id":"de_neuschwanstein","text":"Schloss Neuschwanstein","mode":"place","category":"attraction","language":"de","lat":47.5576,"lon":10.7498,"radius_m":3000,"country":"DE"}
+{"id":"de_cologne_dom","text":"Kölner Dom","mode":"place","category":"attraction","language":"de","lat":50.9413,"lon":6.9583,"radius_m":1200,"country":"DE"}
+{"id":"de_heidelberg_schloss","text":"Heidelberger Schloss","mode":"place","category":"attraction","language":"de","lat":49.4107,"lon":8.7158,"radius_m":1900,"country":"DE"}
+{"id":"de_english_garden","text":"Englischer Garten München","mode":"place","category":"attraction","language":"de","lat":48.1642,"lon":11.6053,"radius_m":6000,"country":"DE"}
+{"id":"de_hotel_adlon","text":"Hotel Adlon Kempinski","mode":"place","category":"hotel","language":"de","lat":52.516,"lon":13.3802,"radius_m":1300,"country":"DE"}
+{"id":"de_hotel_bayerischer","text":"Bayerischer Hof München","mode":"place","category":"hotel","language":"de","lat":48.1406,"lon":11.5738,"radius_m":1300,"country":"DE"}
+{"id":"de_restaurant_hofbraeuhaus","text":"Hofbräuhaus München","mode":"place","category":"restaurant","language":"de","lat":48.1377,"lon":11.58,"radius_m":1400,"country":"DE"}
+{"id":"de_restaurant_berlin","text":"Restaurant Tim Raue Berlin","mode":"place","category":"restaurant","language":"de","lat":52.5068,"lon":13.3939,"radius_m":2000,"country":"DE"}
+{"id":"de_address_berlin","text":"Unter den Linden 1 Berlin","mode":"address","category":"address","language":"de","lat":52.5186,"lon":13.3951,"radius_m":2800,"country":"DE"}
+{"id":"de_address_munich","text":"Marienplatz 1 München","mode":"address","category":"address","language":"de","lat":48.1374,"lon":11.5755,"radius_m":2500,"country":"DE"}
+{"id":"de_address_frankfurt","text":"Zeil 1 Frankfurt am Main","mode":"address","category":"address","language":"de","lat":50.1149,"lon":8.6878,"radius_m":3000,"country":"DE"}
+{"id":"de_address_hamburg","text":"Mönckebergstraße 1 Hamburg","mode":"address","category":"address","language":"de","lat":53.5509,"lon":10.003,"radius_m":2800,"country":"DE"}
+{"id":"de_address_cologne","text":"Hohe Straße 1 Köln","mode":"address","category":"address","language":"de","lat":50.9386,"lon":6.9588,"radius_m":2800,"country":"DE"}
+{"id":"de_autocomplete_berlin","text":"Berlin Hauptbah","mode":"autocomplete","category":"station","language":"de","lat":52.5251,"lon":13.3694,"radius_m":2500,"country":"DE"}
+{"id":"de_autocomplete_munich","text":"Münch","mode":"autocomplete","category":"city","language":"de","lat":48.1374,"lon":11.5755,"radius_m":6500,"country":"DE"}
+{"id":"de_autocomplete_cologne","text":"Kölner D","mode":"autocomplete","category":"attraction","language":"de","lat":50.9413,"lon":6.9583,"radius_m":2000,"country":"DE"}
+{"id":"de_autocomplete_freiburg","text":"Freiburg im B","mode":"autocomplete","category":"city","language":"de","lat":47.999,"lon":7.8421,"radius_m":6500,"country":"DE"}
+{"id":"fr_paris_fr","text":"Paris","mode":"place","category":"city","language":"fr","lat":48.8566,"lon":2.3522,"radius_m":7000,"country":"FR"}
+{"id":"fr_paris_de","text":"Paris Frankreich","mode":"place","category":"city","language":"de","lat":48.8566,"lon":2.3522,"radius_m":9000,"country":"FR"}
+{"id":"fr_lyon","text":"Lyon","mode":"place","category":"city","language":"fr","lat":45.764,"lon":4.8357,"radius_m":6500,"country":"FR"}
+{"id":"fr_marseille","text":"Marseille","mode":"place","category":"city","language":"fr","lat":43.2965,"lon":5.3698,"radius_m":7000,"country":"FR"}
+{"id":"fr_toulouse","text":"Toulouse","mode":"place","category":"city","language":"fr","lat":43.6047,"lon":1.4442,"radius_m":6500,"country":"FR"}
+{"id":"fr_nice","text":"Nice","mode":"place","category":"city","language":"fr","lat":43.7102,"lon":7.262,"radius_m":6500,"country":"FR"}
+{"id":"fr_nice_en","text":"Nice France","mode":"place","category":"city","language":"en","lat":43.7102,"lon":7.262,"radius_m":7500,"country":"FR"}
+{"id":"fr_bordeaux","text":"Bordeaux","mode":"place","category":"city","language":"fr","lat":44.8378,"lon":-0.5792,"radius_m":7000,"country":"FR"}
+{"id":"fr_lille","text":"Lille","mode":"place","category":"city","language":"fr","lat":50.6292,"lon":3.0573,"radius_m":6000,"country":"FR"}
+{"id":"fr_strasbourg","text":"Strasbourg","mode":"place","category":"city","language":"fr","lat":48.5734,"lon":7.7521,"radius_m":6500,"country":"FR"}
+{"id":"fr_strassburg","text":"Straßburg","mode":"place","category":"city","language":"de","lat":48.5734,"lon":7.7521,"radius_m":7000,"country":"FR"}
+{"id":"fr_nantes","text":"Nantes","mode":"place","category":"city","language":"fr","lat":47.2184,"lon":-1.5536,"radius_m":6500,"country":"FR"}
+{"id":"fr_rennes","text":"Rennes","mode":"place","category":"city","language":"fr","lat":48.1173,"lon":-1.6778,"radius_m":6500,"country":"FR"}
+{"id":"fr_montpellier","text":"Montpellier","mode":"place","category":"city","language":"fr","lat":43.6108,"lon":3.8767,"radius_m":7000,"country":"FR"}
+{"id":"fr_grenoble","text":"Grenoble","mode":"place","category":"city","language":"fr","lat":45.1885,"lon":5.7245,"radius_m":6500,"country":"FR"}
+{"id":"fr_rouen","text":"Rouen","mode":"place","category":"city","language":"fr","lat":49.4431,"lon":1.0993,"radius_m":6500,"country":"FR"}
+{"id":"fr_annecy","text":"Annecy","mode":"place","category":"city","language":"fr","lat":45.8992,"lon":6.1294,"radius_m":6000,"country":"FR"}
+{"id":"fr_reims","text":"Reims","mode":"place","category":"city","language":"fr","lat":49.2583,"lon":4.0317,"radius_m":6500,"country":"FR"}
+{"id":"fr_dijon","text":"Dijon","mode":"place","category":"city","language":"fr","lat":47.322,"lon":5.0415,"radius_m":6500,"country":"FR"}
+{"id":"fr_avignon","text":"Avignon","mode":"place","category":"city","language":"fr","lat":43.9493,"lon":4.8055,"radius_m":6500,"country":"FR"}
+{"id":"fr_paris_nord","text":"Gare du Nord Paris","mode":"place","category":"station","language":"fr","lat":48.8809,"lon":2.3553,"radius_m":1800,"country":"FR"}
+{"id":"fr_paris_lyon_station","text":"Gare de Lyon Paris","mode":"place","category":"station","language":"fr","lat":48.8449,"lon":2.3735,"radius_m":1800,"country":"FR"}
+{"id":"fr_paris_est","text":"Gare de l'Est","mode":"place","category":"station","language":"fr","lat":48.8769,"lon":2.3584,"radius_m":1800,"country":"FR"}
+{"id":"fr_lyon_partdieu","text":"Gare de Lyon Part-Dieu","mode":"place","category":"station","language":"fr","lat":45.7605,"lon":4.8618,"radius_m":1800,"country":"FR"}
+{"id":"fr_bordeaux_stjean","text":"Gare de Bordeaux Saint-Jean","mode":"place","category":"station","language":"fr","lat":44.8255,"lon":-0.5567,"radius_m":1800,"country":"FR"}
+{"id":"fr_marseille_stcharles","text":"Gare de Marseille Saint-Charles","mode":"place","category":"station","language":"fr","lat":43.3027,"lon":5.3804,"radius_m":1800,"country":"FR"}
+{"id":"fr_strasbourg_gare","text":"Gare de Strasbourg","mode":"place","category":"station","language":"fr","lat":48.585,"lon":7.7345,"radius_m":1800,"country":"FR"}
+{"id":"fr_lille_flandres","text":"Gare de Lille-Flandres","mode":"place","category":"station","language":"fr","lat":50.6361,"lon":3.0714,"radius_m":1800,"country":"FR"}
+{"id":"fr_cdg","text":"Aéroport Paris Charles de Gaulle","mode":"place","category":"airport","language":"fr","lat":49.0097,"lon":2.5479,"radius_m":5000,"country":"FR"}
+{"id":"fr_orly","text":"Aéroport de Paris-Orly","mode":"place","category":"airport","language":"fr","lat":48.7262,"lon":2.3652,"radius_m":5000,"country":"FR"}
+{"id":"fr_eiffel","text":"Tour Eiffel Paris","mode":"place","category":"landmark","language":"fr","lat":48.8584,"lon":2.2945,"radius_m":1800,"country":"FR"}
+{"id":"fr_louvre","text":"Musée du Louvre","mode":"place","category":"museum","language":"fr","lat":48.8606,"lon":2.3376,"radius_m":2000,"country":"FR"}
+{"id":"fr_notre_dame","text":"Cathédrale Notre-Dame de Paris","mode":"place","category":"landmark","language":"fr","lat":48.853,"lon":2.3499,"radius_m":1800,"country":"FR"}
+{"id":"fr_arc_triomphe","text":"Arc de Triomphe","mode":"place","category":"landmark","language":"fr","lat":48.8738,"lon":2.295,"radius_m":1600,"country":"FR"}
+{"id":"fr_versailles","text":"Château de Versailles","mode":"place","category":"attraction","language":"fr","lat":48.8049,"lon":2.1204,"radius_m":3000,"country":"FR"}
+{"id":"fr_mont_saintmichel","text":"Mont Saint-Michel","mode":"place","category":"attraction","language":"fr","lat":48.6361,"lon":-1.5115,"radius_m":3300,"country":"FR"}
+{"id":"fr_sacre_coeur","text":"Basilique du Sacré-Cœur","mode":"place","category":"landmark","language":"fr","lat":48.8867,"lon":2.3431,"radius_m":1800,"country":"FR"}
+{"id":"fr_pont_gard","text":"Pont du Gard","mode":"place","category":"attraction","language":"fr","lat":43.9474,"lon":4.535,"radius_m":2800,"country":"FR"}
+{"id":"fr_hotel_ritz","text":"Ritz Paris","mode":"place","category":"hotel","language":"fr","lat":48.8681,"lon":2.3289,"radius_m":1400,"country":"FR"}
+{"id":"fr_hotel_crillon","text":"Hôtel de Crillon","mode":"place","category":"hotel","language":"fr","lat":48.8676,"lon":2.321,"radius_m":1800,"country":"FR"}
+{"id":"fr_hotel_negresco","text":"Hôtel Negresco Nice","mode":"place","category":"hotel","language":"fr","lat":43.6945,"lon":7.257,"radius_m":1500,"country":"FR"}
+{"id":"fr_restaurant_tourargent","text":"La Tour d'Argent Paris","mode":"place","category":"restaurant","language":"fr","lat":48.8493,"lon":2.355,"radius_m":1700,"country":"FR"}
+{"id":"fr_restaurant_paulbocuse","text":"Restaurant Paul Bocuse Lyon","mode":"place","category":"restaurant","language":"fr","lat":45.8166,"lon":4.8477,"radius_m":2800,"country":"FR"}
+{"id":"fr_address_rivoli","text":"Rue de Rivoli 1 Paris","mode":"address","category":"address","language":"fr","lat":48.8559,"lon":2.3597,"radius_m":3500,"country":"FR"}
+{"id":"fr_address_champs","text":"Avenue des Champs-Élysées 1 Paris","mode":"address","category":"address","language":"fr","lat":48.8693,"lon":2.3088,"radius_m":3500,"country":"FR"}
+{"id":"fr_address_lyon","text":"Rue de la République 1 Lyon","mode":"address","category":"address","language":"fr","lat":45.7623,"lon":4.8365,"radius_m":3500,"country":"FR"}
+{"id":"fr_address_marseille","text":"La Canebière 1 Marseille","mode":"address","category":"address","language":"fr","lat":43.2979,"lon":5.3803,"radius_m":3500,"country":"FR"}
+{"id":"fr_address_nice","text":"Promenade des Anglais 1 Nice","mode":"address","category":"address","language":"fr","lat":43.6942,"lon":7.2607,"radius_m":4500,"country":"FR"}
+{"id":"fr_autocomplete_paris","text":"Gare du N","mode":"autocomplete","category":"station","language":"fr","lat":48.8809,"lon":2.3553,"radius_m":3000,"country":"FR"}
+{"id":"fr_autocomplete_louvre","text":"Musée du Lou","mode":"autocomplete","category":"museum","language":"fr","lat":48.8606,"lon":2.3376,"radius_m":3000,"country":"FR"}
+{"id":"fr_autocomplete_strasbourg","text":"Strasbo","mode":"autocomplete","category":"city","language":"fr","lat":48.5734,"lon":7.7521,"radius_m":7000,"country":"FR"}
+{"id":"fr_autocomplete_eiffel","text":"Tour Eif","mode":"autocomplete","category":"landmark","language":"fr","lat":48.8584,"lon":2.2945,"radius_m":2500,"country":"FR"}
+{"id":"fr_autocomplete_annecy","text":"Annec","mode":"autocomplete","category":"city","language":"fr","lat":45.8992,"lon":6.1294,"radius_m":7000,"country":"FR"}
