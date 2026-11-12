@@ -18,7 +18,7 @@ jobs:
   cargo-check:
     name: Check all Rust targets
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       # Limit parallel dependency builds on memory-constrained hosted runners.
       CARGO_BUILD_JOBS: "2"
@@ -36,3 +36,25 @@ jobs:
 
       - name: Check library, compiler, ingest, query, and test targets
         run: cargo check --locked --all-targets
+
+      - name: Test packed mmap index encoding and query
+        run: |
+          cargo test --locked --lib packed_token
+          cargo test --locked --bin compiler packed_token
+          cargo test --locked --bin query
+
+      - name: Validate Europe benchmark scripts and workload
+        run: |
+          bash -n benchmarks/switzerland_ab/run.sh
+          python3 -m py_compile benchmarks/switzerland_ab/compare.py
+          python3 - <<'PY'
+          import json
+          from collections import Counter
+          from pathlib import Path
+          path = Path("benchmarks/switzerland_ab/workload.jsonl")
+          cases = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+          counts = Counter(c["country"] for c in cases)
+          assert counts == {"CH": 81, "DE": 50, "FR": 53}, counts
+          assert len({c["id"] for c in cases}) == len(cases)
+          print(counts)
+          PY
