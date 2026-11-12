@@ -53,13 +53,13 @@ cp "$EXPERIMENT_TARGET/release/compiler" "$DATA/experimental-compiler"
 # Fail before starting Scylla, downloading three country PBFs, or importing.
 # This catches accidentally copying main's compiler into the experiment slot.
 echo "Verifying experimental compiler CLI and binary provenance"
-if ! "$DATA/experimental-compiler" --help | grep -F -- '--packed-token-index'; then
-  echo "ERROR: experiment compiler does not support --packed-token-index." >&2
+if ! "$DATA/experimental-compiler" --help | grep -F -- '--roaring-token-index'; then
+  echo "ERROR: experiment compiler does not support --roaring-token-index." >&2
   echo "Expected: $ROOT/Cargo.toml at git $(git rev-parse HEAD)" >&2
   echo "Built into: $EXPERIMENT_TARGET/release/compiler" >&2
   exit 1
 fi
-if "$DATA/main-compiler" --help | grep -Fq -- '--packed-token-index'; then
+if "$DATA/main-compiler" --help | grep -Fq -- '--roaring-token-index'; then
   echo "ERROR: baseline binary unexpectedly has the experimental CLI flag." >&2
   exit 1
 fi
@@ -206,15 +206,15 @@ run_engine baseline "$DATA/main-query" token
 echo "Reclaiming baseline mmap files before experimental compile"
 rm -rf "$DATA/compiled/baseline"
 df -h "$DATA"
-echo "Compiling experimental packed posting index using its own compiler"
+echo "Compiling Roaring-style hybrid posting index using its own compiler"
 time "$DATA/experimental-compiler" --scylla-url 127.0.0.1 \
   --out-dir "$DATA/compiled/experiment" --tmp-dir "$DATA/tmp/experiment" \
   --concurrency "${BENCHMARK_COMPILER_CONCURRENCY:-2}" \
-  --packed-token-index
+  --roaring-token-index
 du -sh "$DATA/compiled/experiment" | tee "$RESULTS/index-size-experiment.txt"
 find "$DATA/compiled/experiment" -type f -printf '%P %s bytes\n' | sort > "$RESULTS/index-files-experiment.txt"
-test -s "$DATA/compiled/experiment/cypress_token_pack.bin"
-run_engine experiment "$DATA/experimental-query" open-geocode
+test -s "$DATA/compiled/experiment/cypress_roaring_tokens.bin"
+run_engine experiment "$DATA/experimental-query" roaring
 python3 benchmarks/switzerland_ab/compare.py summarize \
   --baseline "$RESULTS/baseline.json" \
   --experiment "$RESULTS/experiment.json" --output "$RESULTS"
