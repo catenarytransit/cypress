@@ -20,14 +20,9 @@ cleanup() {
   if [[ -n "${SERVER_PID:-}" ]]; then kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true; fi
   docker rm -f cypress-swiss-ab-scylla >/dev/null 2>&1 || true
 }
-PBF="$DATA/switzerland.osm.pbf"
-curl --fail --location --retry 4 --retry-delay 5 \
-  --output "$PBF" "https://download.geofabrik.de/europe/switzerland-latest.osm.pbf"
-test -s "$PBF"
-sha256sum "$PBF" | tee "$RESULTS/geofabrik.sha256"
-osmium fileinfo "$PBF" | tee "$RESULTS/geofabrik-info.txt"
-"$ROOT/scripts/filter_osm.sh" "$PBF" "$DATA/switzerland-filtered.osm.pbf"
-"$ROOT/scripts/filter_admins.sh" "$PBF" "$DATA/switzerland-admins.osm.pbf"
+# One shared Scylla dataset is imported below, sequentially country by country.
+# Do not retain all three raw/filter PBF copies on the 14 GiB hosted runner.
+echo "Regions: Switzerland, Germany, France (same Scylla DB; distinct A/B compilers)"
 
 if [[ -n "${BENCHMARK_MIN_RAM_GIB:-}" ]]; then
   mem_gib="$(awk '/MemTotal:/ {print int($2 / 1048576)}' /proc/meminfo)"
@@ -44,9 +39,10 @@ echo "Building control from pinned main SHA $BASE_SHA"
 cp "$CARGO_TARGET_DIR/release/query" "$DATA/main-query"
 cp "$CARGO_TARGET_DIR/release/ingest" "$DATA/main-ingest"
 cp "$CARGO_TARGET_DIR/release/compiler" "$DATA/main-compiler"
-echo "Building experimental query binary"
-cargo build --locked --release --bin query
+echo "Building experimental compiler and query binaries"
+cargo build --locked --release --bin compiler --bin query
 cp "$CARGO_TARGET_DIR/release/query" "$DATA/experimental-query"
+cp "$CARGO_TARGET_DIR/release/compiler" "$DATA/experimental-compiler"
 
 # Dedicated, disposable Scylla instance. Never point fixture ingest at production.
 # Seastar subtracts a default OS reservation (at least ~1.5 GiB) from the
@@ -97,17 +93,48 @@ if [[ "$SCYLLA_READY" != true ]]; then
 fi
 
 
-echo "Importing Switzerland once from identical unfiltered-source subset"
-time "$DATA/main-ingest" single \
-  --file "$DATA/switzerland-filtered.osm.pbf" \
-  --admin-file "$DATA/switzerland-admins.osm.pbf" \
-  --scylla-url 127.0.0.1 --create-index
-echo "Compiling common generation with token FST/postings enabled"
+# One country at a time: fetch, filter, ingest, delete all PBF intermediates.
+# Only the first import truncates the disposable Scylla tables; subsequent
+# imports upsert into the *same* complete three-country dataset.
+import_region() {
+  local region="$1" truncate="$2"
+  local source="$DATA/${region}.osm.pbf"
+  local filtered="$DATA/${region}-filtered.osm.pbf"
+  local admins="$DATA/${region}-admins.osm.pbf"
+  local url="https://download.geofabrik.de/europe/${region}-latest.osm.pbf"
+  echo "Importing ${region}: ${url}"
+  curl --fail --location --retry 4 --retry-delay 5 --output "$source" "$url"
+  test -s "$source"
+  sha256sum "$source" | tee "$RESULTS/${region}.sha256"
+  osmium fileinfo "$source" > "$RESULTS/${region}-pbf-info.txt"
+  "$ROOT/scripts/filter_osm.sh" "$source" "$filtered"
+  "$ROOT/scripts/filter_admins.sh" "$source" "$admins"
+  rm -f "$source"
+  if [[ "$truncate" == "yes" ]]; then
+    time "$DATA/main-ingest" single --file "$filtered" --admin-file "$admins" \
+      --scylla-url 127.0.0.1 --create-index
+  else
+    time "$DATA/main-ingest" single --file "$filtered" --admin-file "$admins" \
+      --scylla-url 127.0.0.1
+  fi
+  rm -f "$filtered" "$admins"
+  df -h "$DATA"
+}
+import_region switzerland yes
+import_region germany no
+import_region france no
+echo "All three regions imported into one disposable Scylla database"
+docker stats --no-stream cypress-swiss-ab-scylla > "$RESULTS/scylla-after-import.txt"
+
+# Two independently compiled generations from exactly the same source records,
+# but distinct compilers / index layouts. Compile and benchmark A first, then
+# reclaim its generation before building B (the same Scylla DB remains alive).
+echo "Compiling baseline main token index"
 time "$DATA/main-compiler" --scylla-url 127.0.0.1 \
-  --out-dir "$DATA/compiled" --tmp-dir "$DATA/tmp" \
+  --out-dir "$DATA/compiled/baseline" --tmp-dir "$DATA/tmp/baseline" \
   --concurrency "${BENCHMARK_COMPILER_CONCURRENCY:-2}" --token-index
-du -sh "$DATA/compiled" | tee "$RESULTS/index-size.txt"
-find "$DATA/compiled" -type f -printf '%P %s bytes\n' | sort > "$RESULTS/index-files.txt"
+du -sh "$DATA/compiled/baseline" | tee "$RESULTS/index-size-baseline.txt"
+find "$DATA/compiled/baseline" -type f -printf '%P %s bytes\n' | sort > "$RESULTS/index-files-baseline.txt"
 
 # Identical production flags for both binaries: only the retrieval selector changes.
 export RUST_LOG='debug,cypress=debug,cypress::query::timing=debug'
@@ -119,7 +146,7 @@ run_engine() {
   local name="$1" binary="$2" mode="$3"
   export CYPRESS_TOKEN_RETRIEVAL_MODE="$mode"
   echo "Starting $name, retrieval=$mode"
-  "$binary" --memdb-dir "$DATA/compiled" --scylla-url 127.0.0.1 \
+  "$binary" --memdb-dir "$DATA/compiled/$name" --scylla-url 127.0.0.1 \
     --listen 127.0.0.1:3000 > "$RESULTS/$name-server.log" 2>&1 &
   SERVER_PID=$!
   local ready=false
@@ -146,11 +173,22 @@ run_engine() {
 # First run control, then experiment; repeat in reverse order on dedicated hosts
 # for more robust comparisons of memory cache and thermal effects.
 run_engine baseline "$DATA/main-query" token
+echo "Reclaiming baseline mmap files before experimental compile"
+rm -rf "$DATA/compiled/baseline"
+df -h "$DATA"
+echo "Compiling experimental packed posting index using its own compiler"
+time "$DATA/experimental-compiler" --scylla-url 127.0.0.1 \
+  --out-dir "$DATA/compiled/experiment" --tmp-dir "$DATA/tmp/experiment" \
+  --concurrency "${BENCHMARK_COMPILER_CONCURRENCY:-2}" \
+  --token-index --packed-token-index
+du -sh "$DATA/compiled/experiment" | tee "$RESULTS/index-size-experiment.txt"
+find "$DATA/compiled/experiment" -type f -printf '%P %s bytes\n' | sort > "$RESULTS/index-files-experiment.txt"
+test -s "$DATA/compiled/experiment/cypress_token_pack.bin"
 run_engine experiment "$DATA/experimental-query" open-geocode
 python3 benchmarks/switzerland_ab/compare.py summarize \
   --baseline "$RESULTS/baseline.json" \
   --experiment "$RESULTS/experiment.json" --output "$RESULTS"
-git rev-parse HEAD > "$RESULTS/experiment.sha"
+git rev-parse HEAD > "$RESULTS/experiment.sha"\nprintf '%s\\n' "switzerland germany france" > "$RESULTS/imported-regions.txt"
 printf '%s\n' "$BASE_SHA" > "$RESULTS/main.sha"
 docker stats --no-stream cypress-swiss-ab-scylla > "$RESULTS/scylla-memory.txt"
 echo "Saved summary: $RESULTS/summary.md"
