@@ -270,6 +270,21 @@ fn token_retrieval_mode() -> TokenRetrievalMode {
     })
 }
 
+// Field-aware administrative joins use whichever posting layout was compiled
+// for this generation. The experimental query does not mmap the v1 sidecar.
+enum QueryTokenIndex<'a> {
+    Delta(cypress::models::token_index::TokenIndexView<'a>),
+    Pack(cypress::models::packed_token::PackedTokenIndexView<'a>),
+}
+impl QueryTokenIndex<'_> {
+    fn retrieve(&self, query: &str) -> anyhow::Result<Option<(Vec<u32>, token_retrieval::RetrievalStats)>> {
+        match self {
+            Self::Delta(index) => token_retrieval::retrieve(index, query),
+            Self::Pack(index) => super::open_geocode_retrieval::retrieve(index, query),
+        }
+    }
+}
+
 static PREFIX_MODE: std::sync::OnceLock<PrefixMode> = std::sync::OnceLock::new();
 
 fn active_prefix_mode() -> PrefixMode {
@@ -1348,12 +1363,21 @@ pub fn search_place_ids(
 
         if token_candidate_ids.is_none() && (2..=8).contains(&query_tokens.len())
         {
-            if let (Some(sidecar), Some(admin_fst)) =
-                (memdb_data.token_mmap.as_ref(), admin_alias_fst.as_ref())
-            {
-                if let Ok(index) =
+            let field_index = if token_mode == TokenRetrievalMode::OpenGeocode {
+                memdb_data.packed_token_mmap.as_ref().map(|sidecar| {
+                    cypress::models::packed_token::PackedTokenIndexView::view_validated(sidecar)
+                        .map(QueryTokenIndex::Pack)
+                })
+            } else {
+                memdb_data.token_mmap.as_ref().map(|sidecar| {
                     cypress::models::token_index::TokenIndexView::view_validated(sidecar)
-                {
+                        .map(QueryTokenIndex::Delta)
+                })
+            };
+            if let (Some(index_result), Some(admin_fst)) =
+                (field_index, admin_alias_fst.as_ref())
+            {
+                if let Ok(index) = index_result {
                     let mut joined = Vec::<u32>::new();
                     let mut areas = Vec::<u32>::new();
                     let mut examined = 0u64;
@@ -1374,7 +1398,7 @@ pub fn search_place_ids(
                         let Ok(name) = std::str::from_utf8(&name) else {
                             continue;
                         };
-                        match token_retrieval::retrieve(&index, name) {
+                        match index.retrieve(name) {
                             Ok(Some((ids, stats))) => {
                                 examined += stats.posting_entries_examined;
                                 if let Some((filtered, join_stats)) =
