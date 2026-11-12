@@ -163,6 +163,51 @@ mod tests {
         assert_eq!(bytes.len(), 4 + CONTAINER_BYTES + BITMAP_BYTES);
     }
     #[test]
+    fn complete_bitmap_sparse_and_cross_shard_roundtrip() {
+        use cypress::models::roaring_token::{MAGIC, VERSION};
+        use cypress::models::token_index::TOKEN_ANALYZER_VERSION;
+        use fst::MapBuilder;
+        let mut ids: Vec<u32> = (0..4097).collect();
+        ids.extend([65539, 65586]);
+        let (encoded, arrays, bitmaps) = encode_list(&ids).unwrap();
+        assert_eq!((arrays, bitmaps), (1, 1));
+        let mut fst_builder = MapBuilder::memory();
+        fst_builder.insert("common", 0).unwrap();
+        let fst = fst_builder.into_inner().unwrap();
+        let names = b"common";
+        let offsets = [0u32, 6];
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&VERSION.to_le_bytes());
+        bytes.extend_from_slice(&TOKEN_ANALYZER_VERSION.to_le_bytes());
+        for value in [
+            1u64,
+            cypress::models::token_index::dictionary_fingerprint(names, &offsets),
+            1,
+            ids.len() as u64,
+            fst.len() as u64,
+            encoded.len() as u64,
+        ] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.extend_from_slice(&fst);
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&encoded);
+        let view = RoaringTokenIndexView::parse(&bytes).unwrap();
+        assert!(view.matches_dictionary(names, &offsets));
+        let p = view.lookup("common").unwrap().unwrap();
+        for id in [0, 250, 4096, 65539, 65586] {
+            assert!(p.contains(id), "missing included id {id}");
+        }
+        for id in [4097, 5000, 65538, 65587, 131073] {
+            assert!(!p.contains(id), "unexpected id {id}");
+        }
+        assert_eq!(p.anchor_ids(), ids);
+    }
+
+    #[test]
     fn multilingual_roundtrip() {
         let names = ["berlin", "berlin hauptbahnhof", "paris", "zürich", "東京駅"];
         let mut data = Vec::new();
