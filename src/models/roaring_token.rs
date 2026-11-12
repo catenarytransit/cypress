@@ -79,6 +79,9 @@ impl RoaringPosting<'_> {
         if left >= self.container_count() { return false; }
         let c = self.container(left);
         if c.high != high { return false; }
+        Self::contains_low(c, low)
+    }
+    fn contains_low(c: Container<'_>, low: u16) -> bool {
         if c.bitmap {
             let b = c.body[(low as usize) >> 3];
             return b & (1 << (low & 7)) != 0;
@@ -92,6 +95,24 @@ impl RoaringPosting<'_> {
         }
         lo < c.count as usize
             && u16::from_le_bytes(c.body[lo*2..lo*2+2].try_into().unwrap()) == low
+    }
+    /// Retain an increasing candidate stream using one forward container cursor.
+    /// Reuses the caller's allocation; never decodes the probe list.
+    pub fn retain_sorted(&self, ids: &mut Vec<u32>) -> u64 {
+        debug_assert!(ids.windows(2).all(|w| w[0] < w[1]));
+        let mut cursor = 0;
+        let mut probes = 0;
+        ids.retain(|&id| {
+            probes += 1;
+            let high = (id >> 16) as u16;
+            while cursor < self.container_count() && self.container(cursor).high < high {
+                cursor += 1;
+            }
+            if cursor == self.container_count() { return false; }
+            let c = self.container(cursor);
+            c.high == high && Self::contains_low(c, id as u16)
+        });
+        probes
     }
     /// Decode only the selected rarest anchor list, never the high-DF probes.
     pub fn anchor_ids(&self) -> Vec<u32> {

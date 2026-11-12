@@ -32,19 +32,14 @@ pub fn retrieve(
     let mut stats = RetrievalStats {
         tokens: lists.len(), anchor_df, ..Default::default()
     };
-    let mut matched = Vec::new();
-    for id in lists[0].anchor_ids() {
-        stats.posting_entries_examined += 1;
-        if lists[1..].iter().all(|p| {
-            stats.block_seeks += 1;
-            p.contains(id)
-        }) {
-            matched.push(id);
-            if matched.len() > MAX_FAST_PATH_IDS {
-                // Fall back to full legacy search instead of dropping results.
-                return Ok(None);
-            }
-        }
+    let mut matched = lists[0].anchor_ids();
+    stats.posting_entries_examined = matched.len() as u64;
+    for probe in &lists[1..] {
+        stats.block_seeks += probe.retain_sorted(&mut matched);
+        if matched.is_empty() { return Ok(None); }
+    }
+    if matched.len() > MAX_FAST_PATH_IDS {
+        return Ok(None);
     }
     stats.candidates = matched.len();
     if matched.is_empty() { return Ok(None); }

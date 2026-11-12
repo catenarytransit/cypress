@@ -24,8 +24,8 @@ cleanup() {
   docker rm -f cypress-swiss-ab-scylla >/dev/null 2>&1 || true
 }
 # One shared Scylla dataset is imported below, sequentially country by country.
-# Do not retain all three raw/filter PBF copies on the 14 GiB hosted runner.
-echo "Regions: Switzerland, Germany, France (same Scylla DB; distinct A/B compilers)"
+# Do not retain all five raw/filter PBF copies on the 14 GiB hosted runner.
+echo "Regions: Switzerland, Germany, France, United Kingdom, Italy (same Scylla DB; distinct A/B compilers)"
 
 if [[ -n "${BENCHMARK_MIN_RAM_GIB:-}" ]]; then
   mem_gib="$(awk '/MemTotal:/ {print int($2 / 1048576)}' /proc/meminfo)"
@@ -50,7 +50,7 @@ cargo build --manifest-path "$ROOT/Cargo.toml" --target-dir "$EXPERIMENT_TARGET"
 cp "$EXPERIMENT_TARGET/release/query" "$DATA/experimental-query"
 cp "$EXPERIMENT_TARGET/release/compiler" "$DATA/experimental-compiler"
 
-# Fail before starting Scylla, downloading three country PBFs, or importing.
+# Fail before starting Scylla, downloading five country PBFs, or importing.
 # This catches accidentally copying main's compiler into the experiment slot.
 echo "Verifying experimental compiler CLI and binary provenance"
 if ! "$DATA/experimental-compiler" --help | grep -F -- '--roaring-token-index'; then
@@ -99,33 +99,37 @@ docker run -d --name cypress-swiss-ab-scylla --memory="${SCYLLA_DOCKER_LIMIT_MIB
   -p 127.0.0.1:9042:9042 scylladb/scylla:5.4 \
   --smp 2 --memory "${SCYLLA_MEMORY_MIB}M" --overprovisioned 1
 
-SCYLLA_READY=false
-for i in $(seq 1 120); do
-  if docker exec cypress-swiss-ab-scylla cqlsh -e 'DESCRIBE KEYSPACES' >/dev/null 2>&1; then
-    SCYLLA_READY=true
-    break
-  fi
-  if docker logs cypress-swiss-ab-scylla 2>&1 | grep -Eq 'insufficient physical memory|gave up: scylla entered FATAL state'; then
-    echo "Scylla failed startup. Check Docker cgroup memory and Seastar's OS reserve." >&2
-    echo "Docker cap: ${SCYLLA_DOCKER_LIMIT_MIB} MiB; Scylla heap: ${SCYLLA_MEMORY_MIB} MiB." >&2
-    echo "Runner memory (Docker may have a separate cgroup limit):" >&2
-    free -h >&2 || true
-    docker inspect --format 'Docker memory limit: {{.HostConfig.Memory}} bytes' cypress-swiss-ab-scylla >&2 || true
+wait_for_scylla() {
+  local SCYLLA_READY=false
+  for i in $(seq 1 120); do
+    if docker exec cypress-swiss-ab-scylla cqlsh -e 'DESCRIBE KEYSPACES' >/dev/null 2>&1; then
+      SCYLLA_READY=true
+      break
+    fi
+    if docker logs cypress-swiss-ab-scylla 2>&1 | grep -Eq 'insufficient physical memory|gave up: scylla entered FATAL state'; then
+      echo "Scylla failed startup. Check Docker cgroup memory and Seastar's OS reserve." >&2
+      echo "Docker cap: ${SCYLLA_DOCKER_LIMIT_MIB} MiB; Scylla heap: ${SCYLLA_MEMORY_MIB} MiB." >&2
+      echo "Runner memory (Docker may have a separate cgroup limit):" >&2
+      free -h >&2 || true
+      docker inspect --format 'Docker memory limit: {{.HostConfig.Memory}} bytes' cypress-swiss-ab-scylla >&2 || true
+      docker logs --tail 100 cypress-swiss-ab-scylla
+      exit 1
+    fi
+    sleep 5
+  done
+  if [[ "$SCYLLA_READY" != true ]]; then
+    echo "Scylla did not become CQL-ready within 10 minutes" >&2
     docker logs --tail 100 cypress-swiss-ab-scylla
     exit 1
   fi
-  sleep 5
-done
-if [[ "$SCYLLA_READY" != true ]]; then
-  echo "Scylla did not become CQL-ready within 10 minutes" >&2
-  docker logs --tail 100 cypress-swiss-ab-scylla
-  exit 1
-fi
+
+}
+wait_for_scylla
 
 
 # One country at a time: fetch, filter, ingest, delete all PBF intermediates.
 # Only the first import truncates the disposable Scylla tables; subsequent
-# imports upsert into the *same* complete three-country dataset.
+# imports upsert into the *same* complete five-country dataset.
 import_region() {
   local region="$1" truncate="$2"
   local source="$DATA/${region}.osm.pbf"
@@ -153,7 +157,9 @@ import_region() {
 import_region switzerland yes
 import_region germany no
 import_region france no
-echo "All three regions imported into one disposable Scylla database"
+import_region united-kingdom no
+import_region italy no
+echo "All five regions imported into one disposable Scylla database"
 docker stats --no-stream cypress-swiss-ab-scylla > "$RESULTS/scylla-after-import.txt"
 
 # Two independently compiled generations from exactly the same source records,
@@ -172,9 +178,26 @@ export CYPRESS_AREA_FANOUT=on
 export CYPRESS_CANDIDATE_SHORTLIST=on
 export CYPRESS_CANDIDATE_BUDGET=256
 
+# Capture resident file pages separately from heap/cache allocations. These are
+# snapshots, not peak RSS; faults and I/O help diagnose the larger working set.
+snapshot_engine() {
+  local name="$1" stage="$2"
+  ps -o pid=,rss=,vsz=,etime= -p "$SERVER_PID" > "$RESULTS/$name-process-$stage.txt"
+  cat "/proc/$SERVER_PID/status" > "$RESULTS/$name-status-$stage.txt"
+  cat "/proc/$SERVER_PID/smaps_rollup" > "$RESULTS/$name-smaps-$stage.txt"
+  cat "/proc/$SERVER_PID/stat" > "$RESULTS/$name-stat-$stage.txt"
+  cat "/proc/$SERVER_PID/io" > "$RESULTS/$name-io-$stage.txt"
+  cat /proc/meminfo > "$RESULTS/$name-host-memory-$stage.txt"
+  docker stats --no-stream cypress-swiss-ab-scylla > "$RESULTS/$name-scylla-$stage.txt"
+}
+
 run_engine() {
   local name="$1" binary="$2" mode="$3"
   export CYPRESS_TOKEN_RETRIEVAL_MODE="$mode"
+  echo "Restarting disposable Scylla after $name compilation, before queries"
+  docker exec cypress-swiss-ab-scylla nodetool flush
+  docker restart --time 120 cypress-swiss-ab-scylla
+  wait_for_scylla
   echo "Starting $name, retrieval=$mode"
   "$binary" --memdb-dir "$DATA/compiled/$name" --scylla-url 127.0.0.1 \
     --listen 127.0.0.1:3000 > "$RESULTS/$name-server.log" 2>&1 &
@@ -189,12 +212,19 @@ run_engine() {
     tail -n 100 "$RESULTS/$name-server.log"
     exit 1
   fi
-  ps -o pid=,rss=,vsz=,etime= -p "$SERVER_PID" > "$RESULTS/$name-process-start.txt"
+  snapshot_engine "$name" start
+  # Preserve a separate first pass before the unchanged warm benchmark. This
+  # resets Scylla process caches, but does not claim a cold Linux page cache.
+  python3 benchmarks/switzerland_ab/compare.py measure \
+    --label "$name" --url http://127.0.0.1:3000 \
+    --workload benchmarks/switzerland_ab/workload.jsonl \
+    --output "$RESULTS/$name-first-pass.json" --cycles 1 --warmup 0
+  snapshot_engine "$name" first-pass
   python3 benchmarks/switzerland_ab/compare.py measure \
     --label "$name" --url http://127.0.0.1:3000 \
     --workload benchmarks/switzerland_ab/workload.jsonl \
     --output "$RESULTS/$name.json" --cycles "${BENCHMARK_CYCLES:-11}" --warmup 2
-  ps -o pid=,rss=,vsz=,etime= -p "$SERVER_PID" > "$RESULTS/$name-process-end.txt"
+  snapshot_engine "$name" end
   kill "$SERVER_PID"
   wait "$SERVER_PID" 2>/dev/null || true
   SERVER_PID=""
@@ -215,11 +245,12 @@ du -sh "$DATA/compiled/experiment" | tee "$RESULTS/index-size-experiment.txt"
 find "$DATA/compiled/experiment" -type f -printf '%P %s bytes\n' | sort > "$RESULTS/index-files-experiment.txt"
 test -s "$DATA/compiled/experiment/cypress_roaring_tokens.bin"
 run_engine experiment "$DATA/experimental-query" roaring
+python3 benchmarks/switzerland_ab/analyze_logs.py "$RESULTS"
 python3 benchmarks/switzerland_ab/compare.py summarize \
   --baseline "$RESULTS/baseline.json" \
   --experiment "$RESULTS/experiment.json" --output "$RESULTS"
 git rev-parse HEAD > "$RESULTS/experiment.sha"
-printf '%s\n' "switzerland germany france" > "$RESULTS/imported-regions.txt"
+printf '%s\n' "switzerland germany france united-kingdom italy" > "$RESULTS/imported-regions.txt"
 printf '%s\n' "$BASE_SHA" > "$RESULTS/main.sha"
 docker stats --no-stream cypress-swiss-ab-scylla > "$RESULTS/scylla-memory.txt"
 echo "Saved summary: $RESULTS/summary.md"

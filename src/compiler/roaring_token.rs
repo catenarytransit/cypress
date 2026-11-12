@@ -205,6 +205,12 @@ mod tests {
             assert!(!p.contains(id), "unexpected id {id}");
         }
         assert_eq!(p.anchor_ids(), ids);
+        // Missing highs, dense/array boundary, and exhausted cursor.
+        let mut candidates = vec![0, 4096, 4097, 65538, 65539, 65586, 65587, 131073];
+        let expected: Vec<_> = candidates.iter().copied().filter(|id| p.contains(*id)).collect();
+        assert_eq!(p.retain_sorted(&mut candidates), 8);
+        assert_eq!(candidates, expected);
+        assert_eq!(p.retain_sorted(&mut Vec::new()), 0);
     }
 
     #[test]

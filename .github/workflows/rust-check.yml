@@ -46,7 +46,7 @@ jobs:
       - name: Validate Europe benchmark scripts and workload
         run: |
           bash -n benchmarks/switzerland_ab/run.sh
-          python3 -m py_compile benchmarks/switzerland_ab/compare.py
+          python3 -m py_compile benchmarks/switzerland_ab/compare.py benchmarks/switzerland_ab/analyze_logs.py
           python3 - <<'PY'
           import json
           from collections import Counter

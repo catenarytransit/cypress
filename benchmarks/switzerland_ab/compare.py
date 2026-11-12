@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark identical Cypress APIs, main vs Roaring-style hybrid postings, across CH/DE/FR."""
+"""Benchmark identical Cypress APIs, main vs Roaring-style hybrid postings, on CH/DE/FR/GB/IT data."""
 import argparse
 import csv
 import json
@@ -184,6 +184,28 @@ def summarize(args):
                     rss_rows.append(int(columns[1]))
         if rss_rows:
             rss_snapshots[label] = rss_rows
+    memory = {}
+    first_pass = {}
+    for label in ("baseline", "experiment"):
+        memory[label] = {}
+        for stage in ("start", "first-pass", "end"):
+            status = args.output / f"{label}-status-{stage}.txt"
+            if status.exists():
+                fields = {}
+                for line in status.read_text().splitlines():
+                    key, _, value = line.partition(":")
+                    if key in ("VmRSS", "VmHWM", "RssAnon", "RssFile", "RssShmem"):
+                        fields[key] = int(value.split()[0])
+                memory[label][stage] = fields
+        path = args.output / f"{label}-first-pass.json"
+        if path.exists():
+            rows = json.loads(path.read_text())["observations"]
+            good = [r["wall_ms"] for r in rows if r["status"] == 200]
+            first_pass[label] = {"p50_ms": percentile(good, 50),
+                                 "p95_ms": percentile(good, 95),
+                                 "failed_requests": len(rows) - len(good)}
+    report["memory_kib"] = memory
+    report["first_pass_after_scylla_restart"] = first_pass
     report["index_bytes"] = sizes
     report["query_process_rss_snapshot_kib"] = rss_snapshots
     args.output.mkdir(parents=True, exist_ok=True)
@@ -202,7 +224,7 @@ def summarize(args):
                              x["hit5"], y["hit5"], json.dumps(x["ids"]),
                              json.dumps(y["ids"])])
     md = [
-        "# Switzerland, Germany, France: Cypress main vs Roaring-style hybrid postings", "",
+        "# Five-country dataset: Cypress main vs Roaring-style hybrid postings", "",
         "Both binaries use identical production settings, except the experiment",
         "selects `CYPRESS_TOKEN_RETRIEVAL_MODE=roaring`.",
         "Each binary runs an independently compiled index from the **same imported Scylla dataset**.",
@@ -227,6 +249,21 @@ def summarize(args):
                    "| Variant | Start | End |", "|---|---:|---:|"])
         for label, rows in rss_snapshots.items():
             md.append(f"| {label} | {rows[0]:,} | {rows[-1]:,} |")
+    if first_pass:
+        md.extend(["", "## First pass after Scylla restart", "",
+                   "Linux page cache is retained; startup validation also touches mmap pages.",
+                   "", "| Variant | p50 ms | p95 ms | Failed |", "|---|---:|---:|---:|"])
+        for label, row in first_pass.items():
+            md.append(f"| {label} | {row['p50_ms']} | {row['p95_ms']} | {row['failed_requests']} |")
+    if any(memory.values()):
+        md.extend(["", "## Resident memory breakdown (KiB)", "",
+                   "VmHWM is the process RSS high-water mark; other values are snapshots.",
+                   "", "| Variant | Stage | RSS | Anonymous | File | Peak RSS |",
+                   "|---|---|---:|---:|---:|---:|"])
+        for label, stages in memory.items():
+            for stage, row in stages.items():
+                md.append(f"| {label} | {stage} | {row.get('VmRSS', '—')} | "
+                          f"{row.get('RssAnon', '—')} | {row.get('RssFile', '—')} | {row.get('VmHWM', '—')} |")
     md.extend(["", "## By country", "",
                "| Country | Queries | main p50 ms | experiment p50 ms | p50 speedup | ID mismatches |",
                "|---|---:|---:|---:|---:|---:|"])
