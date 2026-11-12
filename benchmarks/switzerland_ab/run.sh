@@ -180,7 +180,7 @@ echo "Compiling experimental packed posting index using its own compiler"
 time "$DATA/experimental-compiler" --scylla-url 127.0.0.1 \
   --out-dir "$DATA/compiled/experiment" --tmp-dir "$DATA/tmp/experiment" \
   --concurrency "${BENCHMARK_COMPILER_CONCURRENCY:-2}" \
-  --token-index --packed-token-index
+  --packed-token-index
 du -sh "$DATA/compiled/experiment" | tee "$RESULTS/index-size-experiment.txt"
 find "$DATA/compiled/experiment" -type f -printf '%P %s bytes\n' | sort > "$RESULTS/index-files-experiment.txt"
 test -s "$DATA/compiled/experiment/cypress_token_pack.bin"
