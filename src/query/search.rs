@@ -247,7 +247,7 @@ enum TokenRetrievalMode {
     Legacy,
     Shadow,
     Token,
-    OpenGeocode,
+    Roaring,
 }
 
 fn token_retrieval_mode() -> TokenRetrievalMode {
@@ -259,7 +259,7 @@ fn token_retrieval_mode() -> TokenRetrievalMode {
         {
             "shadow" => TokenRetrievalMode::Shadow,
             "token" => TokenRetrievalMode::Token,
-            "open-geocode" => TokenRetrievalMode::OpenGeocode,
+            "roaring" => TokenRetrievalMode::Roaring,
             "legacy" => TokenRetrievalMode::Legacy,
             other => {
                 warn!(target: "cypress::query::timing", %other,
@@ -274,13 +274,13 @@ fn token_retrieval_mode() -> TokenRetrievalMode {
 // for this generation. The experimental query does not mmap the v1 sidecar.
 enum QueryTokenIndex<'a> {
     Delta(cypress::models::token_index::TokenIndexView<'a>),
-    Pack(cypress::models::packed_token::PackedTokenIndexView<'a>),
+    Roaring(cypress::models::roaring_token::RoaringTokenIndexView<'a>),
 }
 impl QueryTokenIndex<'_> {
     fn retrieve(&self, query: &str) -> anyhow::Result<Option<(Vec<u32>, token_retrieval::RetrievalStats)>> {
         match self {
             Self::Delta(index) => token_retrieval::retrieve(index, query),
-            Self::Pack(index) => super::open_geocode_retrieval::retrieve(index, query),
+            Self::Roaring(index) => super::roaring_retrieval::retrieve(index, query),
         }
     }
 }
@@ -1334,10 +1334,10 @@ pub fn search_place_ids(
     let mut token_candidate_ids = None::<Vec<u32>>;
     let mut token_candidate_stats = None::<token_retrieval::RetrievalStats>;
     if token_mode != TokenRetrievalMode::Legacy {
-        let retrieval = if token_mode == TokenRetrievalMode::OpenGeocode {
-            memdb_data.packed_token_mmap.as_ref().map(|sidecar| {
-                cypress::models::packed_token::PackedTokenIndexView::view_validated(sidecar)
-                    .and_then(|index| super::open_geocode_retrieval::retrieve(&index, &query))
+        let retrieval = if token_mode == TokenRetrievalMode::Roaring {
+            memdb_data.roaring_token_mmap.as_ref().map(|sidecar| {
+                cypress::models::roaring_token::RoaringTokenIndexView::view_validated(sidecar)
+                    .and_then(|index| super::roaring_retrieval::retrieve(&index, &query))
             })
         } else {
             memdb_data.token_mmap.as_ref().map(|sidecar| {
@@ -1363,10 +1363,10 @@ pub fn search_place_ids(
 
         if token_candidate_ids.is_none() && (2..=8).contains(&query_tokens.len())
         {
-            let field_index = if token_mode == TokenRetrievalMode::OpenGeocode {
-                memdb_data.packed_token_mmap.as_ref().map(|sidecar| {
-                    cypress::models::packed_token::PackedTokenIndexView::view_validated(sidecar)
-                        .map(QueryTokenIndex::Pack)
+            let field_index = if token_mode == TokenRetrievalMode::Roaring {
+                memdb_data.roaring_token_mmap.as_ref().map(|sidecar| {
+                    cypress::models::roaring_token::RoaringTokenIndexView::view_validated(sidecar)
+                        .map(QueryTokenIndex::Roaring)
                 })
             } else {
                 memdb_data.token_mmap.as_ref().map(|sidecar| {
@@ -1439,7 +1439,7 @@ pub fn search_place_ids(
                             .filter(|sid| prefix_string_ids.binary_search(sid).is_err())
                             .collect();
                         field_join_areas = areas;
-                        if token_mode == TokenRetrievalMode::OpenGeocode {
+                        if token_mode == TokenRetrievalMode::Roaring {
                             let candidates = token_candidate_ids.get_or_insert_with(Vec::new);
                             candidates.extend(joined);
                             candidates.sort_unstable();
@@ -1468,11 +1468,11 @@ pub fn search_place_ids(
             target: "cypress::query::timing",
             mode = match token_mode {
                 TokenRetrievalMode::Shadow => "shadow",
-                TokenRetrievalMode::OpenGeocode => "open-geocode",
+                TokenRetrievalMode::Roaring => "roaring",
                 _ => "token",
             },
-            has_sidecar = if token_mode == TokenRetrievalMode::OpenGeocode {
-                memdb_data.packed_token_mmap.is_some()
+            has_sidecar = if token_mode == TokenRetrievalMode::Roaring {
+                memdb_data.roaring_token_mmap.is_some()
             } else {
                 memdb_data.token_mmap.is_some()
             },
@@ -1488,7 +1488,7 @@ pub fn search_place_ids(
         );
     }
     let use_token_fast_path =
-        matches!(token_mode, TokenRetrievalMode::Token | TokenRetrievalMode::OpenGeocode)
+        matches!(token_mode, TokenRetrievalMode::Token | TokenRetrievalMode::Roaring)
             && token_candidate_ids.is_some();
 
     let mut results = Vec::<(u32, f64)>::new();
