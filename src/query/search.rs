@@ -1319,16 +1319,19 @@ pub fn search_place_ids(
     let mut token_candidate_ids = None::<Vec<u32>>;
     let mut token_candidate_stats = None::<token_retrieval::RetrievalStats>;
     if token_mode != TokenRetrievalMode::Legacy {
-        if let Some(sidecar) = memdb_data.token_mmap.as_ref() {
-            match cypress::models::token_index::TokenIndexView::view_validated(sidecar)
-                .and_then(|index| {
-                    if token_mode == TokenRetrievalMode::OpenGeocode {
-                        super::open_geocode_retrieval::retrieve(&index, &query)
-                    } else {
-                        token_retrieval::retrieve(&index, &query)
-                    }
-                })
-            {
+        let retrieval = if token_mode == TokenRetrievalMode::OpenGeocode {
+            memdb_data.packed_token_mmap.as_ref().map(|sidecar| {
+                cypress::models::packed_token::PackedTokenIndexView::view_validated(sidecar)
+                    .and_then(|index| super::open_geocode_retrieval::retrieve(&index, &query))
+            })
+        } else {
+            memdb_data.token_mmap.as_ref().map(|sidecar| {
+                cypress::models::token_index::TokenIndexView::view_validated(sidecar)
+                    .and_then(|index| token_retrieval::retrieve(&index, &query))
+            })
+        };
+        if let Some(retrieval) = retrieval {
+            match retrieval {
                 Ok(Some((ids, stats))) => {
                     if !ids.is_empty() && ids.len() <= MAX_STRING_MATCHES {
                         token_candidate_ids = Some(ids);
@@ -1343,8 +1346,7 @@ pub fn search_place_ids(
             }
         }
 
-        if (token_candidate_ids.is_none() || token_mode == TokenRetrievalMode::OpenGeocode)
-            && (2..=8).contains(&query_tokens.len())
+        if token_candidate_ids.is_none() && (2..=8).contains(&query_tokens.len())
         {
             if let (Some(sidecar), Some(admin_fst)) =
                 (memdb_data.token_mmap.as_ref(), admin_alias_fst.as_ref())
@@ -1445,7 +1447,11 @@ pub fn search_place_ids(
                 TokenRetrievalMode::OpenGeocode => "open-geocode",
                 _ => "token",
             },
-            has_sidecar = memdb_data.token_mmap.is_some(),
+            has_sidecar = if token_mode == TokenRetrievalMode::OpenGeocode {
+                memdb_data.packed_token_mmap.is_some()
+            } else {
+                memdb_data.token_mmap.is_some()
+            },
             token_candidates = token_candidate_ids.as_ref().map_or(0, Vec::len),
             token_count = token_candidate_stats.as_ref().map_or(0, |x| x.tokens),
             posting_entries_examined = token_candidate_stats.as_ref()
