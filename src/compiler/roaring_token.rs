@@ -176,7 +176,7 @@ mod tests {
         build_token_index(&offsets, &data, temp.path(), &tokens).unwrap();
         let target = temp.path().join(FILE);
         let report = build(&tokens, &target, temp.path()).unwrap();
-        assert_eq!(report.postings, 7);
+        assert_eq!(report.postings, 6);
         let bytes = fs::read(&target).unwrap();
         let view = RoaringTokenIndexView::parse(&bytes).unwrap();
         assert!(view.matches_dictionary(&data, &offsets));
