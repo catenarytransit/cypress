@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark identical Cypress APIs, main vs packed-memory experiment, across CH/DE/FR."""
+"""Benchmark identical Cypress APIs, main vs Roaring-style hybrid postings, across CH/DE/FR."""
 import argparse
 import csv
 import json
@@ -202,9 +202,9 @@ def summarize(args):
                              x["hit5"], y["hit5"], json.dumps(x["ids"]),
                              json.dumps(y["ids"])])
     md = [
-        "# Switzerland, Germany, France: Cypress main vs packed posting index", "",
+        "# Switzerland, Germany, France: Cypress main vs Roaring-style hybrid postings", "",
         "Both binaries use identical production settings, except the experiment",
-        "selects `CYPRESS_TOKEN_RETRIEVAL_MODE=open-geocode`.",
+        "selects `CYPRESS_TOKEN_RETRIEVAL_MODE=roaring`.",
         "Each binary runs an independently compiled index from the **same imported Scylla dataset**.",
         "", "| Metric | main | experiment |", "|---|---:|---:|"]
     for title, field in [("p50 HTTP latency ms", "p50_ms"),
@@ -243,8 +243,8 @@ def summarize(args):
                f"Mean top-5 ID overlap: {report['mean_top5_overlap']}",
                "", "## Interpretation", "",
                "The upstream open-geocode binary is NOT benchmarked. The experiment",
-               "tests an independent, frequency-bucketed fixed-width posting memory format",
-               "while preserving Cypress's memory-mapped multilingual StringIds.",
+               "tests a hybrid sparse-array/dense-bitmap inverted index and rarest-first query",
+               "while preserving Cypress's original multilingual StringIds and ranking pipeline.",
                "The existing Cypress scoring, area fanout, and importance model remain active.",
                "Incorrect or missing top results are regressions even when latency improves.",
                "Coordinates are approximate fixtures; review misses before deciding.",
