@@ -36,3 +36,25 @@ jobs:
 
       - name: Check library, compiler, ingest, query, and test targets
         run: cargo check --locked --all-targets
+
+      - name: Start ScyllaDB for cleanup regression test
+        run: |
+          docker run -d --name cypress-cleanup-scylla -p 9042:9042 \
+            scylladb/scylla:6.2 --smp 2 --memory 1G --overprovisioned 1
+          for attempt in $(seq 1 60); do
+            if docker exec cypress-cleanup-scylla cqlsh -e 'SELECT release_version FROM system.local'; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs cypress-cleanup-scylla
+          exit 1
+
+      - name: Test cleanup across multiple ScyllaDB pages
+        env:
+          CYPRESS_TEST_SCYLLA_URI: 127.0.0.1:9042
+        run: cargo test --locked --test scylla_cleanup -- --ignored
+
+      - name: Show ScyllaDB logs on failure
+        if: failure()
+        run: docker logs cypress-cleanup-scylla
