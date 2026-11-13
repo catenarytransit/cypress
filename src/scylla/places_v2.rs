@@ -265,13 +265,16 @@ impl ScyllaClient {
                 continue;
             }
             stream::iter(0..V2_BUCKETS)
-                .map(|bucket| async move {
+                .map(|bucket| {
+                    let source = &source;
+                    async move {
                     self.session.query_unpaged(
                         "DELETE FROM cypress.places_v2
                          WHERE source_file = ? AND generation = ? AND bucket = ?",
                         (&source, generation, bucket),
                     ).await.context("Failed to delete obsolete places_v2 partition")?;
                     Ok::<_, anyhow::Error>(())
+                    }
                 })
                 .buffer_unordered(GC_CONCURRENCY)
                 .try_collect::<Vec<_>>().await?;
