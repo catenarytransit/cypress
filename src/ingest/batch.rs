@@ -111,6 +111,7 @@ pub async fn run_batch(
         }
     });
 
+    let mut failed_regions = Vec::new();
     // Consumer (Ingest & Version Save)
     while let Some(prepared) = rx.recv().await {
         info!("Starting ingest for {}", prepared.region.name);
@@ -118,6 +119,7 @@ pub async fn run_batch(
         let res = crate::run_single(prepared.args, synonyms.clone()).await;
         if let Err(e) = res {
             error!("Ingest failed for {}: {:?}", prepared.region.name, e);
+            failed_regions.push(prepared.region.name.clone());
             continue;
         }
 
@@ -137,11 +139,14 @@ pub async fn run_batch(
                 "Failed to save version for {}: {:?}",
                 prepared.region.name, e
             );
+            failed_regions.push(prepared.region.name.clone());
         } else {
             info!("Region {} complete.", prepared.region.name);
         }
     }
 
+    anyhow::ensure!(failed_regions.is_empty(),
+        "Batch import failed for regions: {}", failed_regions.join(", "));
     Ok(())
 }
 
@@ -181,7 +186,9 @@ async fn prepare_region(
 
     // 2. Version Check
     let hash = calculate_file_hash(&raw_pbf)?;
-    if version_manager
+    let filtered_source = format!("{}-filtered.osm.pbf", filename.trim_end_matches(".osm.pbf"));
+    let has_v2_source = version_manager.has_active_place_source(&filtered_source).await?;
+    if has_v2_source && version_manager
         .is_latest(&region.name, &filename, &hash)
         .await?
         && !base_args.refresh
