@@ -184,8 +184,7 @@ async fn prepare_region(
             .context("Failed to run curl")?;
 
         if !status.success() {
-            warn!("Failed to download {}. Skipping.", region.name);
-            return Ok(None);
+            anyhow::bail!("Failed to download {}", region.name);
         }
     } else {
         info!("File {} exists.", filename);
@@ -232,8 +231,7 @@ async fn prepare_region(
         .context("Failed to run filter script")?;
 
     if !status.success() {
-        warn!("Filtering failed for {}. Skipping.", region.name);
-        return Ok(None);
+        anyhow::bail!("Filtering failed for {}", region.name);
     }
 
     // Admin filter
