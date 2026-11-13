@@ -79,7 +79,7 @@ jobs:
           from pathlib import Path
           cases = [json.loads(line) for line in Path('benchmarks/switzerland_ab/workload.jsonl').read_text().splitlines() if line.strip()]
           counts = Counter(case.get('country') for case in cases)
-          assert {'CH', 'DE', 'FR'} <= set(counts), counts
+          assert counts == {'CH': 81, 'DE': 50, 'FR': 53, 'GB': 24, 'IT': 26}, counts
           assert len({case['id'] for case in cases}) == len(cases)
           print('CH/DE/FR query workload on five-country data:', dict(counts))
           PY
