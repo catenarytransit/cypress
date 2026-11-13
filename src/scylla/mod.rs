@@ -1,7 +1,10 @@
 use anyhow::{Context, Result};
+use futures::{stream, StreamExt, TryStreamExt};
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 use scylla::response::query_result::QueryResult;
+use scylla::response::{PagingState, PagingStateResponse};
+use scylla::value::{CqlValue, Row};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::info;
@@ -216,33 +219,73 @@ impl ScyllaClient {
         source_file: &str,
         import_start: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64> {
-        let result = self.session
-            .query_unpaged(
-                "SELECT id, import_timestamp FROM cypress.places_by_source WHERE source_file = ? AND import_timestamp < ?",
-                (source_file, import_start),
-            )
-            .await?;
+        // Fetch and finish one bounded page before requesting the next. In particular,
+        // do not accumulate an entire country's IDs or issue an unpaged range read.
+        const PAGE_SIZE: i32 = 1_000;
+        const DELETE_CONCURRENCY: usize = 16;
 
+        let mut select = self.session.prepare(
+            "SELECT id, import_timestamp FROM cypress.places_by_source WHERE source_file = ? AND import_timestamp < ?",
+        ).await?;
+        select.set_page_size(PAGE_SIZE);
+        // Old index entries also exist for places refreshed by this import. Use a
+        // conditional delete so they cannot remove a newer row (or another source's
+        // row) based on its metadata at deletion time.
+        let delete_place = self.session.prepare(
+            "DELETE FROM cypress.places WHERE id = ? IF source_file = ? AND import_timestamp < ?",
+        ).await?;
+        let delete_index = self.session.prepare(
+            "DELETE FROM cypress.places_by_source WHERE source_file = ? AND import_timestamp = ? AND id = ?",
+        ).await?;
+
+        let mut paging_state = PagingState::start();
         let mut count = 0;
-        if let Ok(rows_result) = result.into_rows_result() {
-            let mut items_to_delete = Vec::new();
-            for row_res in rows_result.rows::<(String, chrono::DateTime<chrono::Utc>)>()? {
-                if let Ok((id, ts)) = row_res {
-                    items_to_delete.push((id, ts));
-                }
-            }
+        loop {
+            let (result, next_page) = self
+                .session
+                .execute_single_page(&select, (source_file, import_start), paging_state)
+                .await
+                .context("Failed to read stale-place cleanup page")?;
+            let rows_result = result.into_rows_result()?;
+            // Propagate decoding errors instead of silently abandoning stale entries.
+            let rows = rows_result.rows::<(String, chrono::DateTime<chrono::Utc>)>()?;
+            let delete_place = &delete_place;
+            let delete_index = &delete_index;
+            let deleted: Vec<bool> = stream::iter(rows)
+                .map(|row| async move {
+                    let (id, timestamp) = row?;
+                    let result = self
+                        .session
+                        .execute_unpaged(delete_place, (&id, source_file, import_start))
+                        .await
+                        .context("Failed to conditionally delete stale place")?;
+                    // Failed conditions include the current column values, whereas
+                    // successful conditions return only [applied]. Decode dynamically.
+                    let result = result.into_rows_result()?;
+                    let row = result.first_row::<Row>()?;
+                    let applied = row
+                        .columns
+                        .first()
+                        .and_then(Option::as_ref)
+                        .and_then(CqlValue::as_boolean)
+                        .context("Conditional stale-place delete omitted [applied]")?;
 
-            for (id, ts) in &items_to_delete {
-                self.session
-                    .query_unpaged("DELETE FROM cypress.places WHERE id = ?", (id,))
-                    .await?;
-                self.session
-                    .query_unpaged(
-                        "DELETE FROM cypress.places_by_source WHERE source_file = ? AND import_timestamp = ? AND id = ?",
-                        (source_file, *ts, id),
-                    )
-                    .await?;
-                count += 1;
+                    // Remove the index entry only after the place delete succeeds or
+                    // its condition says the place must be retained. Failed requests
+                    // leave the entry available for a later cleanup attempt.
+                    self.session
+                        .execute_unpaged(delete_index, (source_file, timestamp, &id))
+                        .await
+                        .context("Failed to delete stale source index entry")?;
+                    Ok::<_, anyhow::Error>(applied)
+                })
+                .buffer_unordered(DELETE_CONCURRENCY)
+                .try_collect()
+                .await?;
+            count += deleted.into_iter().filter(|applied| *applied).count() as u64;
+            match next_page {
+                PagingStateResponse::HasMorePages { state: next } => paging_state = next,
+                PagingStateResponse::NoMorePages => break,
             }
         }
         Ok(count)
