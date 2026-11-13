@@ -398,6 +398,7 @@ pub async fn run_single(args: Args, _synonyms: Arc<SynonymService>) -> Result<()
         }
     });
 
+    let result: Result<()> = async {
     // Create pipeline channel
     let (tx, rx) = mpsc::channel::<Place>(2000);
 
@@ -480,10 +481,7 @@ pub async fn run_single(args: Args, _synonyms: Arc<SynonymService>) -> Result<()
 
             place.sanitize();
 
-            if let Err(_) = tx.send(place).await {
-                error!("Pipeline receiver dropped encountered during admin indexing");
-                break;
-            }
+            tx.send(place).await.context("Import pipeline stopped accepting documents")?;
         }
     }
 
@@ -562,10 +560,7 @@ pub async fn run_single(args: Args, _synonyms: Arc<SynonymService>) -> Result<()
 
             place.sanitize();
 
-            if let Err(_) = tx.send(place).await {
-                error!("Pipeline receiver dropped");
-                break;
-            }
+            tx.send(place).await.context("Import pipeline stopped accepting documents")?;
         }
     }
 
@@ -604,10 +599,7 @@ pub async fn run_single(args: Args, _synonyms: Arc<SynonymService>) -> Result<()
 
                 place.sanitize();
 
-                if let Err(_) = tx.send(place).await {
-                    error!("Pipeline receiver dropped during merged roads");
-                    break;
-                }
+                tx.send(place).await.context("Import pipeline stopped accepting documents")?;
             }
         }
     }
@@ -617,22 +609,7 @@ pub async fn run_single(args: Args, _synonyms: Arc<SynonymService>) -> Result<()
 
     // Every write must finish successfully before publication. Failed imports
     // are left inactive for generation GC, never used by the compiler.
-    let pipeline_result = match pipeline_handle.await {
-        Ok(result) => result,
-        Err(err) => {
-            heartbeat_task.abort();
-            scylla_client.fail_place_import(&import_run).await?;
-            return Err(err.into());
-        }
-    };
-    heartbeat_task.abort();
-    let pipeline_result = match pipeline_result {
-        Ok(count) => count,
-        Err(err) => {
-            scylla_client.fail_place_import(&import_run).await?;
-            return Err(err);
-        }
-    };
+    let pipeline_result = pipeline_handle.await.context("Import pipeline task failed")??;
     scylla_client.publish_place_import(&import_run, pipeline_result as u64).await?;
     info!("Published {} documents for {}", pipeline_result, source_file);
 
@@ -649,7 +626,12 @@ pub async fn run_single(args: Args, _synonyms: Arc<SynonymService>) -> Result<()
             .await;
     }
 
-    Ok(())
+    Ok(())    }.await;
+    heartbeat_task.abort();
+    if result.is_err() {
+        scylla_client.fail_place_import(&import_run).await?;
+    }
+    result
 }
 
 async fn run_processing_pipeline(
