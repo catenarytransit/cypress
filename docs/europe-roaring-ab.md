@@ -121,3 +121,21 @@ After **each** index compilation and before starting that variant's query server
 Restarting Scylla resets its process caches. It **does not evict Linux page-cache data**; compilation and mmap validation touch index pages. Adding GB/IT increases the corpus and may increase working-set pressure, but repeated 184-query passes can still warm their working set. This is not a controlled cold-disk benchmark.
 
 At startup, after first pass, and after warm measurement, archive `/proc/PID/status`, `smaps_rollup`, `stat`, `io`, host meminfo and Scylla stats. The report separates RSS, anonymous RSS, file RSS and VmHWM. Fault counters and I/O are available in raw artifacts; snapshots can distinguish file residency from heap/cache growth, but do not attribute individual allocations. `log-analysis.json` accompanies each report.
+
+## 2026-11-13 experimental redesign: ABBA, country coverage and adaptive Roaring layout
+
+**Benchmark:** each executable is benchmarked in independent A1/B1/B2/A2 processes, where A is pinned main and B is the experimental branch. The benchmark restarts the disposable Scylla instance before every phase, runs a one-cycle first pass, performs two warmups followed by eleven measured cycles, and merges the two measured blocks for each variant. Each process has distinct logs and memory snapshots. Because disk space is constrained, the baseline index is recompiled before A2; its size manifest must match the original. The kernel page cache is not flushed and these are not controlled cold-disk runs.
+
+**Fixtures:** 234 cases: CH 81, DE 50, FR 53, GB 24, IT 26. New cases include city names, language variants, station names, landmark lookups, addresses, and autocomplete. Coordinates are approximate and are not independently labeled relevance judgments. The summary now reports nondeterministic IDs across observed measured cycles.
+
+**Storage:** `cypress_roaring_tokens.bin` format version 2 chooses an exact representation per posting:
+- Very small postings: zero-container marker and sorted flat u32 StringIds, avoiding a 12-byte header for each high-16 shard.
+- Sparse shards: sorted u16 arrays.
+- Dense shards: 8192-byte bitmaps.
+- Consecutive shards: Roaring-style run container using [u16 start, u16 inclusive extra length] pairs.
+
+The compiler chooses the smaller of flat posting and container encoding. For individual 16-bit shards, run encoding is used only when smaller than either the sparse array or dense bitmap. This reduces file size for highly fragmented rare tokens and compresses spatially ordered or consecutive IDs. The representation is generation-bound and deep-validated before publication.
+
+**Upstream SIMD audit:** [roaring-rs](https://github.com/RoaringBitmap/roaring-rs) version 0.12 uses `fearless_simd` for SIMD-enabled operations and dispatches at runtime on x86/x86-64 with `std`. Cypress's experimental `RoaringPosting` currently uses *scalar* membership/probing; there was no SIMD code to correct. This experiment does not claim SIMD acceleration or full roaring-rs behavior, and should not claim such speedups before implementing a separately verified SIMD intersection path. Native bit tests and scalar run search are exact; container decode and membership tests remain required. The upstream crate is not added as a Cargo dependency here, because an unvalidated `Cargo.lock` update would break `--locked` CI.
+
+**Next major experiment:** direct Roaring set intersections for token groups, and a bitmap-based fuzzy candidate accumulator to replace repeated broad bigram-count scans and expensive sparse-count snapshots, with a strict scalar oracle and exact result-ID parity. This is not yet implemented in this revision. The full ABBA benchmark still needs to run.
