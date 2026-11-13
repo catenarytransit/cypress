@@ -888,6 +888,7 @@ mod transit_ranking_tests {
                 dense_mmap: Some(mmap(&dense)),
                 places_mmap: mmap(&[0]),
                 token_mmap: None,
+                roaring_token_mmap: None,
                 grid_mmap: None,
                 bigram_mmap: None,
                 reverse_tree: rstar::RTree::new(),
