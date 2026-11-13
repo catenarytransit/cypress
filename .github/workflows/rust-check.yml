@@ -54,7 +54,7 @@ jobs:
           path = Path("benchmarks/switzerland_ab/workload.jsonl")
           cases = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
           counts = Counter(c["country"] for c in cases)
-          assert counts == {"CH": 81, "DE": 50, "FR": 53}, counts
+          assert counts == {"CH": 81, "DE": 50, "FR": 53, "GB": 24, "IT": 26}, counts
           assert len({c["id"] for c in cases}) == len(cases)
           print(counts)
           PY
