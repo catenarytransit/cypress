@@ -40,7 +40,8 @@ pub async fn run_batch(
     let version_manager_clone = version_manager.clone();
 
     // Spawn Producer (Download & Filter)
-    tokio::spawn(async move {
+    let producer = tokio::spawn(async move {
+        let mut preparation_failures = Vec::new();
         // Track if it's the first region to handle --create-index logic
         // Note: This logic assumes strictly sequential processing matching config order.
         let mut is_first_region = true;
@@ -104,11 +105,13 @@ pub async fn run_batch(
                 }
                 Err(e) => {
                     error!("Failed to prepare {}: {:?}", region.name, e);
+                    preparation_failures.push(region.name.clone());
                     // Do not kill pipeline, just skip
                     is_first_region = false;
                 }
             }
         }
+        preparation_failures
     });
 
     let mut failed_regions = Vec::new();
@@ -145,6 +148,10 @@ pub async fn run_batch(
         }
     }
 
+    failed_regions.extend(producer.await.context("Batch region preparation panicked")?);
+    let gc_client = cypress::scylla::ScyllaClient::new(&config.global.scylla_url).await?;
+    let reclaimed = gc_client.garbage_collect_places_v2().await?;
+    info!("Collected {reclaimed} inactive places_v2 generations");
     anyhow::ensure!(failed_regions.is_empty(),
         "Batch import failed for regions: {}", failed_regions.join(", "));
     Ok(())
