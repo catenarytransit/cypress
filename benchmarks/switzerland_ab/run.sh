@@ -192,15 +192,15 @@ snapshot_engine() {
 }
 
 run_engine() {
-  local name="$1" binary="$2" mode="$3"
+  local slot="$1" name="$2" binary="$3" mode="$4"
   export CYPRESS_TOKEN_RETRIEVAL_MODE="$mode"
-  echo "Restarting disposable Scylla after $name compilation, before queries"
+  echo "ABBA slot $slot ($name): restart disposable Scylla before queries"
   docker exec cypress-swiss-ab-scylla nodetool flush
   docker restart --time 120 cypress-swiss-ab-scylla
   wait_for_scylla
-  echo "Starting $name, retrieval=$mode"
+  echo "Starting ABBA slot $slot: $name, retrieval=$mode"
   "$binary" --memdb-dir "$DATA/compiled/$name" --scylla-url 127.0.0.1 \
-    --listen 127.0.0.1:3000 > "$RESULTS/$name-server.log" 2>&1 &
+    --listen 127.0.0.1:3000 > "$RESULTS/$slot-server.log" 2>&1 &
   SERVER_PID=$!
   local ready=false
   for i in $(seq 1 120); do
@@ -209,42 +209,73 @@ run_engine() {
     sleep 1
   done
   if [[ "$ready" != true ]]; then
-    tail -n 100 "$RESULTS/$name-server.log"
+    tail -n 100 "$RESULTS/$slot-server.log"
     exit 1
   fi
-  snapshot_engine "$name" start
+  snapshot_engine "$slot" start
   # Preserve a separate first pass before the unchanged warm benchmark. This
   # resets Scylla process caches, but does not claim a cold Linux page cache.
   python3 benchmarks/switzerland_ab/compare.py measure \
     --label "$name" --url http://127.0.0.1:3000 \
     --workload benchmarks/switzerland_ab/workload.jsonl \
-    --output "$RESULTS/$name-first-pass.json" --cycles 1 --warmup 0
-  snapshot_engine "$name" first-pass
+    --output "$RESULTS/$slot-first-pass.json" --cycles 1 --warmup 0
+  snapshot_engine "$slot" first-pass
   python3 benchmarks/switzerland_ab/compare.py measure \
     --label "$name" --url http://127.0.0.1:3000 \
     --workload benchmarks/switzerland_ab/workload.jsonl \
-    --output "$RESULTS/$name.json" --cycles "${BENCHMARK_CYCLES:-11}" --warmup 2
-  snapshot_engine "$name" end
+    --output "$RESULTS/$slot.json" --cycles "${BENCHMARK_CYCLES:-11}" --warmup 2
+  snapshot_engine "$slot" end
   kill "$SERVER_PID"
   wait "$SERVER_PID" 2>/dev/null || true
   SERVER_PID=""
   sleep 3
 }
-# First run control, then experiment; repeat in reverse order on dedicated hosts
-# for more robust comparisons of memory cache and thermal effects.
-run_engine baseline "$DATA/main-query" token
-echo "Reclaiming baseline mmap files before experimental compile"
+# ABBA uses the same Scylla dataset and distinct executable generations.
+# Keep only one ~13 GiB compiled mmap generation on disk at a time.
+# Restart Scylla and query process before each phase. B2 is a fresh process,
+# not a continuation of B1; A2 is recompiled after B1/B2 to balance order.
+printf 'A1 baseline\nB1 experiment\nB2 experiment\nA2 baseline\n' > "$RESULTS/order.txt"
+run_engine baseline-a1 baseline "$DATA/main-query" token
+echo "Reclaiming baseline generation before B phases"
 rm -rf "$DATA/compiled/baseline"
 df -h "$DATA"
-echo "Compiling Roaring-style hybrid posting index using its own compiler"
+echo "Compiling Roaring experimental index"
 time "$DATA/experimental-compiler" --scylla-url 127.0.0.1 \
   --out-dir "$DATA/compiled/experiment" --tmp-dir "$DATA/tmp/experiment" \
   --concurrency "${BENCHMARK_COMPILER_CONCURRENCY:-2}" \
   --roaring-token-index
 du -sh "$DATA/compiled/experiment" | tee "$RESULTS/index-size-experiment.txt"
-find "$DATA/compiled/experiment" -type f -printf '%P %s bytes\n' | sort > "$RESULTS/index-files-experiment.txt"
+find "$DATA/compiled/experiment" -type f -printf '%P %s bytes\\n' | sort > "$RESULTS/index-files-experiment.txt"
 test -s "$DATA/compiled/experiment/cypress_roaring_tokens.bin"
-run_engine experiment "$DATA/experimental-query" roaring
+run_engine experiment-b1 experiment "$DATA/experimental-query" roaring
+run_engine experiment-b2 experiment "$DATA/experimental-query" roaring
+echo "Reclaiming experimental generation before A2"
+rm -rf "$DATA/compiled/experiment"
+df -h "$DATA"
+echo "Recompiling baseline for the final ABBA phase"
+rm -rf "$DATA/compiled/baseline"
+time "$DATA/main-compiler" --scylla-url 127.0.0.1 \
+  --out-dir "$DATA/compiled/baseline" --tmp-dir "$DATA/tmp/baseline" \
+  --concurrency "${BENCHMARK_COMPILER_CONCURRENCY:-2}" --token-index
+find "$DATA/compiled/baseline" -type f -printf '%P %s bytes\\n' | sort > "$RESULTS/index-files-baseline-a2.txt"
+diff -u "$RESULTS/index-files-baseline.txt" "$RESULTS/index-files-baseline-a2.txt"
+run_engine baseline-a2 baseline "$DATA/main-query" token
+python3 benchmarks/switzerland_ab/compare.py combine \
+  --input "$RESULTS/baseline-a1.json" "$RESULTS/baseline-a2.json" \
+  --output "$RESULTS/baseline.json" --label baseline
+python3 benchmarks/switzerland_ab/compare.py combine \
+  --input "$RESULTS/experiment-b1.json" "$RESULTS/experiment-b2.json" \
+  --output "$RESULTS/experiment.json" --label experiment
+for name in baseline experiment; do
+  if [[ "$name" == baseline ]]; then phases=(baseline-a1 baseline-a2); else phases=(experiment-b1 experiment-b2); fi
+  cat "$RESULTS/${phases[0]}-server.log" "$RESULTS/${phases[1]}-server.log" > "$RESULTS/$name-server.log"
+  for stage in start first-pass end; do
+    cp "$RESULTS/${phases[0]}-status-$stage.txt" "$RESULTS/$name-status-$stage.txt"
+  done
+  cp "$RESULTS/${phases[0]}-process-start.txt" "$RESULTS/$name-process-start.txt"
+  cp "$RESULTS/${phases[1]}-process-end.txt" "$RESULTS/$name-process-end.txt"
+  cp "$RESULTS/${phases[0]}-first-pass.json" "$RESULTS/$name-first-pass.json"
+done
 python3 benchmarks/switzerland_ab/analyze_logs.py "$RESULTS"
 python3 benchmarks/switzerland_ab/compare.py summarize \
   --baseline "$RESULTS/baseline.json" \
