@@ -96,6 +96,17 @@ fn encode_list(ids: &[u32]) -> Result<(Vec<u8>, u64, u64)> {
     ensure!(out.len() == header, "container header count mismatch");
     out.extend_from_slice(&bodies);
     ensure!(out.len() == data_offset as usize, "container offset mismatch");
+    // Most rare tokens touch too few StringIds to amortize high-16 container
+    // metadata. A zero-container sentinel switches to a sorted flat u32 list.
+    let flat_size = 4usize + ids.len() * 4;
+    if flat_size < out.len() {
+        let mut flat = Vec::with_capacity(flat_size);
+        flat.extend_from_slice(&0u32.to_le_bytes());
+        for &id in ids {
+            flat.extend_from_slice(&id.to_le_bytes());
+        }
+        return Ok((flat, 0, 0));
+    }
     Ok((out, array_count, bitmap_count))
 }
 
@@ -181,8 +192,8 @@ mod tests {
     fn array_and_bitmap_container_membership() {
         let sparse = [1u32, 7, 100, 65538, 65550];
         let (bytes, arrays, bitmaps) = encode_list(&sparse).unwrap();
-        assert_eq!((arrays,bitmaps), (2,0));
-        assert_eq!(u32::from_le_bytes(bytes[..4].try_into().unwrap()), 2);
+        assert_eq!((arrays,bitmaps), (0,0));
+        assert_eq!(u32::from_le_bytes(bytes[..4].try_into().unwrap()), 0);
         let dense: Vec<u32> = (0..8194).filter(|n| n % 2 == 0).collect();
         let (bytes, arrays, bitmaps) = encode_list(&dense).unwrap();
         assert_eq!((arrays,bitmaps), (0,1));
@@ -239,6 +250,14 @@ mod tests {
         assert_eq!(p.retain_sorted(&mut Vec::new()), 0);
     }
 
+    #[test]
+    fn sparse_flat_cross_shard_roundtrip() {
+        let ids = [1u32, 7, 100, 65538, 65550];
+        let (bytes, arrays, bitmaps) = encode_list(&ids).unwrap();
+        assert_eq!((arrays,bitmaps), (0,0));
+        assert_eq!(bytes.len(), 4 + ids.len()*4);
+        assert_eq!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 0);
+    }
     #[test]
     fn run_container_compresses_ranges_and_checks_boundaries() {
         let ids: Vec<u32> = (100..700).chain(65530..65536).chain(65538..65547).collect();
