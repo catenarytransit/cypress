@@ -68,12 +68,17 @@ enum Commands {
         #[command(flatten)]
         args: Args,
     },
-    /// Reset version history (forces re-import of all regions)
     /// One-time import of existing legacy places into active V2 generations.
     MigratePlacesV2 {
         #[arg(long, default_value = "127.0.0.1")]
         scylla_url: String,
     },
+    /// Clean up failed and obsolete generation partitions.
+    GarbageCollectPlacesV2 {
+        #[arg(long, default_value = "127.0.0.1")]
+        scylla_url: String,
+    },
+    /// Reset version history (forces re-import of all regions)
     ResetVersions {
         /// ScyllaDB connection address string
         #[arg(long, default_value = "127.0.0.1")]
@@ -393,7 +398,7 @@ pub async fn run_single(args: Args, _synonyms: Arc<SynonymService>) -> Result<()
     let import_run = scylla_client.begin_place_import(&source_file).await?;
     let heartbeat_client = scylla_client.clone();
     let heartbeat_run = import_run.clone();
-    let heartbeat_task = tokio::spawn(async move {
+    let heartbeat_task: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
         loop {
             interval.tick().await;
