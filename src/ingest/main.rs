@@ -169,47 +169,183 @@ async fn main() -> Result<()> {
     }
 }
 
+#[derive(Default)]
+struct PlacesV2MigrationProgress {
+    scanned: u64,
+    queued: u64,
+    completed: u64,
+    skipped: u64,
+}
+
+impl PlacesV2MigrationProgress {
+    fn log(&self, phase: &'static str, started: std::time::Instant, sources: usize, in_flight: usize) {
+        let elapsed_seconds = started.elapsed().as_secs_f64();
+        info!(
+            phase,
+            scanned_rows = self.scanned,
+            queued_rows = self.queued,
+            completed_writes = self.completed,
+            skipped_active_rows = self.skipped,
+            sources_started = sources,
+            in_flight_writes = in_flight,
+            elapsed_seconds = (elapsed_seconds * 10.0).round() / 10.0,
+            scan_rows_per_second = (self.scanned as f64 / elapsed_seconds.max(0.001)).round() as u64,
+            "Places V2 migration progress"
+        );
+    }
+}
+
 /// Convert the legacy table without clearing it. This command is idempotent
 /// for sources already published to V2 and is required before the first V2-only
 /// compilation of a preexisting database.
 pub async fn migrate_places_v2(uri: &str) -> Result<()> {
     use futures::{stream::FuturesUnordered, StreamExt};
     use std::collections::HashMap;
-    let db = ScyllaClient::new(uri).await?;
+    use std::time::{Duration, Instant};
+    use tokio::time::{interval, MissedTickBehavior};
+
+    const WRITE_CONCURRENCY: usize = 64;
+    const PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
+
+    let started = Instant::now();
+    let mut ticker = interval(PROGRESS_INTERVAL);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    ticker.tick().await; // Discard the interval's immediate first tick.
+
+    info!("Initializing ScyllaDB connection and places V2 schema");
+    let connect = ScyllaClient::new(uri);
+    tokio::pin!(connect);
+    let db = loop {
+        tokio::select! {
+            result = &mut connect => break result?,
+            _ = ticker.tick() => {
+                info!(
+                    elapsed_seconds = started.elapsed().as_secs(),
+                    "Still waiting for ScyllaDB connection/schema initialization"
+                );
+            }
+        }
+    };
+    info!("ScyllaDB schema ready; loading active V2 sources");
+
     let active = db.active_place_sources().await?;
-    let active_names: std::collections::HashSet<_> = active.into_iter()
-        .map(|source| source.source_file).collect();
+    let active_names: std::collections::HashSet<_> = active
+        .into_iter()
+        .map(|source| source.source_file)
+        .collect();
+    info!(active_sources = active_names.len(), "Active V2 sources loaded");
+
     let mut runs: HashMap<String, (V2Import, usize)> = HashMap::new();
-    let mut rows = db.session.query_iter(
-        "SELECT id, data, population, source_file FROM cypress.places", &[],
-    ).await?.rows_stream::<(String, String, Option<i32>, Option<String>)>()?;
+    let mut progress = PlacesV2MigrationProgress::default();
+    info!("Starting full scan of legacy cypress.places");
+    let scan = db.session.query_iter(
+        "SELECT id, data, population, source_file FROM cypress.places",
+        &[],
+    );
+    tokio::pin!(scan);
+    let mut rows = loop {
+        tokio::select! {
+            result = &mut scan => {
+                break result?.rows_stream::<(String, String, Option<i32>, Option<String>)>()?;
+            }
+            _ = ticker.tick() => {
+                progress.log("starting_scan", started, runs.len(), 0);
+            }
+        }
+    };
     let mut pending = FuturesUnordered::new();
-    while let Some(row) = rows.next().await {
+
+    loop {
+        let row = tokio::select! {
+            row = rows.next() => row,
+            _ = ticker.tick() => {
+                progress.log("scanning", started, runs.len(), pending.len());
+                continue;
+            }
+        };
+        let Some(row) = row else { break };
         let (id, data, population, source_file) = row?;
+        progress.scanned += 1;
         let source = source_file.unwrap_or_else(|| "legacy-unattributed".to_owned());
-        if active_names.contains(&source) { continue; }
+        if active_names.contains(&source) {
+            progress.skipped += 1;
+            continue;
+        }
         if !runs.contains_key(&source) {
             let run = db.begin_place_import(&source).await?;
+            info!(source_file = %source, "Started places V2 source generation");
             runs.insert(source.clone(), (run, 0));
         }
         let (run, count) = runs.get_mut(&source).expect("run inserted");
         let write_run = run.clone();
         let db_ref = &db;
         pending.push(async move {
-            db_ref.upsert_place_v2(&write_run, &id, &data,
-                population.and_then(|p| u32::try_from(p).ok())).await
+            db_ref.upsert_place_v2(
+                &write_run,
+                &id,
+                &data,
+                population.and_then(|p| u32::try_from(p).ok()),
+            ).await
         });
-        if pending.len() >= 64 {
-            pending.next().await.context("Migration worker terminated")??;
-        }
+        progress.queued += 1;
         *count += 1;
-        if *count % 1_000 == 0 { db.heartbeat_place_import(run).await?; }
+
+        while pending.len() >= WRITE_CONCURRENCY {
+            tokio::select! {
+                write = pending.next() => {
+                    write.context("Migration worker terminated")??;
+                    progress.completed += 1;
+                }
+                _ = ticker.tick() => {
+                    progress.log("waiting_for_writes", started, runs.len(), pending.len());
+                }
+            }
+        }
+
+        if *count % 1_000 == 0 {
+            db.heartbeat_place_import(run).await?;
+        }
+        if *count % 100_000 == 0 {
+            info!(
+                source_file = %source,
+                queued_for_source = *count,
+                "Places V2 source progress"
+            );
+        }
     }
-    while let Some(write) = pending.next().await { write?; }
+
+    info!(
+        scanned_rows = progress.scanned,
+        queued_rows = progress.queued,
+        "Legacy table scan complete; finishing outstanding writes"
+    );
+    while !pending.is_empty() {
+        tokio::select! {
+            write = pending.next() => {
+                write.context("Migration worker terminated")??;
+                progress.completed += 1;
+            }
+            _ = ticker.tick() => {
+                progress.log("draining_writes", started, runs.len(), pending.len());
+            }
+        }
+    }
+    progress.log("publishing", started, runs.len(), 0);
     for (_, (run, count)) in runs {
+        info!(
+            source_file = %run.source_file,
+            source_rows = count,
+            "Publishing places V2 source generation"
+        );
         db.publish_place_import(&run, count as u64).await?;
     }
-    info!("Legacy places migrated; old table remains available for rollback");
+    info!(
+        scanned_rows = progress.scanned,
+        completed_writes = progress.completed,
+        skipped_active_rows = progress.skipped,
+        elapsed_seconds = started.elapsed().as_secs(),
+        "Legacy places migrated; old table remains available for rollback"
+    );
     Ok(())
 }
 
