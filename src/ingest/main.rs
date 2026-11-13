@@ -69,6 +69,11 @@ enum Commands {
         args: Args,
     },
     /// Reset version history (forces re-import of all regions)
+    /// One-time import of existing legacy places into active V2 generations.
+    MigratePlacesV2 {
+        #[arg(long, default_value = "127.0.0.1")]
+        scylla_url: String,
+    },
     ResetVersions {
         /// ScyllaDB connection address string
         #[arg(long, default_value = "127.0.0.1")]
@@ -149,7 +154,42 @@ async fn main() -> Result<()> {
         Commands::Single(args) => run_single(args, synonym_service).await,
         Commands::Batch { config, args } => batch::run_batch(config, args, synonym_service).await,
         Commands::ResetVersions { scylla_url } => run_reset(&scylla_url).await,
+        Commands::MigratePlacesV2 { scylla_url } => migrate_places_v2(&scylla_url).await,
     }
+}
+
+/// Convert the legacy table without clearing it. This command is idempotent
+/// for sources already published to V2 and is required before the first V2-only
+/// compilation of a preexisting database.
+pub async fn migrate_places_v2(uri: &str) -> Result<()> {
+    use futures::StreamExt;
+    use std::collections::HashMap;
+    let db = ScyllaClient::new(uri).await?;
+    let active = db.active_place_sources().await?;
+    let active_names: std::collections::HashSet<_> = active.into_iter()
+        .map(|source| source.source_file).collect();
+    let mut runs: HashMap<String, (V2Import, usize)> = HashMap::new();
+    let mut rows = db.session.query_iter(
+        "SELECT id, data, population, source_file FROM cypress.places", &[],
+    ).await?.rows_stream::<(String, String, Option<i32>, Option<String>)>()?;
+    while let Some(row) = rows.next().await {
+        let (id, data, population, source_file) = row?;
+        let source = source_file.unwrap_or_else(|| "legacy-unattributed".to_owned());
+        if active_names.contains(&source) { continue; }
+        if !runs.contains_key(&source) {
+            let run = db.begin_place_import(&source).await?;
+            runs.insert(source.clone(), (run, 0));
+        }
+        let (run, count) = runs.get_mut(&source).expect("run inserted");
+        db.upsert_place_v2(run, &id, &data, population.and_then(|p| u32::try_from(p).ok())).await?;
+        *count += 1;
+        if *count % 1_000 == 0 { db.heartbeat_place_import(run).await?; }
+    }
+    for (_, (run, count)) in runs {
+        db.publish_place_import(&run, count as u64).await?;
+    }
+    info!("Legacy places migrated; old table remains available for rollback");
+    Ok(())
 }
 
 pub async fn run_reset(scylla_url: &str) -> Result<()> {
@@ -202,15 +242,15 @@ pub async fn run_single(args: Args, _synonyms: Arc<SynonymService>) -> Result<()
             .await;
     }
 
-    // Truncate tables if requested
+    // A generation-based refresh needs no destructive truncation.
+    // Historical --create-index must never delete the only rollback copy.
     if args.create_index {
-        info!("Truncating ScyllaDB places, admin_areas, and places_by_source tables...");
-        scylla_client.truncate_tables().await?;
+        anyhow::bail!("--create-index is obsolete with places_v2; imports replace the active source generation automatically");
     }
 
     // Every region is written to an isolated generation. Previous completed
     // generations remain accessible until the new generation is published.
-    let import_start = Utc::now();
+    let _import_start = Utc::now();
 
     // Load importance data
     let importance_map = if let Some(path) = &args.importance_file {
