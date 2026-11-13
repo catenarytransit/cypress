@@ -507,8 +507,7 @@ pub async fn run_single(args: Args, _synonyms: Arc<SynonymService>) -> Result<()
         let obj = match obj_result {
             Ok(o) => o,
             Err(e) => {
-                warn!("Error reading OSM object: {}", e);
-                continue;
+                anyhow::bail!("OSM object parsing failed, refusing to publish incomplete generation: {e}");
             }
         };
 
