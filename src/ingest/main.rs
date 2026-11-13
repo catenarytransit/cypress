@@ -32,6 +32,7 @@ use cypress::models::population::{compress_population, parse_osm_population};
 use cypress::models::{Address, AdminLevel, GeoBbox, GeoPoint, Layer, OsmType, Place};
 use cypress::pip::{extract_admin_boundaries, AdminSpatialIndex, GeometryResolver, PipService};
 use cypress::scylla::ScyllaClient;
+use cypress::scylla::places_v2::V2Import;
 use cypress::wikidata::WikidataFetcher;
 
 use crate::importance::{calculate_default_importance, load_importance};
@@ -66,6 +67,16 @@ enum Commands {
         /// Base arguments to apply to all regions (overridden by config where applicable)
         #[command(flatten)]
         args: Args,
+    },
+    /// One-time import of existing legacy places into active V2 generations.
+    MigratePlacesV2 {
+        #[arg(long, default_value = "127.0.0.1")]
+        scylla_url: String,
+    },
+    /// Clean up failed and obsolete generation partitions.
+    GarbageCollectPlacesV2 {
+        #[arg(long, default_value = "127.0.0.1")]
+        scylla_url: String,
     },
     /// Reset version history (forces re-import of all regions)
     ResetVersions {
@@ -148,7 +159,58 @@ async fn main() -> Result<()> {
         Commands::Single(args) => run_single(args, synonym_service).await,
         Commands::Batch { config, args } => batch::run_batch(config, args, synonym_service).await,
         Commands::ResetVersions { scylla_url } => run_reset(&scylla_url).await,
+        Commands::MigratePlacesV2 { scylla_url } => migrate_places_v2(&scylla_url).await,
+        Commands::GarbageCollectPlacesV2 { scylla_url } => {
+            let db = ScyllaClient::new(&scylla_url).await?;
+            let deleted = db.garbage_collect_places_v2().await?;
+            info!("Removed {deleted} inactive places_v2 generations");
+            Ok(())
+        },
     }
+}
+
+/// Convert the legacy table without clearing it. This command is idempotent
+/// for sources already published to V2 and is required before the first V2-only
+/// compilation of a preexisting database.
+pub async fn migrate_places_v2(uri: &str) -> Result<()> {
+    use futures::{stream::FuturesUnordered, StreamExt};
+    use std::collections::HashMap;
+    let db = ScyllaClient::new(uri).await?;
+    let active = db.active_place_sources().await?;
+    let active_names: std::collections::HashSet<_> = active.into_iter()
+        .map(|source| source.source_file).collect();
+    let mut runs: HashMap<String, (V2Import, usize)> = HashMap::new();
+    let mut rows = db.session.query_iter(
+        "SELECT id, data, population, source_file FROM cypress.places", &[],
+    ).await?.rows_stream::<(String, String, Option<i32>, Option<String>)>()?;
+    let mut pending = FuturesUnordered::new();
+    while let Some(row) = rows.next().await {
+        let (id, data, population, source_file) = row?;
+        let source = source_file.unwrap_or_else(|| "legacy-unattributed".to_owned());
+        if active_names.contains(&source) { continue; }
+        if !runs.contains_key(&source) {
+            let run = db.begin_place_import(&source).await?;
+            runs.insert(source.clone(), (run, 0));
+        }
+        let (run, count) = runs.get_mut(&source).expect("run inserted");
+        let write_run = run.clone();
+        let db_ref = &db;
+        pending.push(async move {
+            db_ref.upsert_place_v2(&write_run, &id, &data,
+                population.and_then(|p| u32::try_from(p).ok())).await
+        });
+        if pending.len() >= 64 {
+            pending.next().await.context("Migration worker terminated")??;
+        }
+        *count += 1;
+        if *count % 1_000 == 0 { db.heartbeat_place_import(run).await?; }
+    }
+    while let Some(write) = pending.next().await { write?; }
+    for (_, (run, count)) in runs {
+        db.publish_place_import(&run, count as u64).await?;
+    }
+    info!("Legacy places migrated; old table remains available for rollback");
+    Ok(())
 }
 
 pub async fn run_reset(scylla_url: &str) -> Result<()> {
@@ -201,13 +263,15 @@ pub async fn run_single(args: Args, _synonyms: Arc<SynonymService>) -> Result<()
             .await;
     }
 
-    // Truncate tables if requested
+    // A generation-based refresh needs no destructive truncation.
+    // Historical --create-index must never delete the only rollback copy.
     if args.create_index {
-        info!("Truncating ScyllaDB places, admin_areas, and places_by_source tables...");
-        scylla_client.truncate_tables().await?;
+        anyhow::bail!("--create-index is obsolete with places_v2; imports replace the active source generation automatically");
     }
 
-    let import_start = Utc::now();
+    // Every region is written to an isolated generation. Previous completed
+    // generations remain accessible until the new generation is published.
+    let _import_start = Utc::now();
 
     // Load importance data
     let importance_map = if let Some(path) = &args.importance_file {
@@ -339,6 +403,23 @@ pub async fn run_single(args: Args, _synonyms: Arc<SynonymService>) -> Result<()
             .progress_chars("#>-"),
     );
 
+    // Acquire ownership only after expensive geometry preparation. Continue
+    // heartbeating while the import pipeline is alive.
+    let import_run = scylla_client.begin_place_import(&source_file).await?;
+    let heartbeat_client = scylla_client.clone();
+    let heartbeat_run = import_run.clone();
+    let heartbeat_task: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            if let Err(err) = heartbeat_client.heartbeat_place_import(&heartbeat_run).await {
+                error!("Import heartbeat failed: {err:#}");
+                return Err(err);
+            }
+        }
+    });
+
+    let result: Result<()> = async {
     // Create pipeline channel
     let (tx, rx) = mpsc::channel::<Place>(2000);
 
@@ -348,6 +429,7 @@ pub async fn run_single(args: Args, _synonyms: Arc<SynonymService>) -> Result<()
         wikidata,
         scylla_client.clone(),
         args.batch_size,
+        import_run.clone(),
     ));
 
     // Index Admin Boundaries first
@@ -420,10 +502,7 @@ pub async fn run_single(args: Args, _synonyms: Arc<SynonymService>) -> Result<()
 
             place.sanitize();
 
-            if let Err(_) = tx.send(place).await {
-                error!("Pipeline receiver dropped encountered during admin indexing");
-                break;
-            }
+            tx.send(place).await.context("Import pipeline stopped accepting documents")?;
         }
     }
 
@@ -443,8 +522,7 @@ pub async fn run_single(args: Args, _synonyms: Arc<SynonymService>) -> Result<()
         let obj = match obj_result {
             Ok(o) => o,
             Err(e) => {
-                warn!("Error reading OSM object: {}", e);
-                continue;
+                anyhow::bail!("OSM object parsing failed, refusing to publish incomplete generation: {e}");
             }
         };
 
@@ -502,10 +580,7 @@ pub async fn run_single(args: Args, _synonyms: Arc<SynonymService>) -> Result<()
 
             place.sanitize();
 
-            if let Err(_) = tx.send(place).await {
-                error!("Pipeline receiver dropped");
-                break;
-            }
+            tx.send(place).await.context("Import pipeline stopped accepting documents")?;
         }
     }
 
@@ -544,10 +619,7 @@ pub async fn run_single(args: Args, _synonyms: Arc<SynonymService>) -> Result<()
 
                 place.sanitize();
 
-                if let Err(_) = tx.send(place).await {
-                    error!("Pipeline receiver dropped during merged roads");
-                    break;
-                }
+                tx.send(place).await.context("Import pipeline stopped accepting documents")?;
             }
         }
     }
@@ -555,25 +627,11 @@ pub async fn run_single(args: Args, _synonyms: Arc<SynonymService>) -> Result<()
     // Close channel by dropping sender
     drop(tx);
 
-    // Wait for pipeline to finish
-    let pipeline_result = match pipeline_handle.await {
-        Ok(count) => count,
-        Err(e) => {
-            error!("Pipeline task failed: {}", e);
-            0
-        }
-    };
-
-    info!("Imported {} documents", pipeline_result);
-
-    // Refresh: delete stale documents
-    if args.refresh {
-        info!("Deleting stale documents from previous import...");
-        let deleted = scylla_client
-            .delete_stale_places(&source_file, import_start)
-            .await?;
-        info!("Deleted {} stale documents", deleted);
-    }
+    // Every write must finish successfully before publication. Failed imports
+    // are left inactive for generation GC, never used by the compiler.
+    let pipeline_result = pipeline_handle.await.context("Import pipeline task failed")??;
+    scylla_client.publish_place_import(&import_run, pipeline_result as u64).await?;
+    info!("Published {} documents for {}", pipeline_result, source_file);
 
     if let Some(ref dw) = discord {
         let _ = dw
@@ -588,7 +646,12 @@ pub async fn run_single(args: Args, _synonyms: Arc<SynonymService>) -> Result<()
             .await;
     }
 
-    Ok(())
+    Ok(())    }.await;
+    heartbeat_task.abort();
+    if result.is_err() {
+        scylla_client.fail_place_import(&import_run).await?;
+    }
+    result
 }
 
 async fn run_processing_pipeline(
@@ -596,7 +659,8 @@ async fn run_processing_pipeline(
     wikidata: Option<WikidataFetcher>,
     scylla: Arc<ScyllaClient>,
     batch_size: usize,
-) -> usize {
+    import_run: V2Import,
+) -> Result<usize> {
     let mut buffer = Vec::with_capacity(batch_size);
     let mut total_imported = 0;
 
@@ -605,11 +669,8 @@ async fn run_processing_pipeline(
 
         if buffer.len() >= batch_size {
             let len = buffer.len();
-            if let Err(e) = process_buffer(&mut buffer, &wikidata, &scylla).await {
-                error!("Error processing batch: {}", e);
-            } else {
-                total_imported += len;
-            }
+            process_buffer(&mut buffer, &wikidata, &scylla, &import_run).await?;
+            total_imported += len;
             buffer.clear();
         }
     }
@@ -617,20 +678,18 @@ async fn run_processing_pipeline(
     // Process remaining
     if !buffer.is_empty() {
         let len = buffer.len();
-        if let Err(e) = process_buffer(&mut buffer, &wikidata, &scylla).await {
-            error!("Error processing final batch: {}", e);
-        } else {
-            total_imported += len;
-        }
+        process_buffer(&mut buffer, &wikidata, &scylla, &import_run).await?;
+        total_imported += len;
     }
 
-    total_imported
+    Ok(total_imported)
 }
 
 async fn process_buffer(
     places: &mut [Place],
     wikidata: &Option<WikidataFetcher>,
     scylla: &ScyllaClient,
+    import_run: &V2Import,
 ) -> Result<()> {
     // 1. Fetch Wikidata
     if let Some(wd) = wikidata {
@@ -659,12 +718,11 @@ async fn process_buffer(
             let normalized = NormalizedPlace::from_place(place.clone());
             let json_data = serde_json::to_string(&normalized)?;
             scylla
-                .upsert_place(
+                .upsert_place_v2(
+                    import_run,
                     &normalized.source_id,
                     &json_data,
                     compress_population(normalized.population),
-                    &normalized.source_file,
-                    normalized.import_timestamp,
                 )
                 .await?;
 

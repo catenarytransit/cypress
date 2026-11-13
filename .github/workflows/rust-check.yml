@@ -55,6 +55,11 @@ jobs:
           CYPRESS_TEST_SCYLLA_URI: 127.0.0.1:9042
         run: cargo test --locked --test scylla_cleanup -- --ignored
 
+      - name: Test places_v2 generation publication and failed imports
+        env:
+          CYPRESS_TEST_SCYLLA_URI: 127.0.0.1:9042
+        run: cargo test --locked --test places_v2 -- --ignored
+
       - name: Show ScyllaDB logs on failure
         if: failure()
         run: docker logs cypress-cleanup-scylla

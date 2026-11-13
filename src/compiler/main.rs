@@ -31,6 +31,7 @@ use cypress::models::normalized::NormalizedPlace;
 use cypress::models::place::Address;
 use cypress::models::population::decompress_population;
 use cypress::scylla::ScyllaClient;
+use cypress::scylla::places_v2::{ActiveSource, V2_BUCKETS};
 use rkyv::ser::{
     serializers::{AllocScratch, CompositeSerializer, SharedSerializeMap, WriteSerializer},
     Serializer,
@@ -418,17 +419,31 @@ fn get_or_create_writer<'a>(
 
 async fn fetch_range_to_spill(
     client: Arc<ScyllaClient>,
-    start: i64,
-    end: i64,
+    bucket: i16,
+    sources: &[ActiveSource],
     place_file: &Path,
     term_file: &Path,
     parent_file: &Path,
     address_file: &Path,
 ) -> Result<u32> {
-    let query = format!(
-        "SELECT data, population FROM cypress.places WHERE token(id) >= {} AND token(id) < {}",
-        start, end
-    );
+    // Each source generation has bounded buckets. Collect one bucket at a time
+    // and resolve duplicate OSM IDs in deterministic source order. This avoids
+    // global per-ID LWTs and limits memory to one bucket's candidate documents.
+    let mut records: std::collections::BTreeMap<String, (String, Option<i32>)> =
+        std::collections::BTreeMap::new();
+    for source in sources {
+        let mut results = client.session.query_iter(
+            "SELECT id, data, population FROM cypress.places_v2
+             WHERE source_file = ? AND generation = ? AND bucket = ?",
+            (&source.source_file, source.generation, bucket),
+        ).await?.rows_stream::<(String, String, Option<i32>)>()?;
+        while let Some(row) = results.next().await {
+            let (id, data, population) = row?;
+            // Prefer the lexically earliest source for overlapping Geofabrik
+            // extracts; this is stable regardless of request completion order.
+            records.entry(id).or_insert((data, population));
+        }
+    }
 
     let mut place_writer = BufWriter::new(File::create(place_file).with_context(|| {
         format!(
@@ -455,21 +470,9 @@ async fn fetch_range_to_spill(
         )
     })?);
 
-    let it = client
-        .session
-        .query_iter(query, &[])
-        .await
-        .context("Scylla query_iter failed")?;
-
-    let mut rows = it
-        .rows_stream::<(String, Option<i32>)>()
-        .context("rows_stream type conversion failed")?;
-
     let mut local_place_id = 0u32;
 
-    while let Some(row_result) = rows.next().await {
-        let (data, compressed_population) = row_result.context("Row fetch failure")?;
-
+    for (_, (data, compressed_population)) in records {
         let Ok(place) = serde_json::from_str::<NormalizedPlace>(&data) else {
             continue;
         };
@@ -600,33 +603,14 @@ async fn main() -> Result<()> {
 
     info!("Connecting to ScyllaDB at {}", args.scylla_url);
     let scylla_client = ScyllaClient::new(&args.scylla_url).await?;
-    let session = &scylla_client.session;
+    let sources = Arc::new(scylla_client.active_place_sources().await?);
+    anyhow::ensure!(!sources.is_empty(),
+        "places_v2 has no active generations; run 'ingest migrate-places-v2' or import regions first");
 
-    // Retrieve the token ring from the ReplicaLocator
-    let cluster_state = session.get_cluster_state();
-    let ring = cluster_state.replica_locator().ring();
-
-    // Extract and sort unique tokens to define range boundaries
-    let mut tokens: Vec<i64> = ring.iter().map(|(t, _)| t.value()).collect();
-    tokens.sort_unstable();
-    tokens.dedup();
-
-    let mut ranges = Vec::new();
-    if tokens.is_empty() {
-        ranges.push((i64::MIN, i64::MAX));
-    } else {
-        ranges.push((i64::MIN, tokens[0]));
-        for i in 0..tokens.len() - 1 {
-            ranges.push((tokens[i], tokens[i + 1]));
-        }
-        ranges.push((tokens[tokens.len() - 1], i64::MAX));
-    }
-
+    // Work units are independent bucket partitions, not legacy token ranges.
+    let ranges: Vec<i16> = (0..V2_BUCKETS).collect();
     let total_ranges = ranges.len();
-    info!(
-        "Generated {} token ranges from cluster metadata",
-        total_ranges
-    );
+    info!("Compiling {} active regions from {} V2 buckets", sources.len(), total_ranges);
 
     let spills = Arc::new(Mutex::new(Vec::<WorkerSpill>::new()));
     let worker_counter = Arc::new(AtomicU32::new(0));
@@ -634,9 +618,10 @@ async fn main() -> Result<()> {
 
     let scylla_client_ref = Arc::new(scylla_client);
 
-    stream::iter(ranges.into_iter().map(Ok::<(i64, i64), anyhow::Error>))
-        .try_for_each_concurrent(args.concurrency, |(start, end)| {
+    stream::iter(ranges.into_iter().map(Ok::<i16, anyhow::Error>))
+        .try_for_each_concurrent(args.concurrency, |bucket| {
             let client = Arc::clone(&scylla_client_ref);
+            let sources = Arc::clone(&sources);
             let spills = Arc::clone(&spills);
             let worker_counter = Arc::clone(&worker_counter);
             let processed_ranges = Arc::clone(&processed_ranges);
@@ -656,8 +641,8 @@ async fn main() -> Result<()> {
                     attempt += 1;
                     match fetch_range_to_spill(
                         Arc::clone(&client),
-                        start,
-                        end,
+                        bucket,
+                        &sources,
                         &place_file,
                         &term_file,
                         &parent_file,
@@ -669,21 +654,19 @@ async fn main() -> Result<()> {
                         Err(e) => {
                             if attempt >= max_retries {
                                 error!(
-                                    "Range [{}, {}] aborted after {} attempts: {}",
-                                    start, end, attempt, e
+                                    "Bucket {} aborted after {} attempts: {}",
+                                    bucket, attempt, e
                                 );
                                 return Err(anyhow!(
-                                    "Range [{}, {}] failed permanently: {}",
-                                    start,
-                                    end,
-                                    e
+                                    "Bucket {} failed permanently: {}",
+                                    bucket, e
                                 ));
                             }
 
                             let delay = Duration::from_secs(2u64.saturating_pow(attempt));
                             warn!(
-                                "Range [{}, {}] failed ({}). Retrying in {:?}...",
-                                start, end, e, delay
+                                "Bucket {} failed ({}). Retrying in {:?}...",
+                                bucket, e, delay
                             );
                             sleep(delay).await;
                         }

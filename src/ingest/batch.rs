@@ -40,7 +40,8 @@ pub async fn run_batch(
     let version_manager_clone = version_manager.clone();
 
     // Spawn Producer (Download & Filter)
-    tokio::spawn(async move {
+    let producer = tokio::spawn(async move {
+        let mut preparation_failures = Vec::new();
         // Track if it's the first region to handle --create-index logic
         // Note: This logic assumes strictly sequential processing matching config order.
         let mut is_first_region = true;
@@ -104,13 +105,16 @@ pub async fn run_batch(
                 }
                 Err(e) => {
                     error!("Failed to prepare {}: {:?}", region.name, e);
+                    preparation_failures.push(region.name.clone());
                     // Do not kill pipeline, just skip
                     is_first_region = false;
                 }
             }
         }
+        preparation_failures
     });
 
+    let mut failed_regions = Vec::new();
     // Consumer (Ingest & Version Save)
     while let Some(prepared) = rx.recv().await {
         info!("Starting ingest for {}", prepared.region.name);
@@ -118,6 +122,7 @@ pub async fn run_batch(
         let res = crate::run_single(prepared.args, synonyms.clone()).await;
         if let Err(e) = res {
             error!("Ingest failed for {}: {:?}", prepared.region.name, e);
+            failed_regions.push(prepared.region.name.clone());
             continue;
         }
 
@@ -137,11 +142,18 @@ pub async fn run_batch(
                 "Failed to save version for {}: {:?}",
                 prepared.region.name, e
             );
+            failed_regions.push(prepared.region.name.clone());
         } else {
             info!("Region {} complete.", prepared.region.name);
         }
     }
 
+    failed_regions.extend(producer.await.context("Batch region preparation panicked")?);
+    let gc_client = cypress::scylla::ScyllaClient::new(&config.global.scylla_url).await?;
+    let reclaimed = gc_client.garbage_collect_places_v2().await?;
+    info!("Collected {reclaimed} inactive places_v2 generations");
+    anyhow::ensure!(failed_regions.is_empty(),
+        "Batch import failed for regions: {}", failed_regions.join(", "));
     Ok(())
 }
 
@@ -172,8 +184,7 @@ async fn prepare_region(
             .context("Failed to run curl")?;
 
         if !status.success() {
-            warn!("Failed to download {}. Skipping.", region.name);
-            return Ok(None);
+            anyhow::bail!("Failed to download {}", region.name);
         }
     } else {
         info!("File {} exists.", filename);
@@ -181,7 +192,9 @@ async fn prepare_region(
 
     // 2. Version Check
     let hash = calculate_file_hash(&raw_pbf)?;
-    if version_manager
+    let filtered_source = format!("{}-filtered.osm.pbf", filename.trim_end_matches(".osm.pbf"));
+    let has_v2_source = version_manager.has_active_place_source(&filtered_source).await?;
+    if has_v2_source && version_manager
         .is_latest(&region.name, &filename, &hash)
         .await?
         && !base_args.refresh
@@ -218,8 +231,7 @@ async fn prepare_region(
         .context("Failed to run filter script")?;
 
     if !status.success() {
-        warn!("Filtering failed for {}. Skipping.", region.name);
-        return Ok(None);
+        anyhow::bail!("Filtering failed for {}", region.name);
     }
 
     // Admin filter
