@@ -87,6 +87,29 @@ def measure(args):
     return 0 if successes == len(observations) else 2
 
 
+
+def combine(args):
+    """Combine two independent ABBA phases without losing phase identities."""
+    parts = [json.loads(path.read_text(encoding="utf-8")) for path in args.input]
+    if len(parts) != 2 or parts[0]["cases"] != parts[1]["cases"]:
+        raise ValueError("ABBA requires two identical-workload phase observations")
+    if parts[0]["cycles"] != parts[1]["cycles"]:
+        raise ValueError("ABBA phases must have the same measured cycle count")
+    merged = dict(parts[0])
+    merged["engine"] = args.label
+    merged["abba_phases"] = [str(path) for path in args.input]
+    merged["observations"] = []
+    for phase, item in enumerate(parts):
+        for row in item["observations"]:
+            merged["observations"].append(
+                {**row, "abba_phase": phase,
+                 "cycle": row["cycle"] + phase * item["cycles"]})
+    merged["cycles"] = sum(x["cycles"] for x in parts)
+    args.output.write_text(json.dumps(merged, ensure_ascii=False, indent=2) + "\n",
+                           encoding="utf-8")
+    return 0
+
+
 def summarize(args):
     base = json.loads(args.baseline.read_text(encoding="utf-8"))
     exp = json.loads(args.experiment.read_text(encoding="utf-8"))
@@ -128,6 +151,16 @@ def summarize(args):
     e = by_engine[exp["engine"]]
     mismatches = [cid for cid in cases
                   if details[base["engine"]][cid]["ids"] != details[exp["engine"]][cid]["ids"]]
+    # Compare every observed result for each fixture, not just one response.
+    per_case_baseline = {}
+    per_case_experiment = {}
+    for obj, sink in ((base, per_case_baseline), (exp, per_case_experiment)):
+        for observation in obj["observations"]:
+            sink.setdefault(observation["id"], set()).add(tuple(observation["ids"]))
+    nondeterministic_cases = sorted(cid for cid in cases
+        if len(per_case_baseline.get(cid, ())) != 1 or
+           len(per_case_experiment.get(cid, ())) != 1)
+    report_nondeterminism = nondeterministic_cases
     overlap = []
     for cid in cases:
         a = details[base["engine"]][cid]["ids"]
@@ -135,7 +168,9 @@ def summarize(args):
         if a:
             overlap.append(len(set(a[:5]) & set(z[:5])) / min(5, len(a)))
     report = {"baseline": b, "experiment": e, "cases": len(cases),
+              "test_order": "A1 B1 B2 A2",
               "ordered_id_mismatches": mismatches,
+              "nondeterministic_cases": report_nondeterminism,
               "mean_top5_overlap": round(statistics.mean(overlap), 4) if overlap else None,
               "p50_speedup": round(b["p50_ms"] / e["p50_ms"], 3) if e["p50_ms"] else None,
               "p95_speedup": round(b["p95_ms"] / e["p95_ms"], 3) if e["p95_ms"] else None}
@@ -224,7 +259,9 @@ def summarize(args):
                              x["hit5"], y["hit5"], json.dumps(x["ids"]),
                              json.dumps(y["ids"])])
     md = [
-        "# Five-country dataset: Cypress main vs Roaring-style hybrid postings", "",
+        "# Five-country ABBA: Cypress main vs experimental retrieval", "",
+        "Measured in A1/B1/B2/A2 order, with independently restarted query processes.",
+        "Each variant aggregates two complete measured blocks; Linux page cache is retained.", "",
         "Both binaries use identical production settings, except the experiment",
         "selects `CYPRESS_TOKEN_RETRIEVAL_MODE=roaring`.",
         "Each binary runs an independently compiled index from the **same imported Scylla dataset**.",
@@ -277,6 +314,7 @@ def summarize(args):
     md.extend(["", f"p50 speedup: {report['p50_speedup']}x",
                f"p95 speedup: {report['p95_speedup']}x",
                f"Ordered result-ID differences: {len(mismatches)} / {len(cases)}",
+               f"Nondeterministic across cycles: {len(nondeterministic_cases)} fixtures",
                f"Mean top-5 ID overlap: {report['mean_top5_overlap']}",
                "", "## Interpretation", "",
                "The upstream open-geocode binary is NOT benchmarked. The experiment",
@@ -305,12 +343,20 @@ def main():
     m.add_argument("--warmup", type=int, default=2)
     m.add_argument("--timeout", type=float, default=30)
     m.add_argument("--seed", type=int, default=20261111)
+    c = sub.add_parser("combine")
+    c.add_argument("--input", nargs=2, required=True, type=Path)
+    c.add_argument("--output", required=True, type=Path)
+    c.add_argument("--label", choices=("baseline", "experiment"), required=True)
     s = sub.add_parser("summarize")
     s.add_argument("--baseline", type=Path, required=True)
     s.add_argument("--experiment", type=Path, required=True)
     s.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    return measure(args) if args.cmd == "measure" else summarize(args)
+    if args.cmd == "measure":
+        return measure(args)
+    if args.cmd == "combine":
+        return combine(args)
+    return summarize(args)
 
 
 if __name__ == "__main__":
