@@ -46,6 +46,12 @@ impl VersionManager {
             )
             .await
             .context("Failed to ensure ScyllaDB version tracking table")?;
+        session.query_unpaged(
+            "CREATE TABLE IF NOT EXISTS cypress.latest_region_versions_v2 (
+                region_name text, filename text, hash text, timestamp timestamp,
+                PRIMARY KEY ((region_name), filename)
+            )", &[],
+        ).await?;
         Ok(())
     }
 
@@ -55,21 +61,12 @@ impl VersionManager {
     }
 
     pub async fn is_latest(&self, region_name: &str, filename: &str, hash: &str) -> Result<bool> {
-        let session = &self.scylla_client.session;
-        let query = "SELECT COUNT(*) FROM cypress.cypress_versions \
-                     WHERE region_name = ? AND filename = ? AND hash = ?;";
-
-        let result = session
-            .query_unpaged(query, (region_name, filename, hash))
-            .await
-            .context("Failed executing historical hash state selection inside Scylla")?;
-
-        if let Ok(rows_result) = result.into_rows_result() {
-            if let Some((count,)) = rows_result.maybe_first_row::<(i64,)>()? {
-                return Ok(count > 0);
-            }
-        }
-        Ok(false)
+        let result = self.scylla_client.session.query_unpaged(
+            "SELECT hash FROM cypress.latest_region_versions_v2 WHERE region_name = ? AND filename = ?",
+            (region_name, filename),
+        ).await?;
+        let current = result.into_rows_result()?.maybe_first_row::<(String,)>()?;
+        Ok(current.is_some_and(|(value,)| value == hash))
     }
 
     pub async fn save_version(&self, version: VersionDoc) -> Result<()> {
@@ -82,14 +79,18 @@ impl VersionManager {
             .query_unpaged(
                 statement,
                 (
-                    version.region_name,
-                    version.filename,
-                    version.hash,
+                    &version.region_name,
+                    &version.filename,
+                    &version.hash,
                     version.timestamp,
                 ),
             )
             .await
             .context("Failed persisting processing metadata state verification sequence")?;
+        session.query_unpaged(
+            "INSERT INTO cypress.latest_region_versions_v2 (region_name, filename, hash, timestamp) VALUES (?, ?, ?, ?)",
+            (&version.region_name, &version.filename, &version.hash, version.timestamp),
+        ).await?;
         Ok(())
     }
 
@@ -100,6 +101,7 @@ impl VersionManager {
             .query_unpaged("TRUNCATE cypress.cypress_versions;", &[])
             .await
             .context("Failed to safely prune persistent storage elements")?;
+        session.query_unpaged("TRUNCATE cypress.latest_region_versions_v2", &[]).await?;
         Ok(())
     }
 }
