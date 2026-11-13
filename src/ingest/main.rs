@@ -155,6 +155,12 @@ async fn main() -> Result<()> {
         Commands::Batch { config, args } => batch::run_batch(config, args, synonym_service).await,
         Commands::ResetVersions { scylla_url } => run_reset(&scylla_url).await,
         Commands::MigratePlacesV2 { scylla_url } => migrate_places_v2(&scylla_url).await,
+        Commands::GarbageCollectPlacesV2 { scylla_url } => {
+            let db = ScyllaClient::new(&scylla_url).await?;
+            let deleted = db.garbage_collect_places_v2().await?;
+            info!("Removed {deleted} inactive places_v2 generations");
+            Ok(())
+        },
     }
 }
 
