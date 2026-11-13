@@ -11,7 +11,7 @@ use super::token_index::{dictionary_fingerprint, TOKEN_ANALYZER_VERSION};
 
 pub const FILE: &str = "cypress_roaring_tokens.bin";
 pub const MAGIC: &[u8; 8] = b"CYPROAR1";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const HEADER_BYTES: usize = 64;
 pub const META_BYTES: usize = 16;
 pub const CONTAINER_BYTES: usize = 12;
@@ -32,7 +32,7 @@ fn le64(src: &[u8], pos: usize) -> Result<u64> {
 struct Container<'a> {
     high: u16,
     count: u32,
-    bitmap: bool,
+    kind: u8,
     body: &'a [u8],
 }
 
@@ -58,11 +58,15 @@ impl RoaringPosting<'_> {
     fn container(&self, index: usize) -> Container<'_> {
         let pos = 4 + index * CONTAINER_BYTES;
         let high = u16::from_le_bytes(self.bytes[pos..pos + 2].try_into().unwrap());
-        let bitmap = self.bytes[pos + 2] == 1;
+        let kind = self.bytes[pos + 2];
         let count = u32::from_le_bytes(self.bytes[pos + 4..pos + 8].try_into().unwrap());
         let start = u32::from_le_bytes(self.bytes[pos + 8..pos + 12].try_into().unwrap()) as usize;
-        let size = if bitmap { BITMAP_BYTES } else { count as usize * 2 };
-        Container { high, count, bitmap, body: &self.bytes[start..start + size] }
+        let size = match kind {
+            1 => BITMAP_BYTES,
+            2 => 2 + (u16::from_le_bytes(self.bytes[start..start + 2].try_into().unwrap()) as usize) * 4,
+            _ => count as usize * 2,
+        };
+        Container { high, count, kind, body: &self.bytes[start..start + size] }
     }
     /// O(log #containers + log 4096) for sparse entries; O(log #containers)
     /// plus one bitmap bit-test for dense ones. No allocation or varint decoding.
@@ -82,9 +86,25 @@ impl RoaringPosting<'_> {
         Self::contains_low(c, low)
     }
     fn contains_low(c: Container<'_>, low: u16) -> bool {
-        if c.bitmap {
+        if c.kind == 1 {
             let b = c.body[(low as usize) >> 3];
             return b & (1 << (low & 7)) != 0;
+        }
+        if c.kind == 2 {
+            let runs = u16::from_le_bytes(c.body[0..2].try_into().unwrap()) as usize;
+            let mut left = 0usize;
+            let mut right = runs;
+            while left < right {
+                let mid = left + (right - left) / 2;
+                let off = 2 + mid * 4;
+                let start = u16::from_le_bytes(c.body[off..off + 2].try_into().unwrap());
+                if start <= low { left = mid + 1; } else { right = mid; }
+            }
+            if left == 0 { return false; }
+            let off = 2 + (left - 1) * 4;
+            let start = u16::from_le_bytes(c.body[off..off + 2].try_into().unwrap()) as u32;
+            let len = u16::from_le_bytes(c.body[off + 2..off + 4].try_into().unwrap()) as u32;
+            return (low as u32) <= start + len;
         }
         let mut lo = 0usize;
         let mut hi = c.count as usize;
@@ -120,7 +140,17 @@ impl RoaringPosting<'_> {
         for n in 0..self.container_count() {
             let c = self.container(n);
             let high = (c.high as u32) << 16;
-            if c.bitmap {
+            if c.kind == 2 {
+                let runs = u16::from_le_bytes(c.body[0..2].try_into().unwrap()) as usize;
+                for i in 0..runs {
+                    let pos = 2 + i * 4;
+                    let start = u16::from_le_bytes(c.body[pos..pos+2].try_into().unwrap()) as u32;
+                    let extra = u16::from_le_bytes(c.body[pos+2..pos+4].try_into().unwrap()) as u32;
+                    for low in start..=start + extra {
+                        out.push(high | low);
+                    }
+                }
+            } else if c.kind == 1 {
                 for (i, byte) in c.body.iter().copied().enumerate() {
                     let mut bits = byte;
                     while bits != 0 {
@@ -148,15 +178,24 @@ impl RoaringPosting<'_> {
             let pos = 4 + i * CONTAINER_BYTES;
             let high = le16(self.bytes, pos)?;
             let kind = self.bytes[pos + 2];
-            ensure!(kind <= 1 && self.bytes[pos + 3] == 0, "invalid container type");
+            ensure!(kind <= 2 && self.bytes[pos + 3] == 0, "invalid container type");
             let size = le32(self.bytes, pos + 4)? as usize;
             ensure!((1..=65536).contains(&size), "invalid container cardinality");
             if let Some(prev) = last_high { ensure!(high > prev, "containers not sorted"); }
             last_high = Some(high);
             let start = le32(self.bytes, pos + 8)? as usize;
-            let body_len = if kind == 1 { BITMAP_BYTES } else {
-                ensure!(size <= ARRAY_MAX, "sparse array too large");
-                size * 2
+            let body_len = match kind {
+                1 => BITMAP_BYTES,
+                2 => {
+                    let run_start = le32(self.bytes, pos + 8)? as usize;
+                    let run_count = le16(self.bytes, run_start)? as usize;
+                    2usize.checked_add(run_count.checked_mul(4).ok_or_else(|| anyhow!("run length overflow"))?)
+                        .ok_or_else(|| anyhow!("run length overflow"))?
+                }
+                _ => {
+                    ensure!(size <= ARRAY_MAX, "sparse array too large");
+                    size * 2
+                }
             };
             ensure!(start >= header_end && start.checked_add(body_len).map_or(false, |end| end <= self.bytes.len()),
                     "container data out of bounds");
@@ -164,6 +203,24 @@ impl RoaringPosting<'_> {
             if kind == 1 {
                 ensure!(size > ARRAY_MAX, "bitmap should be dense");
                 ensure!(body.iter().map(|b| b.count_ones() as usize).sum::<usize>() == size, "bitmap cardinality mismatch");
+            } else if kind == 2 {
+                let runs = le16(body, 0)? as usize;
+                ensure!(runs != 0, "empty run list");
+                let mut total = 0usize;
+                let mut prior_end = None;
+                for i in 0..runs {
+                    let pos = 2 + i * 4;
+                    let start = le16(body, pos)? as usize;
+                    let end = start.checked_add(le16(body, pos + 2)? as usize)
+                        .ok_or_else(|| anyhow!("run overflow"))?;
+                    ensure!(end <= u16::MAX as usize, "run crosses container boundary");
+                    if let Some(prev) = prior_end {
+                        ensure!(start > prev + 1, "overlapping or adjacent runs");
+                    }
+                    total += end - start + 1;
+                    prior_end = Some(end);
+                }
+                ensure!(total == size, "run cardinality mismatch");
             } else {
                 let mut prior = None;
                 for pair in body.chunks_exact(2) {
