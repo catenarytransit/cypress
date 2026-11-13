@@ -232,7 +232,25 @@ impl ScyllaClient {
         while let Some(row) = rows.next().await {
             let (source, generation, state, started, finished) = row?;
             if state == "importing" && finished.is_none() {
-                continue; // Heartbeat/lease recovery handles incomplete runs.
+                let current = self.source_state(&source).await?;
+                if let Some((_, Some(pending), heartbeat)) = current {
+                    if pending == generation && heartbeat.is_some_and(|t| t > Utc::now() - Duration::hours(ABANDONED_AFTER_HOURS)) {
+                        continue;
+                    }
+                    if pending == generation {
+                        let reclaimed = was_applied(self.session.query_unpaged(
+                            "UPDATE cypress.place_sources_v2 SET pending_generation = null, heartbeat = null WHERE source_file = ? IF pending_generation = ?",
+                            (&source, generation),
+                        ).await?)?;
+                        if !reclaimed { continue; }
+                    }
+                }
+                self.session.query_unpaged(
+                    "UPDATE cypress.place_import_runs_v2 SET state = 'failed', finished_at = ? WHERE source_file = ? AND generation = ?",
+                    (Utc::now(), &source, generation),
+                ).await?;
+                // Retain for the same grace period as other inactive generations.
+                continue;
             }
             if finished.unwrap_or(started) <= cutoff {
                 old.push((source, generation));
