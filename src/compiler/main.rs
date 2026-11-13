@@ -603,8 +603,6 @@ async fn main() -> Result<()> {
 
     info!("Connecting to ScyllaDB at {}", args.scylla_url);
     let scylla_client = ScyllaClient::new(&args.scylla_url).await?;
-    let session = &scylla_client.session;
-
     let sources = Arc::new(scylla_client.active_place_sources().await?);
     anyhow::ensure!(!sources.is_empty(),
         "places_v2 has no active generations; run 'ingest migrate-places-v2' or import regions first");
