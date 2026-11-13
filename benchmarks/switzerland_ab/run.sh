@@ -245,7 +245,7 @@ time "$DATA/experimental-compiler" --scylla-url 127.0.0.1 \
   --concurrency "${BENCHMARK_COMPILER_CONCURRENCY:-2}" \
   --roaring-token-index
 du -sh "$DATA/compiled/experiment" | tee "$RESULTS/index-size-experiment.txt"
-find "$DATA/compiled/experiment" -type f -printf '%P %s bytes\\n' | sort > "$RESULTS/index-files-experiment.txt"
+find "$DATA/compiled/experiment" -type f -printf '%P %s bytes\n' | sort > "$RESULTS/index-files-experiment.txt"
 test -s "$DATA/compiled/experiment/cypress_roaring_tokens.bin"
 run_engine experiment-b1 experiment "$DATA/experimental-query" roaring
 run_engine experiment-b2 experiment "$DATA/experimental-query" roaring
@@ -257,7 +257,7 @@ rm -rf "$DATA/compiled/baseline"
 time "$DATA/main-compiler" --scylla-url 127.0.0.1 \
   --out-dir "$DATA/compiled/baseline" --tmp-dir "$DATA/tmp/baseline" \
   --concurrency "${BENCHMARK_COMPILER_CONCURRENCY:-2}" --token-index
-find "$DATA/compiled/baseline" -type f -printf '%P %s bytes\\n' | sort > "$RESULTS/index-files-baseline-a2.txt"
+find "$DATA/compiled/baseline" -type f -printf '%P %s bytes\n' | sort > "$RESULTS/index-files-baseline-a2.txt"
 diff -u "$RESULTS/index-files-baseline.txt" "$RESULTS/index-files-baseline-a2.txt"
 run_engine baseline-a2 baseline "$DATA/main-query" token
 python3 benchmarks/switzerland_ab/compare.py combine \
