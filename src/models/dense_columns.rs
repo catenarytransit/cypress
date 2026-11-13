@@ -5,8 +5,8 @@ use std::convert::TryInto;
 
 pub const DENSE_FILE: &str = "cypress_dense.bin";
 pub const DENSE_MAGIC: &[u8; 8] = b"CYDENS01";
-pub const DENSE_VERSION: u32 = 1;
-pub const SECTION_COUNT: usize = 16;
+pub const DENSE_VERSION: u32 = 2;
+pub const SECTION_COUNT: usize = 17;
 pub const HEADER_SIZE: usize = 24 + SECTION_COUNT * 16;
 
 /// The order is part of the disk format, not an enum derived from Rust layout.
@@ -27,9 +27,11 @@ pub const SECTION_NAMES: [&str; SECTION_COUNT] = [
     "place_address_house_indices",
     "place_area_sets",
     "string_to_places_data",
+    "place_transit_kinds",
 ];
 
-pub const ELEMENT_BYTES: [usize; SECTION_COUNT] = [4, 4, 4, 4, 1, 1, 4, 4, 8, 1, 8, 1, 4, 4, 4, 4];
+pub const ELEMENT_BYTES: [usize; SECTION_COUNT] =
+    [4, 4, 4, 4, 1, 1, 4, 4, 8, 1, 8, 1, 4, 4, 4, 4, 1];
 
 pub struct DenseColumnsView<'a> {
     pub place_latitudes: &'a [f32],
@@ -39,6 +41,8 @@ pub struct DenseColumnsView<'a> {
     pub place_source_id_bytes: &'a [u8],
     pub place_layer_ranks: &'a [u8],
     pub place_populations: &'a [u32],
+    /// Empty for legacy v1 generations.
+    pub place_transit_kinds: &'a [u8],
     pub house_street_groups: &'a [u32],
     pub house_number_offsets: &'a [u64],
     pub house_number_bytes: &'a [u8],
@@ -57,20 +61,24 @@ impl<'a> DenseColumnsView<'a> {
             cfg!(target_endian = "little"),
             "dense sidecar requires little-endian"
         );
-        ensure!(data.len() >= HEADER_SIZE, "truncated dense column header");
+        ensure!(data.len() >= 24, "truncated dense column header");
         ensure!(&data[0..8] == DENSE_MAGIC, "bad dense sidecar magic");
+        let version = u32::from_le_bytes(data[8..12].try_into()?);
+        let section_count = match version {
+            1 => 16,
+            DENSE_VERSION => SECTION_COUNT,
+            _ => return Err(anyhow!("unsupported dense sidecar version")),
+        };
         ensure!(
-            u32::from_le_bytes(data[8..12].try_into()?) == DENSE_VERSION,
-            "unsupported dense sidecar version"
-        );
-        ensure!(
-            u32::from_le_bytes(data[12..16].try_into()?) == SECTION_COUNT as u32,
+            u32::from_le_bytes(data[12..16].try_into()?) == section_count as u32,
             "incorrect dense sidecar section count"
         );
+        let header_size = 24 + section_count * 16;
+        ensure!(data.len() >= header_size, "truncated dense column header");
         let fingerprint = u64::from_le_bytes(data[16..24].try_into()?);
         let mut ranges = [(0usize, 0usize); SECTION_COUNT];
-        let mut cursor = HEADER_SIZE;
-        for (i, range) in ranges.iter_mut().enumerate() {
+        let mut cursor = header_size;
+        for (i, range) in ranges.iter_mut().take(section_count).enumerate() {
             let pos = 24 + i * 16;
             let offset = usize::try_from(u64::from_le_bytes(data[pos..pos + 8].try_into()?))?;
             let count = usize::try_from(u64::from_le_bytes(data[pos + 8..pos + 16].try_into()?))?;
@@ -106,6 +114,11 @@ impl<'a> DenseColumnsView<'a> {
             place_source_id_bytes: &data[ranges[4].0..ranges[4].1],
             place_layer_ranks: &data[ranges[5].0..ranges[5].1],
             place_populations: cast(data, ranges[6])?,
+            place_transit_kinds: if version == 1 {
+                &[]
+            } else {
+                &data[ranges[16].0..ranges[16].1]
+            },
             house_street_groups: cast(data, ranges[7])?,
             house_number_offsets: cast(data, ranges[8])?,
             house_number_bytes: &data[ranges[9].0..ranges[9].1],
@@ -118,6 +131,12 @@ impl<'a> DenseColumnsView<'a> {
             dictionary_fingerprint: fingerprint,
         };
         view.validate()?;
+        if version != 1 {
+            ensure!(
+                view.place_transit_kinds.len() == view.place_latitudes.len(),
+                "invalid transit kind count"
+            );
+        }
         Ok(view)
     }
 

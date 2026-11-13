@@ -436,6 +436,8 @@ async fn fetch_range_to_spill(
             place_file.display()
         )
     })?);
+    // Parallel to this worker's place records; retries truncate both files.
+    let mut transit_writer = BufWriter::new(File::create(place_file.with_extension("transit"))?);
     let mut term_writer =
         BufWriter::new(File::create(term_file).with_context(|| {
             format!("Failed to create term spill file: {}", term_file.display())
@@ -507,6 +509,9 @@ async fn fetch_range_to_spill(
         record.name_len = name_len as u8;
 
         write_place_record(&mut place_writer, &record)?;
+        transit_writer.write_all(&[cypress::models::transit::TransitKind::from_categories(
+            &place.categories,
+        ) as u8])?;
 
         // Keep the address relation structured. Only the street/address-anchor
         // enters the global string dictionary later; house numbers and
@@ -565,6 +570,7 @@ async fn fetch_range_to_spill(
     }
 
     place_writer.flush()?;
+    transit_writer.flush()?;
     term_writer.flush()?;
     parent_writer.flush()?;
     address_writer.flush()?;
@@ -791,6 +797,28 @@ async fn main() -> Result<()> {
         disk_columns::DiskColumn::<u8>::new(&dense_dir, "place_layer_ranks")?;
     let mut place_populations =
         disk_columns::DiskColumn::<u32>::new(&dense_dir, "place_populations")?;
+
+    // Stream the transit column in exactly the same worker order as the place
+    // merge. Keep cypress_places.bin's existing fixed-width format unchanged.
+    let mut transit_kinds = disk_columns::DiskColumn::<u8>::new(&dense_dir, "place_transit_kinds")?;
+    let mut transit_buf = [0u8; 64 * 1024];
+    for (spill, _) in &worker_offsets {
+        let mut reader = BufReader::new(File::open(spill.place_file.with_extension("transit"))?);
+        let mut count = 0usize;
+        loop {
+            let n = reader.read(&mut transit_buf)?;
+            if n == 0 {
+                break;
+            }
+            transit_kinds.extend_from_slice(&transit_buf[..n])?;
+            count += n;
+        }
+        anyhow::ensure!(
+            count == spill.place_count as usize,
+            "transit spill count differs from places"
+        );
+    }
+    transit_kinds.finish()?;
 
     place_source_id_offsets.push(0)?;
 

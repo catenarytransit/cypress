@@ -78,7 +78,9 @@ echo "Raw PBF: $RAW_PBF ($(du -h "$RAW_PBF" | cut -f1))"
 if [ "$NO_FILTER" = false ]; then
     if command -v osmium &> /dev/null; then
         # General filter
-        if [ ! -f "$FILTERED_PBF" ] || [ "$RAW_PBF" -nt "$FILTERED_PBF" ]; then
+        if [ ! -f "$FILTERED_PBF" ] || [ "$RAW_PBF" -nt "$FILTERED_PBF" ] \
+            || [ "${PROJECT_DIR}/config/filter_expressions.txt" -nt "$FILTERED_PBF" ] \
+            || [ "${SCRIPT_DIR}/filter_osm.sh" -nt "$FILTERED_PBF" ]; then
             echo
             echo "Pre-filtering OSM data (reduces memory usage)..."
             "$SCRIPT_DIR/filter_osm.sh" "$RAW_PBF" "$FILTERED_PBF"
