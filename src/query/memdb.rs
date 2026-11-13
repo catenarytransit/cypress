@@ -438,6 +438,7 @@ pub struct QueryDbView<'a> {
     pub place_source_id_bytes: &'a [u8],
     pub place_layer_ranks: &'a [u8],
     pub place_populations: &'a [u32],
+    pub place_transit_kinds: &'a [u8],
     pub place_area_sets: &'a [u32],
     pub string_to_places_data: &'a [u32],
     pub house_street_groups: &'a [u32],
@@ -514,6 +515,7 @@ impl MemdbData {
             place_layer_ranks: dense
                 .as_ref()
                 .map_or(&db.place_layer_ranks[..], |v| v.place_layer_ranks),
+            place_transit_kinds: dense.as_ref().map_or(&[], |v| v.place_transit_kinds),
             place_populations: dense
                 .as_ref()
                 .map_or(&db.place_populations[..], |v| v.place_populations),
@@ -806,5 +808,112 @@ impl Memdb {
     /// Read the active database instance
     pub fn get_data(&self) -> arc_swap::Guard<Arc<MemdbData>> {
         self.data.load()
+    }
+}
+
+#[cfg(test)]
+mod transit_ranking_tests {
+    use super::*;
+    use cypress::models::{dense_columns::*, memdb::CypressMemDb};
+
+    fn mmap(bytes: &[u8]) -> Mmap {
+        let mut map = memmap2::MmapMut::map_anon(bytes.len()).unwrap();
+        map.copy_from_slice(bytes);
+        map.make_read_only().unwrap()
+    }
+
+    #[test]
+    fn real_search_applies_mode_prior_before_top_k_and_does_not_cache_flags() {
+        fn u32s(values: &[u32]) -> Vec<u8> {
+            values.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+        fn u64s(values: &[u64]) -> Vec<u8> {
+            values.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+        fn f32s(values: &[f32]) -> Vec<u8> {
+            values.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+        // Same lexical match and coordinates: rail, metro, tram, bus, city.
+        let sections = [
+            f32s(&[52.2; 5]),
+            f32s(&[0.12; 5]),
+            f32s(&[0.0; 5]),
+            u32s(&[0; 6]),
+            vec![],
+            vec![0, 0, 0, 0, 3],
+            u32s(&[0, 0, 0, 0, 600_000]),
+            vec![],
+            u64s(&[0]),
+            vec![],
+            u64s(&[0]),
+            vec![],
+            vec![],
+            u32s(&[u32::MAX; 5]),
+            u32s(&[u32::MAX; 5]),
+            u32s(&[0, 1, 2, 3, 4]),
+            vec![4, 3, 2, 1, 0],
+        ];
+        let mut dense = vec![0; HEADER_SIZE];
+        dense[..8].copy_from_slice(DENSE_MAGIC);
+        dense[8..12].copy_from_slice(&DENSE_VERSION.to_le_bytes());
+        dense[12..16].copy_from_slice(&(SECTION_COUNT as u32).to_le_bytes());
+        for (i, section) in sections.iter().enumerate() {
+            let pos = 24 + i * 16;
+            let offset = dense.len() as u64;
+            dense[pos..pos + 8].copy_from_slice(&offset.to_le_bytes());
+            dense[pos + 8..pos + 16]
+                .copy_from_slice(&((section.len() / ELEMENT_BYTES[i]) as u64).to_le_bytes());
+            dense.extend_from_slice(section);
+            dense.resize((dense.len() + 7) & !7, 0);
+        }
+        DenseColumnsView::parse(&dense).unwrap();
+        let mut fst = fst::MapBuilder::memory();
+        fst.insert("cambridge", 0).unwrap();
+        let db = CypressMemDb {
+            string_bigram_counts: vec![8],
+            bigram_offsets: vec![0; 65537],
+            string_to_places_offsets: vec![0, 5],
+            string_to_street_offsets: vec![0, 0],
+            string_name_offsets: vec![0, 9],
+            string_name_bytes: b"cambridge".to_vec(),
+            prefix_fst_bytes: fst.into_inner().unwrap(),
+            area_name_offsets: vec![0],
+            area_set_offsets: vec![0],
+            ..Default::default()
+        };
+        let bytes = rkyv::to_bytes::<_, 256>(&db).unwrap();
+        let memdb = Memdb {
+            data: ArcSwap::from_pointee(MemdbData {
+                index_mmap: mmap(&bytes),
+                dense_mmap: Some(mmap(&dense)),
+                places_mmap: mmap(&[0]),
+                token_mmap: None,
+                grid_mmap: None,
+                bigram_mmap: None,
+                reverse_tree: rstar::RTree::new(),
+                version: "transit-fixture".into(),
+            }),
+            out_dir: PathBuf::new(),
+        };
+        let search = |prefer, size| {
+            super::super::search::search_place_ids(
+                &memdb,
+                "Cambridge",
+                None,
+                50.0,
+                None,
+                size,
+                super::super::transit::TransitOptions {
+                    prefer_train_stations: prefer,
+                    ..Default::default()
+                },
+            )
+        };
+        assert_eq!(search(false, 1)[0].0, 4); // populated city without preference
+        assert_eq!(search(true, 1)[0].0, 0); // rail survives the final top-1 cutoff
+        let preferred = search(true, 5);
+        let mode_order: Vec<_> = preferred.iter().filter(|x| x.0 < 4).map(|x| x.0).collect();
+        assert_eq!(mode_order, [0, 1, 2, 3]);
+        assert_eq!(search(false, 1)[0].0, 4); // warmed query cache has no option leakage
     }
 }

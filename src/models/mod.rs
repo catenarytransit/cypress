@@ -12,6 +12,7 @@ pub mod scoring;
 pub mod sift4;
 pub mod spatial_grid;
 pub mod token_index;
+pub mod transit;
 
 pub use admin::{AdminArea, AdminEntry, AdminHierarchy, AdminLevel};
 pub use place::{Address, GeoBbox, GeoPoint, Layer, OsmType, Place};

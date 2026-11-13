@@ -201,7 +201,9 @@ for region in "${REGIONS[@]}"; do
     if [ "$NO_FILTER" = false ]; then
         if command -v osmium &> /dev/null; then
             # General filter (places)
-            if [ ! -f "$FILTERED_PBF" ] || [ "$RAW_PBF" -nt "$FILTERED_PBF" ]; then
+            if [ ! -f "$FILTERED_PBF" ] || [ "$RAW_PBF" -nt "$FILTERED_PBF" ] \
+            || [ "${PROJECT_DIR}/config/filter_expressions.txt" -nt "$FILTERED_PBF" ] \
+            || [ "${SCRIPT_DIR}/filter_osm.sh" -nt "$FILTERED_PBF" ]; then
                 echo "Filtering places in $NAME..."
                 "$SCRIPT_DIR/filter_osm.sh" "$RAW_PBF" "$FILTERED_PBF"
             else

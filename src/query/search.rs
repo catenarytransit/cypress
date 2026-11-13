@@ -22,6 +22,8 @@ use super::memdb::{
     AreaPhraseScoreCache, CosSimMatch, Memdb, QueryDbView, GUESS_CONTEXT, MAX_QUERY_PHRASES,
 };
 use super::token_retrieval;
+use super::transit::{self, TransitOptions};
+use cypress::models::transit::TransitKind;
 
 #[derive(Clone)]
 pub struct SearchParams {
@@ -33,6 +35,7 @@ pub struct SearchParams {
     pub focus_weight: Option<f64>,
     pub layers: Option<Vec<String>>,
     pub size: usize,
+    pub transit: TransitOptions,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -590,7 +593,7 @@ fn find_exact_house_range(
     Some((first, lo))
 }
 
-fn place_prior_bonus(db: &QueryDbView<'_>, place_idx: usize) -> f32 {
+fn place_prior_bonus(db: &QueryDbView<'_>, place_idx: usize, options: TransitOptions) -> f32 {
     let layer_rank = db.place_layer_ranks[place_idx];
     let population = db.place_populations[place_idx] as f32;
     let layer_bonus = cypress::models::scoring::get_layer_score_bonus(layer_rank);
@@ -599,7 +602,11 @@ fn place_prior_bonus(db: &QueryDbView<'_>, place_idx: usize) -> f32 {
     } else {
         (population / 200_000.0).clamp(0.0, 3.0)
     };
-    layer_bonus + importance_bonus + 5.0
+    layer_bonus
+        + importance_bonus
+        + 5.0
+        + TransitKind::from_byte(db.place_transit_kinds.get(place_idx).copied().unwrap_or(0))
+            .bonus(options.prefer_train_stations)
 }
 
 /// One exact subset-DP step for a semantic component.
@@ -1136,6 +1143,7 @@ pub fn search_place_ids(
     focus_weight: f64,
     bbox: Option<[f64; 4]>,
     max_results: usize,
+    options: TransitOptions,
 ) -> Vec<(u32, f64)> {
     let total_started = Instant::now();
 
@@ -1835,7 +1843,7 @@ pub fn search_place_ids(
                     &db.string_to_places_data[begin..finish],
                     db.place_importances,
                     place_count,
-                    |p| place_prior_bonus(db, p),
+                    |p| place_prior_bonus(db, p, options),
                 );
                 super::candidate_budget::Quality {
                     full_exact: name == query_bytes,
@@ -2003,19 +2011,6 @@ pub fn search_place_ids(
                     });
                 }
 
-                let layer_rank = db.place_layer_ranks[place_idx];
-                let population = db.place_populations[place_idx] as f32;
-                let layer_bonus = cypress::models::scoring::get_layer_score_bonus(layer_rank);
-
-                let is_extra = layer_rank == 0;
-                let importance_bonus = if is_extra {
-                    (population / 2_000.0).clamp(1.2, 5.0)
-                } else {
-                    (population / 200_000.0).clamp(0.0, 3.0)
-                };
-
-                let place_bonus = 5.0_f32;
-
                 let mut total_score = match_score;
 
                 // Area matching for unmatched tokens
@@ -2061,9 +2056,7 @@ pub fn search_place_ids(
                     }
                 }
 
-                total_score -= layer_bonus;
-                total_score -= importance_bonus;
-                total_score -= place_bonus;
+                total_score -= place_prior_bonus(db, place_idx, options);
 
                 let neg_score = -total_score;
                 ctx.place_scores.push((place_id, neg_score));
@@ -2270,7 +2263,7 @@ pub fn search_place_ids(
                         }
                     }
 
-                    let score = -structural_cost + place_prior_bonus(db, place_idx);
+                    let score = -structural_cost + place_prior_bonus(db, place_idx, options);
                     ctx.place_scores.push((place_id, score));
                     address_candidates_seeded += 1;
                 }
@@ -2288,10 +2281,8 @@ pub fn search_place_ids(
         );
 
         let phase_started = Instant::now();
-        ctx.place_scores.sort_unstable_by(|a, b| {
-            a.0.cmp(&b.0)
-                .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
-        });
+        ctx.place_scores
+            .sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.total_cmp(&a.1)));
         ctx.place_scores.dedup_by(|a, b| a.0 == b.0);
         let unique_base_places = ctx.place_scores.len();
 
@@ -2302,7 +2293,7 @@ pub fn search_place_ids(
             .collect();
         if results.len() > MAX_SCORED_MATCHES {
             results.select_nth_unstable_by(MAX_SCORED_MATCHES, |a, b| {
-                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0))
             });
             results.truncate(MAX_SCORED_MATCHES);
         }
@@ -2380,7 +2371,7 @@ pub fn search_place_ids(
                 work.dp_fallbacks += 1;
             }
             let mut score = exact_cost
-                .map(|cost| (-cost + place_prior_bonus(db, place_idx)) as f64)
+                .map(|cost| (-cost + place_prior_bonus(db, place_idx, options)) as f64)
                 .unwrap_or(base_score);
 
             let lat = db.place_latitudes[place_idx] as f64;
@@ -2452,12 +2443,12 @@ pub fn search_place_ids(
         };
         if results.len() > final_limit {
             results.select_nth_unstable_by(final_limit, |a, b| {
-                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0))
             });
             results.truncate(final_limit);
         }
 
-        results.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
         results.truncate(max_results);
         // Determine whether the shadow shortlist retained at least one
@@ -2523,6 +2514,7 @@ fn bigram_search(
     focus_weight: f64,
     bbox: Option<[f64; 4]>,
     max_results: usize,
+    options: TransitOptions,
 ) -> Vec<(String, f64)> {
     let total_started = Instant::now();
     debug!(
@@ -2536,7 +2528,8 @@ fn bigram_search(
     );
 
     let phase_started = Instant::now();
-    let scored_places = search_place_ids(memdb, text, focus, focus_weight, bbox, max_results);
+    let scored_places =
+        search_place_ids(memdb, text, focus, focus_weight, bbox, max_results, options);
     log_phase_timing("bigram_search", "search_place_ids", phase_started);
 
     let memdb_data = memdb.get_data();
@@ -2635,9 +2628,20 @@ pub async fn execute_search(
     let memdb_for_search = Arc::clone(memdb);
     let text = params.text.clone();
     let bbox = params.bbox;
-    let size = params.size;
+    let options = params.transit;
+    let size = transit::candidate_limit(params.size, options, params.layers.is_some());
     let scored_ids = cpu
-        .run(move || bigram_search(&memdb_for_search, &text, focus, focus_weight, bbox, size))
+        .run(move || {
+            bigram_search(
+                &memdb_for_search,
+                &text,
+                focus,
+                focus_weight,
+                bbox,
+                size,
+                options,
+            )
+        })
         .await?;
     log_phase_timing("execute_search", "bigram_search", phase_started);
     debug!(
@@ -2670,13 +2674,22 @@ pub async fn execute_search(
     for (i, fetch_result) in fetched.into_iter().enumerate() {
         if let Ok(Some(json_data)) = fetch_result {
             if let Ok(place) = serde_json::from_str::<NormalizedPlace>(&json_data) {
-                collect_admin_ids(&place, &mut admin_ids);
                 places_with_scores.push((place, scored_ids[i].1));
             }
         }
     }
     log_phase_timing("execute_search", "decode_places", phase_started);
 
+    let places_with_scores = transit::finalize(
+        places_with_scores,
+        &params.text,
+        params.size,
+        params.transit,
+        params.layers.as_deref(),
+    );
+    for (place, _) in &places_with_scores {
+        collect_admin_ids(place, &mut admin_ids);
+    }
     let admin_ids_vec: Vec<String> = admin_ids.into_iter().collect();
 
     let phase_started = Instant::now();
@@ -2737,9 +2750,20 @@ pub async fn execute_search_v2(
     let memdb_for_search = Arc::clone(memdb);
     let text = params.text.clone();
     let bbox = params.bbox;
-    let size = params.size;
+    let options = params.transit;
+    let size = transit::candidate_limit(params.size, options, params.layers.is_some());
     let scored_ids = cpu
-        .run(move || bigram_search(&memdb_for_search, &text, focus, focus_weight, bbox, size))
+        .run(move || {
+            bigram_search(
+                &memdb_for_search,
+                &text,
+                focus,
+                focus_weight,
+                bbox,
+                size,
+                options,
+            )
+        })
         .await?;
     log_phase_timing("execute_search_v2", "bigram_search", phase_started);
     debug!(
@@ -2767,13 +2791,22 @@ pub async fn execute_search_v2(
     for (i, fetch_result) in fetched.into_iter().enumerate() {
         if let Ok(Some(json_data)) = fetch_result {
             if let Ok(place) = serde_json::from_str::<NormalizedPlace>(&json_data) {
-                collect_admin_ids(&place, &mut admin_ids);
                 places_with_scores.push((place, scored_ids[i].1));
             }
         }
     }
     log_phase_timing("execute_search_v2", "decode_places", phase_started);
 
+    let places_with_scores = transit::finalize(
+        places_with_scores,
+        &params.text,
+        params.size,
+        params.transit,
+        params.layers.as_deref(),
+    );
+    for (place, _) in &places_with_scores {
+        collect_admin_ids(place, &mut admin_ids);
+    }
     let admin_ids_vec: Vec<String> = admin_ids.into_iter().collect();
 
     let phase_started = Instant::now();

@@ -41,6 +41,7 @@ mod roaring_retrieval;
 mod reverse;
 mod search;
 mod token_retrieval;
+mod transit;
 use cpu::{SearchCpu, SearchCpuError};
 use memdb::Memdb;
 use search::{SearchParams, SearchResult, SearchResultV2};
@@ -198,6 +199,48 @@ async fn autocomplete_handler(
     let start = std::time::Instant::now();
     let text = params.text.trim().to_lowercase();
 
+    if text.len() >= 2 && (params.suppress_cities_near_stations || params.layers.is_some()) {
+        let results = search::execute_search_v2(
+            &state.scylla_client,
+            &state.memdb,
+            &state.cpu,
+            SearchParams {
+                text: params.text.clone(),
+                lang: params.lang.clone(),
+                bbox: parse_bbox(&params.bbox),
+                focus_lat: params.focus_point_lat,
+                focus_lon: params.focus_point_lon,
+                focus_weight: params.focus_point_weight,
+                layers: params
+                    .layers
+                    .as_ref()
+                    .map(|l| l.split(',').map(String::from).collect()),
+                size: params.size.unwrap_or(10).min(20),
+                transit: transit::TransitOptions {
+                    prefer_train_stations: params.prefer_train_stations,
+                    suppress_cities_near_stations: params.suppress_cities_near_stations,
+                },
+            },
+        )
+        .await
+        .map_err(map_search_error)?;
+        return Ok(Json(AutocompleteResponse {
+            features: results
+                .results
+                .into_iter()
+                .map(|r| AutocompleteFeature {
+                    result_type: r.result_type,
+                    geometry: r.geometry,
+                    properties: AutocompleteProperties {
+                        id: r.properties.id,
+                        name: r.properties.name,
+                    },
+                })
+                .collect(),
+            memdb_took_ms: start.elapsed().as_millis(),
+        }));
+    }
+
     let features = if text.len() >= 2 {
         let memdb = Arc::clone(&state.memdb);
         let size = params.size.unwrap_or(10).min(20);
@@ -207,13 +250,25 @@ async fn autocomplete_handler(
             } else {
                 None
             };
+        let bbox = parse_bbox(&params.bbox);
         let weight = params.focus_point_weight.unwrap_or(50.0);
+        let options = transit::TransitOptions {
+            prefer_train_stations: params.prefer_train_stations,
+            suppress_cities_near_stations: params.suppress_cities_near_stations,
+        };
 
         state
             .cpu
             .run(move || {
-                let scored_places =
-                    search::search_place_ids(&memdb, &text, focus_point, weight, None, size);
+                let scored_places = search::search_place_ids(
+                    &memdb,
+                    &text,
+                    focus_point,
+                    weight,
+                    bbox,
+                    size,
+                    options,
+                );
                 let memdb_data = memdb.get_data();
                 scored_places
                     .into_iter()
@@ -267,6 +322,10 @@ async fn search_handler(
             .as_ref()
             .map(|l| l.split(',').map(String::from).collect()),
         size: params.size.unwrap_or(10).min(40),
+        transit: transit::TransitOptions {
+            prefer_train_stations: params.prefer_train_stations,
+            suppress_cities_near_stations: params.suppress_cities_near_stations,
+        },
     };
 
     let results = search::execute_search(
@@ -305,6 +364,10 @@ async fn search_v2_handler(
             .as_ref()
             .map(|l| l.split(',').map(String::from).collect()),
         size: params.size.unwrap_or(10).min(40),
+        transit: transit::TransitOptions {
+            prefer_train_stations: params.prefer_train_stations,
+            suppress_cities_near_stations: params.suppress_cities_near_stations,
+        },
     };
 
     let results = search::execute_search_v2(
@@ -459,6 +522,10 @@ struct SearchQueryParams {
     layers: Option<String>,
     /// Number of results
     size: Option<usize>,
+    #[serde(default)]
+    prefer_train_stations: bool,
+    #[serde(default)]
+    suppress_cities_near_stations: bool,
 }
 
 #[derive(Deserialize)]
@@ -546,6 +613,26 @@ mod reverse_parameter_tests {
             let uri = format!("/v1/reverse?{query}").parse().unwrap();
             let Query(params) = Query::<ReverseQueryParams>::try_from_uri(&uri).unwrap();
             assert_eq!(params.validate().unwrap_err().0, StatusCode::BAD_REQUEST);
+        }
+    }
+}
+
+#[cfg(test)]
+mod transit_parameter_tests {
+    use super::*;
+    #[test]
+    fn transit_flags_default_off_and_parse_on_all_search_endpoints() {
+        for path in ["/v1/search", "/v2/search", "/v1/autocomplete"] {
+            let uri = format!("{path}?text=Cambridge").parse().unwrap();
+            let Query(p) = Query::<SearchQueryParams>::try_from_uri(&uri).unwrap();
+            assert!(!p.prefer_train_stations && !p.suppress_cities_near_stations);
+            let uri = format!("{path}?text=Cambridge&prefer_train_stations=true&suppress_cities_near_stations=true").parse().unwrap();
+            let Query(p) = Query::<SearchQueryParams>::try_from_uri(&uri).unwrap();
+            assert!(p.prefer_train_stations && p.suppress_cities_near_stations);
+            let uri = format!("{path}?text=Cambridge&prefer_train_stations=invalid")
+                .parse()
+                .unwrap();
+            assert!(Query::<SearchQueryParams>::try_from_uri(&uri).is_err());
         }
     }
 }
