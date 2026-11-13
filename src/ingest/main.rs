@@ -276,8 +276,14 @@ pub async fn migrate_places_v2(uri: &str) -> Result<()> {
             info!(source_file = %source, "Started places V2 source generation");
             runs.insert(source.clone(), (run, 0));
         }
-        let (run, count) = runs.get_mut(&source).expect("run inserted");
-        let write_run = run.clone();
+        let (write_run, source_count) = {
+            let (run, count) = runs.get_mut(&source).expect("run inserted");
+            *count += 1;
+            if *count % 1_000 == 0 {
+                db.heartbeat_place_import(run).await?;
+            }
+            (run.clone(), *count)
+        };
         let db_ref = &db;
         pending.push(async move {
             db_ref.upsert_place_v2(
@@ -288,7 +294,6 @@ pub async fn migrate_places_v2(uri: &str) -> Result<()> {
             ).await
         });
         progress.queued += 1;
-        *count += 1;
 
         while pending.len() >= WRITE_CONCURRENCY {
             tokio::select! {
@@ -302,13 +307,10 @@ pub async fn migrate_places_v2(uri: &str) -> Result<()> {
             }
         }
 
-        if *count % 1_000 == 0 {
-            db.heartbeat_place_import(run).await?;
-        }
-        if *count % 100_000 == 0 {
+        if source_count % 100_000 == 0 {
             info!(
                 source_file = %source,
-                queued_for_source = *count,
+                queued_for_source = source_count,
                 "Places V2 source progress"
             );
         }
