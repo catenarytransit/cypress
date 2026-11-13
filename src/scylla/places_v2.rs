@@ -265,7 +265,7 @@ impl ScyllaClient {
                 continue;
             }
             stream::iter(0..V2_BUCKETS)
-                .map(|bucket| async {
+                .map(|bucket| async move {
                     self.session.query_unpaged(
                         "DELETE FROM cypress.places_v2
                          WHERE source_file = ? AND generation = ? AND bucket = ?",
