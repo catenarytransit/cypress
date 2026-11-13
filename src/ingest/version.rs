@@ -49,6 +49,11 @@ impl VersionManager {
         Ok(())
     }
 
+    pub async fn has_active_place_source(&self, source: &str) -> Result<bool> {
+        Ok(self.scylla_client.active_place_sources().await?
+            .iter().any(|entry| entry.source_file == source))
+    }
+
     pub async fn is_latest(&self, region_name: &str, filename: &str, hash: &str) -> Result<bool> {
         let session = &self.scylla_client.session;
         let query = "SELECT COUNT(*) FROM cypress.cypress_versions \
