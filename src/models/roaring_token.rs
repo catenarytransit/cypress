@@ -71,6 +71,20 @@ impl RoaringPosting<'_> {
     /// O(log #containers + log 4096) for sparse entries; O(log #containers)
     /// plus one bitmap bit-test for dense ones. No allocation or varint decoding.
     pub fn contains(&self, id: u32) -> bool {
+        if self.container_count() == 0 {
+            let count = self.document_frequency as usize;
+            let mut left = 0usize;
+            let mut right = count;
+            while left < right {
+                let mid = left + (right-left)/2;
+                let pos = 4 + mid*4;
+                let value = u32::from_le_bytes(self.bytes[pos..pos+4].try_into().unwrap());
+                if value < id { left=mid+1 } else { right=mid }
+            }
+            if left == count { return false }
+            let pos = 4 + left*4;
+            return u32::from_le_bytes(self.bytes[pos..pos+4].try_into().unwrap()) == id;
+        }
         let high = (id >> 16) as u16;
         let low = id as u16;
         let mut left = 0;
@@ -120,6 +134,21 @@ impl RoaringPosting<'_> {
     /// Reuses the caller's allocation; never decodes the probe list.
     pub fn retain_sorted(&self, ids: &mut Vec<u32>) -> u64 {
         debug_assert!(ids.windows(2).all(|w| w[0] < w[1]));
+        if self.container_count() == 0 {
+            let mut cursor = 0usize;
+            let n = self.document_frequency as usize;
+            let before = ids.len();
+            ids.retain(|&id| {
+                while cursor < n {
+                    let at = 4 + cursor * 4;
+                    let value = u32::from_le_bytes(self.bytes[at..at+4].try_into().unwrap());
+                    if value >= id { return value == id }
+                    cursor += 1;
+                }
+                false
+            });
+            return before as u64;
+        }
         let mut cursor = 0;
         let mut probes = 0;
         ids.retain(|&id| {
@@ -137,6 +166,12 @@ impl RoaringPosting<'_> {
     /// Decode only the selected rarest anchor list, never the high-DF probes.
     pub fn anchor_ids(&self) -> Vec<u32> {
         let mut out = Vec::with_capacity(self.document_frequency as usize);
+        if self.container_count() == 0 {
+            for pair in self.bytes[4..].chunks_exact(4) {
+                out.push(u32::from_le_bytes(pair.try_into().unwrap()));
+            }
+            return out;
+        }
         for n in 0..self.container_count() {
             let c = self.container(n);
             let high = (c.high as u32) << 16;
@@ -172,6 +207,17 @@ impl RoaringPosting<'_> {
         let header_end = 4usize.checked_add(n.checked_mul(CONTAINER_BYTES).ok_or_else(|| anyhow!("container count overflow"))?)
             .ok_or_else(|| anyhow!("container headers overflow"))?;
         ensure!(header_end <= self.bytes.len(), "truncated container headers");
+        if n == 0 {
+            ensure!(self.bytes.len() == 4 + self.document_frequency as usize * 4,
+                "flat postings length mismatch");
+            let mut previous = None;
+            for pair in self.bytes[4..].chunks_exact(4) {
+                let value = u32::from_le_bytes(pair.try_into()?);
+                if let Some(p) = previous { ensure!(value > p, "unordered flat postings"); }
+                previous = Some(value);
+            }
+            return Ok(());
+        }
         let mut count = 0u64;
         let mut last_high: Option<u16> = None;
         for i in 0..n {
@@ -282,9 +328,13 @@ impl<'a> RoaringTokenIndexView<'a> {
         let end = offset.checked_add(size).ok_or_else(|| anyhow!("posting overflow"))?;
         let data = self.postings.get(offset..end).ok_or_else(|| anyhow!("posting bounds invalid"))?;
         ensure!(data.len() >= 4, "posting headers truncated");
-        // Cheap check for query safety; full verification happens at mmap load.
+        // A zero-container posting is stored as a flat sorted u32 list.
         let n = le32(data, 0)? as usize;
-        ensure!(4usize.checked_add(n.saturating_mul(CONTAINER_BYTES)).map_or(false, |e| e<=data.len()), "invalid container header length");
+        if n == 0 {
+            ensure!(size as usize == 4 + (df as usize) * 4, "bad flat posting size");
+        } else {
+            ensure!(4usize.checked_add(n.saturating_mul(CONTAINER_BYTES)).map_or(false, |e| e<=data.len()), "invalid container header length");
+        }
         Ok(RoaringPosting { bytes: data, document_frequency: df })
     }
     pub fn lookup(&self, token: &str) -> Result<Option<RoaringPosting<'a>>> {
