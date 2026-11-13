@@ -1,3 +1,4 @@
+pub mod places_v2;
 use anyhow::{Context, Result};
 use futures::{stream, StreamExt, TryStreamExt};
 use scylla::client::session::Session;
@@ -100,6 +101,7 @@ impl ScyllaClient {
             .query_unpaged("ALTER TABLE cypress.admin_areas ADD population int", &[])
             .await;
 
+        self.init_places_v2_schema().await?;
         Ok(())
     }
 
