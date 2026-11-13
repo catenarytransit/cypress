@@ -182,3 +182,53 @@
 {"id":"fr_autocomplete_strasbourg","text":"Strasbo","mode":"autocomplete","category":"city","language":"fr","lat":48.5734,"lon":7.7521,"radius_m":7000,"country":"FR"}
 {"id":"fr_autocomplete_eiffel","text":"Tour Eif","mode":"autocomplete","category":"landmark","language":"fr","lat":48.8584,"lon":2.2945,"radius_m":2500,"country":"FR"}
 {"id":"fr_autocomplete_annecy","text":"Annec","mode":"autocomplete","category":"city","language":"fr","lat":45.8992,"lon":6.1294,"radius_m":7000,"country":"FR"}
+{"id":"gb_london","text":"London","mode":"place","category":"city","language":"en","lat":51.5074,"lon":-0.1278,"radius_m":8500,"country":"GB"}
+{"id":"gb_manchester","text":"Manchester","mode":"place","category":"city","language":"en","lat":53.4808,"lon":-2.2426,"radius_m":8500,"country":"GB"}
+{"id":"gb_birmingham","text":"Birmingham","mode":"place","category":"city","language":"en","lat":52.4862,"lon":-1.8904,"radius_m":8000,"country":"GB"}
+{"id":"gb_edinburgh","text":"Edinburgh","mode":"place","category":"city","language":"en","lat":55.9533,"lon":-3.1883,"radius_m":8000,"country":"GB"}
+{"id":"gb_glasgow","text":"Glasgow","mode":"place","category":"city","language":"en","lat":55.8642,"lon":-4.2518,"radius_m":8000,"country":"GB"}
+{"id":"gb_cardiff","text":"Cardiff","mode":"place","category":"city","language":"en","lat":51.4816,"lon":-3.1791,"radius_m":7500,"country":"GB"}
+{"id":"gb_bristol","text":"Bristol","mode":"place","category":"city","language":"en","lat":51.4545,"lon":-2.5879,"radius_m":7500,"country":"GB"}
+{"id":"gb_liverpool","text":"Liverpool","mode":"place","category":"city","language":"en","lat":53.4084,"lon":-2.9916,"radius_m":7500,"country":"GB"}
+{"id":"gb_leeds","text":"Leeds","mode":"place","category":"city","language":"en","lat":53.8008,"lon":-1.5491,"radius_m":7500,"country":"GB"}
+{"id":"gb_oxford","text":"Oxford","mode":"place","category":"city","language":"en","lat":51.752,"lon":-1.2577,"radius_m":7000,"country":"GB"}
+{"id":"gb_cambridge","text":"Cambridge","mode":"place","category":"city","language":"en","lat":52.1951,"lon":0.1313,"radius_m":7000,"country":"GB"}
+{"id":"gb_york","text":"York","mode":"place","category":"city","language":"en","lat":53.959,"lon":-1.0815,"radius_m":7000,"country":"GB"}
+{"id":"gb_belfast","text":"Belfast","mode":"place","category":"city","language":"en","lat":54.5973,"lon":-5.93,"radius_m":8000,"country":"GB"}
+{"id":"gb_kings_cross","text":"King's Cross","mode":"place","category":"station","language":"en","lat":51.5308,"lon":-0.1238,"radius_m":2200,"country":"GB"}
+{"id":"gb_waterloo","text":"London Waterloo","mode":"place","category":"station","language":"en","lat":51.5031,"lon":-0.1132,"radius_m":2500,"country":"GB"}
+{"id":"gb_euston","text":"London Euston","mode":"place","category":"station","language":"en","lat":51.5282,"lon":-0.1337,"radius_m":2200,"country":"GB"}
+{"id":"gb_paddington","text":"Paddington Station","mode":"place","category":"station","language":"en","lat":51.5154,"lon":-0.1755,"radius_m":2200,"country":"GB"}
+{"id":"gb_big_ben","text":"Big Ben","mode":"place","category":"landmark","language":"en","lat":51.5007,"lon":-0.1246,"radius_m":2500,"country":"GB"}
+{"id":"gb_buckingham","text":"Buckingham Palace","mode":"place","category":"landmark","language":"en","lat":51.5014,"lon":-0.1419,"radius_m":2500,"country":"GB"}
+{"id":"gb_tower_bridge","text":"Tower Bridge","mode":"place","category":"landmark","language":"en","lat":51.5055,"lon":-0.0754,"radius_m":2500,"country":"GB"}
+{"id":"gb_autocomplete_lon","text":"Lond","mode":"autocomplete","category":"city","language":"en","lat":51.5074,"lon":-0.1278,"radius_m":8500,"country":"GB"}
+{"id":"gb_autocomplete_ed","text":"Edinb","mode":"autocomplete","category":"city","language":"en","lat":55.9533,"lon":-3.1883,"radius_m":8500,"country":"GB"}
+{"id":"gb_address","text":"10 Downing Street London","mode":"address","category":"address","language":"en","lat":51.5034,"lon":-0.1276,"radius_m":3500,"country":"GB"}
+{"id":"gb_welsh","text":"Caerdydd","mode":"place","category":"city","language":"cy","lat":51.4816,"lon":-3.1791,"radius_m":8000,"country":"GB"}
+{"id":"it_roma","text":"Roma","mode":"place","category":"city","language":"it","lat":41.9028,"lon":12.4964,"radius_m":8500,"country":"IT"}
+{"id":"it_rome","text":"Rome","mode":"place","category":"city","language":"en","lat":41.9028,"lon":12.4964,"radius_m":8500,"country":"IT"}
+{"id":"it_milano","text":"Milano","mode":"place","category":"city","language":"it","lat":45.4642,"lon":9.19,"radius_m":8000,"country":"IT"}
+{"id":"it_milan","text":"Milan","mode":"place","category":"city","language":"en","lat":45.4642,"lon":9.19,"radius_m":8000,"country":"IT"}
+{"id":"it_napoli","text":"Napoli","mode":"place","category":"city","language":"it","lat":40.8518,"lon":14.2681,"radius_m":8000,"country":"IT"}
+{"id":"it_firenze","text":"Firenze","mode":"place","category":"city","language":"it","lat":43.7696,"lon":11.2558,"radius_m":7500,"country":"IT"}
+{"id":"it_florence","text":"Florence","mode":"place","category":"city","language":"en","lat":43.7696,"lon":11.2558,"radius_m":7500,"country":"IT"}
+{"id":"it_venezia","text":"Venezia","mode":"place","category":"city","language":"it","lat":45.4408,"lon":12.3155,"radius_m":8500,"country":"IT"}
+{"id":"it_venice","text":"Venice","mode":"place","category":"city","language":"en","lat":45.4408,"lon":12.3155,"radius_m":8500,"country":"IT"}
+{"id":"it_torino","text":"Torino","mode":"place","category":"city","language":"it","lat":45.0703,"lon":7.6869,"radius_m":7500,"country":"IT"}
+{"id":"it_bologna","text":"Bologna","mode":"place","category":"city","language":"it","lat":44.4949,"lon":11.3426,"radius_m":7500,"country":"IT"}
+{"id":"it_genova","text":"Genova","mode":"place","category":"city","language":"it","lat":44.4056,"lon":8.9463,"radius_m":7500,"country":"IT"}
+{"id":"it_palermo","text":"Palermo","mode":"place","category":"city","language":"it","lat":38.1157,"lon":13.3615,"radius_m":7500,"country":"IT"}
+{"id":"it_pisa","text":"Pisa","mode":"place","category":"city","language":"it","lat":43.7228,"lon":10.4017,"radius_m":6500,"country":"IT"}
+{"id":"it_verona","text":"Verona","mode":"place","category":"city","language":"it","lat":45.4384,"lon":10.9916,"radius_m":7000,"country":"IT"}
+{"id":"it_trento","text":"Trento","mode":"place","category":"city","language":"it","lat":46.0664,"lon":11.1258,"radius_m":7000,"country":"IT"}
+{"id":"it_roma_termini","text":"Roma Termini","mode":"place","category":"station","language":"it","lat":41.901,"lon":12.501,"radius_m":2200,"country":"IT"}
+{"id":"it_milano_centrale","text":"Milano Centrale","mode":"place","category":"station","language":"it","lat":45.4854,"lon":9.2044,"radius_m":2300,"country":"IT"}
+{"id":"it_napoli_centrale","text":"Napoli Centrale","mode":"place","category":"station","language":"it","lat":40.8524,"lon":14.2723,"radius_m":2300,"country":"IT"}
+{"id":"it_firenze_sm","text":"Firenze Santa Maria Novella","mode":"place","category":"station","language":"it","lat":43.7768,"lon":11.2472,"radius_m":2200,"country":"IT"}
+{"id":"it_colosseo","text":"Colosseo","mode":"place","category":"landmark","language":"it","lat":41.8902,"lon":12.4922,"radius_m":2100,"country":"IT"}
+{"id":"it_duomo_milano","text":"Duomo di Milano","mode":"place","category":"landmark","language":"it","lat":45.4641,"lon":9.1919,"radius_m":1800,"country":"IT"}
+{"id":"it_pisa_tower","text":"Torre di Pisa","mode":"place","category":"landmark","language":"it","lat":43.723,"lon":10.3966,"radius_m":2200,"country":"IT"}
+{"id":"it_autocomplete_mil","text":"Milan","mode":"autocomplete","category":"city","language":"it","lat":45.4642,"lon":9.19,"radius_m":8000,"country":"IT"}
+{"id":"it_autocomplete_rom","text":"Rom","mode":"autocomplete","category":"city","language":"it","lat":41.9028,"lon":12.4964,"radius_m":8500,"country":"IT"}
+{"id":"it_address","text":"Via del Corso 1 Roma","mode":"address","category":"address","language":"it","lat":41.9065,"lon":12.4794,"radius_m":3500,"country":"IT"}
