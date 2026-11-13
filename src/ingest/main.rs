@@ -173,7 +173,7 @@ async fn main() -> Result<()> {
 /// for sources already published to V2 and is required before the first V2-only
 /// compilation of a preexisting database.
 pub async fn migrate_places_v2(uri: &str) -> Result<()> {
-    use futures::StreamExt;
+    use futures::{stream::FuturesUnordered, StreamExt};
     use std::collections::HashMap;
     let db = ScyllaClient::new(uri).await?;
     let active = db.active_place_sources().await?;
@@ -183,6 +183,7 @@ pub async fn migrate_places_v2(uri: &str) -> Result<()> {
     let mut rows = db.session.query_iter(
         "SELECT id, data, population, source_file FROM cypress.places", &[],
     ).await?.rows_stream::<(String, String, Option<i32>, Option<String>)>()?;
+    let mut pending = FuturesUnordered::new();
     while let Some(row) = rows.next().await {
         let (id, data, population, source_file) = row?;
         let source = source_file.unwrap_or_else(|| "legacy-unattributed".to_owned());
@@ -192,10 +193,19 @@ pub async fn migrate_places_v2(uri: &str) -> Result<()> {
             runs.insert(source.clone(), (run, 0));
         }
         let (run, count) = runs.get_mut(&source).expect("run inserted");
-        db.upsert_place_v2(run, &id, &data, population.and_then(|p| u32::try_from(p).ok())).await?;
+        let write_run = run.clone();
+        let db_ref = &db;
+        pending.push(async move {
+            db_ref.upsert_place_v2(&write_run, &id, &data,
+                population.and_then(|p| u32::try_from(p).ok())).await
+        });
+        if pending.len() >= 64 {
+            pending.next().await.context("Migration worker terminated")??;
+        }
         *count += 1;
         if *count % 1_000 == 0 { db.heartbeat_place_import(run).await?; }
     }
+    while let Some(write) = pending.next().await { write?; }
     for (_, (run, count)) in runs {
         db.publish_place_import(&run, count as u64).await?;
     }
