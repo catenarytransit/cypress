@@ -448,6 +448,10 @@ pub async fn run_single(args: Args, _synonyms: Arc<SynonymService>) -> Result<()
             }
         };
 
+        if cypress::models::transit::excluded(|key| obj.tags().get(key).map(|s| s.as_str())) {
+            continue;
+        }
+
         // If merging enabled and this is a road way, collect it
         if let Some(ref mut merger) = way_merger {
             if let osmpbfreader::OsmObj::Way(ref way) = obj {
@@ -679,6 +683,11 @@ async fn process_buffer(
 
 /// Check if an OSM way is a road that should be considered for merging
 fn is_road_way(tags: &osmpbfreader::Tags) -> bool {
+    if cypress::models::transit::TransitKind::from_tags(tags)
+        != cypress::models::transit::TransitKind::None
+    {
+        return false;
+    }
     if let Some(highway) = tags.get("highway") {
         // Only roads with names can be merged
         if !tags.contains_key("name") {
@@ -937,6 +946,19 @@ fn extract_tags(place: &mut Place, tags: &osmpbfreader::Tags) {
             "public_transport",
             "aeroway",
             "station",
+            "highway",
+            "train",
+            "subway",
+            "light_rail",
+            "tram",
+            "bus",
+            "ferry",
+            "monorail",
+            "operator",
+            "disused",
+            "abandoned",
+            "proposed",
+            "construction",
         ]
         .contains(&key_str)
         {
@@ -957,6 +979,14 @@ fn is_valid_lang_code(lang: &str) -> bool {
 }
 
 fn determine_layer(tags: &osmpbfreader::Tags) -> Option<Layer> {
+    if cypress::models::transit::excluded(|key| tags.get(key).map(|s| s.as_str())) {
+        return None;
+    }
+    if cypress::models::transit::TransitKind::from_tags(tags)
+        != cypress::models::transit::TransitKind::None
+    {
+        return Some(Layer::Venue);
+    }
     if let Some(place) = tags.get("place") {
         match place.as_str() {
             "country" => Some(Layer::Country),
@@ -997,7 +1027,8 @@ fn determine_layer(tags: &osmpbfreader::Tags) -> Option<Layer> {
         // address. The structured address index is independent of Layer, so a
         // restaurant/hotel/shop can be found both by name and by address while
         // still behaving as a Venue for existing POI clients.
-        let is_venue = tags.contains_key("amenity")
+        let is_venue = tags.contains("public_transport", "station")
+            || tags.contains_key("amenity")
             || tags.contains_key("shop")
             || tags.contains_key("tourism")
             || tags.contains_key("leisure");
@@ -1079,6 +1110,63 @@ async fn upsert_admin_areas(place: &Place, scylla: &ScyllaClient) -> Result<()> 
 #[cfg(test)]
 mod address_tests {
     use super::*;
+
+    #[test]
+    fn imports_station_modes_and_preserves_them_through_normalization() {
+        use cypress::models::transit::TransitKind;
+        for (extra, kind) in [
+            (vec![("railway", "station")], TransitKind::Rail),
+            (
+                vec![("railway", "station"), ("station", "subway")],
+                TransitKind::Metro,
+            ),
+            (
+                vec![("railway", "station"), ("light_rail", "yes")],
+                TransitKind::Metro,
+            ),
+            (vec![("railway", "tram_stop")], TransitKind::Tram),
+            (vec![("highway", "bus_stop")], TransitKind::Bus),
+        ] {
+            let mut tags = osmpbfreader::Tags::new();
+            tags.insert("name".into(), "Example".into());
+            for (k, v) in extra {
+                tags.insert(k.into(), v.into());
+            }
+            assert_eq!(determine_layer(&tags), Some(Layer::Venue));
+            assert!(!is_road_way(&tags));
+            let mut place = Place::new(
+                OsmType::Node,
+                1,
+                Layer::Venue,
+                GeoPoint { lat: 0.0, lon: 0.0 },
+                "test",
+            );
+            extract_tags(&mut place, &tags);
+            let stored = NormalizedPlace::from_place(place);
+            let decoded: NormalizedPlace =
+                serde_json::from_str(&serde_json::to_string(&stored).unwrap()).unwrap();
+            assert_eq!(TransitKind::from_categories(&decoded.categories), kind);
+        }
+    }
+
+    #[test]
+    fn platforms_and_stop_positions_are_excluded_even_with_addresses() {
+        for (key, value) in [
+            ("railway", "platform"),
+            ("public_transport", "platform"),
+            ("public_transport", "stop_position"),
+            ("highway", "platform"),
+        ] {
+            let mut tags = osmpbfreader::Tags::new();
+            tags.insert("name".into(), "Platform 1".into());
+            tags.insert("amenity".into(), "bus_station".into());
+            tags.insert("train".into(), "yes".into());
+            tags.insert("addr:housenumber".into(), "1".into());
+            tags.insert("addr:street".into(), "Station Road".into());
+            tags.insert(key.into(), value.into());
+            assert_eq!(determine_layer(&tags), None);
+        }
+    }
 
     #[test]
     fn addr_place_without_street_is_an_address() {

@@ -75,7 +75,7 @@ impl PlaceRecord {
 
 /// A fully flattened, zero-copy architecture utilizing parallel arrays
 /// and index-offset structures for O(1) traversal with 0 allocations.
-#[derive(Archive, Serialize, Deserialize)]
+#[derive(Archive, Serialize, Deserialize, Default)]
 pub struct CypressMemDb {
     // ==== Bigram Inverted Index ====
     pub string_bigram_counts: Vec<u8>,

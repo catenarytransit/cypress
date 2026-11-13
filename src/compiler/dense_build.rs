@@ -103,6 +103,7 @@ mod tests {
             le_u32(&[u32::MAX, 0]),
             le_u32(&[1, 2]),
             le_u32(&[0, 1, 1]),
+            vec![4u8, 3],
         ];
         for (name, data) in SECTION_NAMES.iter().zip(fields.iter()) {
             fs::write(dir.join(format!("{name}.bin")), data).unwrap();
@@ -111,12 +112,34 @@ mod tests {
         assemble(&dir, &path, 0x1234_5678).unwrap();
         let mut data = fs::read(&path).unwrap();
         let view = DenseColumnsView::parse(&data).unwrap();
+        assert_eq!(view.place_transit_kinds, &[4, 3]);
         assert_eq!(view.place_latitudes, &[34.0, 35.0]);
         assert_eq!(view.house_number_offsets, &[0, 2]);
         assert_eq!(view.house_place_ids, &[1]);
         assert_eq!(view.place_area_sets, &[1, 2]);
         assert_eq!(view.string_to_places_data, &[0, 1, 1]);
         assert_eq!(view.dictionary_fingerprint, 0x1234_5678);
+
+        // Existing v1 generations remain readable: remove the appended transit
+        // section and its directory entry, then shift all other sections back.
+        let legacy_end =
+            u64::from_le_bytes(data[24 + 16 * 16..32 + 16 * 16].try_into().unwrap()) as usize;
+        let mut legacy = data[..24 + 16 * 16].to_vec();
+        legacy[8..12].copy_from_slice(&1u32.to_le_bytes());
+        legacy[12..16].copy_from_slice(&16u32.to_le_bytes());
+        for i in 0..16 {
+            let pos = 24 + i * 16;
+            let offset = u64::from_le_bytes(legacy[pos..pos + 8].try_into().unwrap());
+            legacy[pos..pos + 8].copy_from_slice(&(offset - 16).to_le_bytes());
+        }
+        legacy.extend_from_slice(&data[HEADER_SIZE..legacy_end]);
+        let legacy_view = DenseColumnsView::parse(&legacy).unwrap();
+        assert!(legacy_view.place_transit_kinds.is_empty());
+        assert_eq!(legacy_view.place_latitudes, &[34.0, 35.0]);
+
+        let mut malformed = data.clone();
+        malformed[32 + 16 * 16..40 + 16 * 16].copy_from_slice(&1u64.to_le_bytes());
+        assert!(DenseColumnsView::parse(&malformed).is_err());
         data[24] ^= 1; // first section offset no longer equals header size
         assert!(DenseColumnsView::parse(&data).is_err());
     }
