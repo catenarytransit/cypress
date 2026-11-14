@@ -927,6 +927,7 @@ mod transit_ranking_tests {
                 bigram_mmap: None,
                 reverse_tree: rstar::RTree::new(),
                 version: "transit-fixture".into(),
+                v2_lookup: None,
             }),
             out_dir: PathBuf::new(),
         };
