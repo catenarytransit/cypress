@@ -753,10 +753,6 @@ name = "flat_map"
 version = "0.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e4fa2a56a33c493fc81acbad4676c599cf2b128f21462a020043ea1eee46244f"
-dependencies = [
- "serde",
- "serde_derive",
-]
 
 [[package]]
 name = "flate2"
@@ -1114,6 +1110,15 @@ name = "hermit-abi"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
+
+[[package]]
+name = "home"
+version = "0.5.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc627f471c528ff0c4a49e1d5e60450c8f6461dd6d10ba9dcd3a61d3dff7728d"
+dependencies = [
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "http"
@@ -1556,6 +1561,12 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "linux-raw-sys"
+version = "0.4.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d26c52dbd32dccf2d10cac7725f8eae5296885fb5703b261f7d0a0739ec807ab"
+
+[[package]]
+name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
@@ -1708,19 +1719,18 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "osmpbfreader"
-version = "0.16.1"
+version = "0.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "31a9a5652ee5d1ac97f64960117f9165d2d185034c5ccf22f6fadd3fcb78ccb2"
+checksum = "58a9aad3969d4c846bbbdd37fcdf77174fdc52e173bdc476981d543b0773307e"
 dependencies = [
  "byteorder",
  "flat_map",
  "flate2",
  "par-map",
  "protobuf",
- "protobuf-codegen-pure",
+ "protobuf-codegen",
  "pub-iterator-type",
  "self_cell",
- "serde",
  "smartstring",
 ]
 
@@ -1837,27 +1847,53 @@ dependencies = [
 
 [[package]]
 name = "protobuf"
-version = "2.28.0"
+version = "3.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "106dd99e98437432fed6519dedecfade6a06a73bb7b2a1e019fdd2bee5778d94"
-
-[[package]]
-name = "protobuf-codegen"
-version = "2.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "033460afb75cf755fcfc16dfaed20b86468082a2ea24e05ac35ab4a099a017d6"
+checksum = "d65a1d4ddae7d8b5de68153b48f6aa3bba8cb002b243dbdbc55a5afbc98f99f4"
 dependencies = [
- "protobuf",
+ "once_cell",
+ "protobuf-support",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
-name = "protobuf-codegen-pure"
-version = "2.28.0"
+name = "protobuf-codegen"
+version = "3.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95a29399fc94bcd3eeaa951c715f7bea69409b2445356b00519740bcd6ddd865"
+checksum = "5d3976825c0014bbd2f3b34f0001876604fe87e0c86cd8fa54251530f1544ace"
 dependencies = [
+ "anyhow",
+ "once_cell",
  "protobuf",
- "protobuf-codegen",
+ "protobuf-parse",
+ "regex",
+ "tempfile",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "protobuf-parse"
+version = "3.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4aeaa1f2460f1d348eeaeed86aea999ce98c1bded6f089ff8514c9d9dbdc973"
+dependencies = [
+ "anyhow",
+ "indexmap",
+ "log",
+ "protobuf",
+ "protobuf-support",
+ "tempfile",
+ "thiserror 1.0.69",
+ "which",
+]
+
+[[package]]
+name = "protobuf-support"
+version = "3.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e36c2f31e0a47f9280fb347ef5e461ffcd2c52dd520d8e216b52f93b0b0d7d6"
+dependencies = [
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -2230,6 +2266,19 @@ dependencies = [
 
 [[package]]
 name = "rustix"
+version = "0.38.44"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdb5bc1ae2baa591800df16c9ca78619bf65c0488b41b96ccec5d11220d8c154"
+dependencies = [
+ "bitflags 2.13.0",
+ "errno",
+ "libc",
+ "linux-raw-sys 0.4.15",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "rustix"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
@@ -2237,7 +2286,7 @@ dependencies = [
  "bitflags 2.13.0",
  "errno",
  "libc",
- "linux-raw-sys",
+ "linux-raw-sys 0.12.1",
  "windows-sys 0.61.2",
 ]
 
@@ -2629,7 +2678,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3fb72c633efbaa2dd666986505016c32c3044395ceaf881518399d2f4127ee29"
 dependencies = [
  "autocfg",
- "serde",
  "static_assertions",
  "version_check",
 ]
@@ -2774,7 +2822,7 @@ dependencies = [
  "fastrand",
  "getrandom 0.4.3",
  "once_cell",
- "rustix",
+ "rustix 1.1.4",
  "windows-sys 0.61.2",
 ]
 
@@ -3272,6 +3320,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d46a5a140e6f7afeccd8eae97eff335163939eac8b929834875168b29b3d267"
 dependencies = [
  "rustls-pki-types",
+]
+
+[[package]]
+name = "which"
+version = "4.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "87ba24419a2078cd2b0f2ede2691b6c66d8e47836da3b6db8265ebad47afbfc7"
+dependencies = [
+ "either",
+ "home",
+ "once_cell",
+ "rustix 0.38.44",
 ]
 
 [[package]]

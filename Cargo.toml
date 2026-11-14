@@ -23,7 +23,7 @@ path = "src/compiler/main.rs"
 tokio = { version = "1.35", features = ["full"] }
 
 # Geographic/DB dependencies
-osmpbfreader = "0.16"
+osmpbfreader = "0.19"
 
 # HTTP client (for Wikidata)
 reqwest = { version = "0.13", features = ["json", "gzip"] }
