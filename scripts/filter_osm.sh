@@ -95,4 +95,4 @@ fi
 
 echo
 echo "Use the filtered file with the ingest pipeline:"
-echo "  cargo run --release --bin ingest -- --file $OUTPUT_FILE --create-index"
+echo "  cargo run --release --bin ingest -- single --file \"$OUTPUT_FILE\""

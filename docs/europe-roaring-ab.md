@@ -42,7 +42,7 @@ These papers support choosing and testing this architecture, **not a claim that 
 
 ## Five-country A/B isolation
 
-The workflow downloads and filters full Geofabrik PBFs for **Switzerland, Germany, France, the United Kingdom and Italy**, sequentially. Only the first import uses `--create-index`, so all countries reside in **one disposable Scylla DB**.
+The workflow downloads and filters full Geofabrik PBFs for **Switzerland, Germany, France, the United Kingdom and Italy**, sequentially. Each `ingest single` call publishes an active places_v2 generation for its distinct source filename, so all countries reside in **one disposable Scylla DB**. The database starts empty; no truncation flag is needed.
 
 A and B use two distinct source revisions, compiler executables, and compiled indexes:
 

@@ -128,10 +128,10 @@ wait_for_scylla
 
 
 # One country at a time: fetch, filter, ingest, delete all PBF intermediates.
-# Only the first import truncates the disposable Scylla tables; subsequent
-# imports upsert into the *same* complete five-country dataset.
+# The disposable Scylla instance starts empty. places_v2 publishes a separate
+# active generation per source filename, retaining all five countries together.
 import_region() {
-  local region="$1" truncate="$2"
+  local region="$1"
   local source="$DATA/${region}.osm.pbf"
   local filtered="$DATA/${region}-filtered.osm.pbf"
   local admins="$DATA/${region}-admins.osm.pbf"
@@ -144,21 +144,16 @@ import_region() {
   "$ROOT/scripts/filter_osm.sh" "$source" "$filtered"
   "$ROOT/scripts/filter_admins.sh" "$source" "$admins"
   rm -f "$source"
-  if [[ "$truncate" == "yes" ]]; then
-    time "$DATA/main-ingest" single --file "$filtered" --admin-file "$admins" \
-      --scylla-url 127.0.0.1 --create-index
-  else
-    time "$DATA/main-ingest" single --file "$filtered" --admin-file "$admins" \
-      --scylla-url 127.0.0.1
-  fi
+  time "$DATA/main-ingest" single --file "$filtered" --admin-file "$admins" \
+    --scylla-url 127.0.0.1
   rm -f "$filtered" "$admins"
   df -h "$DATA"
 }
-import_region switzerland yes
-import_region germany no
-import_region france no
-import_region united-kingdom no
-import_region italy no
+import_region switzerland
+import_region germany
+import_region france
+import_region united-kingdom
+import_region italy
 echo "All five regions imported into one disposable Scylla database"
 docker stats --no-stream cypress-swiss-ab-scylla > "$RESULTS/scylla-after-import.txt"
 
