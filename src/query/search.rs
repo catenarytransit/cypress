@@ -2459,7 +2459,7 @@ fn bigram_search(
     bbox: Option<[f64; 4]>,
     max_results: usize,
     options: TransitOptions,
-) -> Vec<(String, f64)> {
+) -> Vec<(String, f64, Option<cypress::scylla::places_v2::ActiveSource>)> {
     let total_started = Instant::now();
     debug!(
         target: "cypress::query::timing",
@@ -2484,7 +2484,7 @@ fn bigram_search(
         let Some(source_id) = memdb_data.get_place_source_id(place_id as usize) else {
             continue;
         };
-        results.push((source_id, score));
+        results.push((source_id, score, memdb_data.v2_source_for_place(place_id as usize)));
     }
     log_phase_timing("bigram_search", "resolve_source_ids", phase_started);
 
@@ -2499,7 +2499,7 @@ fn spatial_search(
     lat: f64,
     max_results: usize,
     radius_km: f64,
-) -> Vec<(String, f64)> {
+) -> Vec<(String, f64, Option<cypress::scylla::places_v2::ActiveSource>)> {
     let data = memdb.get_data();
     let db = data.get_view();
     let grid = data.grid_mmap.as_ref().map(|m| {
@@ -2539,7 +2539,7 @@ fn spatial_search(
     .into_iter()
     .filter_map(|(id, distance)| {
         data.get_place_source_id(id as usize)
-            .map(|source| (source, distance))
+            .map(|source| (source, distance, data.v2_source_for_place(id as usize)))
     })
     .collect()
 }
@@ -2604,8 +2604,8 @@ pub async fn execute_search(
     // triggers a higher-ranked FnOnce lifetime error in the Axum handler.
     // The IDs stay alive through the buffered fetch, so borrowing is safe.
     let mut fetch_futures = Vec::with_capacity(scored_ids.len());
-    for (id, _) in &scored_ids {
-        fetch_futures.push(scylla_client.get_place(id));
+    for (id, _, source) in &scored_ids {
+        fetch_futures.push(scylla_client.get_place_for_source(id, source.as_ref()));
     }
     let fetched = stream::iter(fetch_futures)
         .buffered(8)
@@ -2721,8 +2721,8 @@ pub async fn execute_search_v2(
 
     let phase_started = Instant::now();
     let mut fetch_futures = Vec::with_capacity(scored_ids.len());
-    for (id, _) in &scored_ids {
-        fetch_futures.push(scylla_client.get_place(id));
+    for (id, _, source) in &scored_ids {
+        fetch_futures.push(scylla_client.get_place_for_source(id, source.as_ref()));
     }
     let fetched = stream::iter(fetch_futures)
         .buffered(8)
@@ -2813,8 +2813,8 @@ pub async fn execute_reverse(
 
     let phase_started = Instant::now();
     let mut fetch_futures = Vec::with_capacity(nearby.len());
-    for (id, _) in &nearby {
-        fetch_futures.push(scylla_client.get_place(id));
+    for (id, _, source) in &nearby {
+        fetch_futures.push(scylla_client.get_place_for_source(id, source.as_ref()));
     }
     let fetched = stream::iter(fetch_futures)
         .buffered(8)
@@ -2896,8 +2896,8 @@ pub async fn execute_reverse_v2(
 
     let phase_started = Instant::now();
     let mut fetch_futures = Vec::with_capacity(nearby.len());
-    for (id, _) in &nearby {
-        fetch_futures.push(scylla_client.get_place(id));
+    for (id, _, source) in &nearby {
+        fetch_futures.push(scylla_client.get_place_for_source(id, source.as_ref()));
     }
     let fetched = stream::iter(fetch_futures)
         .buffered(8)
