@@ -188,9 +188,13 @@ impl ScyllaClient {
                 // Only needed for /place_details?id=... without a source hint.
                 // Prefer the lexically first active source, matching compilation.
                 let sources = self.active_place_sources().await?;
-                let mut lookups = stream::iter(sources.iter())
-                    .map(|source| self.get_place_v2_from_source(id, source))
-                    .buffered(16);
+                // Build futures explicitly to avoid an async closure borrowing
+                // ActiveSource across await (not sufficiently general for Axum).
+                let mut fetch_futures = Vec::with_capacity(sources.len());
+                for source in &sources {
+                    fetch_futures.push(self.get_place_v2_from_source(id, source));
+                }
+                let mut lookups = stream::iter(fetch_futures).buffered(16);
                 while let Some(result) = lookups.next().await {
                     if let Some(data) = result? {
                         return Ok(Some(data));
