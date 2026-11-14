@@ -59,7 +59,7 @@ struct Args {
     scylla_url: String,
 
     /// Table used to hydrate place documents: places (rollback) or places_v2.
-    #[arg(long, env = "CYPRESS_PLACE_LOOKUP_TABLE", default_value = "places_v2", value_parser = ["places", "places_v2"])]
+    #[arg(long, default_value = "places_v2", value_parser = ["places", "places_v2"])]
     place_lookup_table: String,
 
     /// Directory containing rkyv memory-mapped files compiled by 'compiler'
