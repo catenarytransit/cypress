@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use cypress::models::bigram_index::name_fingerprint;
+use cypress::scylla::places_v2::{ActiveSource, V2_LOOKUP_FILE, V2_LOOKUP_MAGIC};
 use cypress::models::dense_columns::{DenseColumnsView, DENSE_FILE};
 use memmap2::Mmap;
 use std::collections::{HashMap, VecDeque};
@@ -424,6 +425,62 @@ pub struct MemdbData {
     pub reverse_tree: rstar::RTree<super::reverse::Cell>,
     pub bigram_mmap: Option<Mmap>,
     pub version: String,
+    pub v2_lookup: Option<V2Lookup>,
+}
+
+/// V2 provenance is immutable for each compiled index generation. Per-place
+/// source indices are accessed directly from the mmap, without a hash table.
+pub struct V2Lookup {
+    mapping: Mmap,
+    source_offsets_start: usize,
+    sources: Vec<ActiveSource>,
+}
+
+impl V2Lookup {
+    fn load(path: &Path, place_count: usize) -> Result<Self> {
+        let mapping = unsafe { Mmap::map(&File::open(path)?)? };
+        anyhow::ensure!(mapping.len() >= 20 && &mapping[..8] == V2_LOOKUP_MAGIC,
+            "Invalid V2 provenance header");
+        let json_len = u32::from_le_bytes(mapping[8..12].try_into()?) as usize;
+        let count = u64::from_le_bytes(mapping[12..20].try_into()?);
+        anyhow::ensure!(count == place_count as u64, "V2 provenance place count mismatch");
+        let source_offsets_start = 20usize.checked_add(json_len).context("V2 provenance overflow")?;
+        anyhow::ensure!(
+            source_offsets_start.checked_add(place_count.checked_mul(4).context("V2 provenance overflow")?)
+                == Some(mapping.len()),
+            "V2 provenance file length mismatch"
+        );
+        #[derive(serde::Deserialize)]
+        struct SourceEntry {
+            source_file: String,
+            generation: uuid::Uuid,
+        }
+        let entries: Vec<SourceEntry> = serde_json::from_slice(&mapping[20..source_offsets_start])?;
+        anyhow::ensure!(!entries.is_empty(), "V2 provenance has no sources");
+        let sources = entries.into_iter().map(|entry| ActiveSource {
+            source_file: entry.source_file,
+            generation: entry.generation,
+        }).collect::<Vec<_>>();
+        let lookup = Self { mapping, source_offsets_start, sources };
+        lookup.validate_indices(place_count)?;
+        Ok(lookup)
+    }
+
+    fn validate_indices(&self, place_count: usize) -> Result<()> {
+        for place_id in 0..place_count {
+            anyhow::ensure!(
+                self.source_for_place(place_id).is_some(),
+                "Invalid V2 source index at place {place_id}"
+            );
+        }
+        Ok(())
+    }
+
+    pub fn source_for_place(&self, place_id: usize) -> Option<&ActiveSource> {
+        let start = self.source_offsets_start.checked_add(place_id.checked_mul(4)?)?;
+        let source_idx = u32::from_le_bytes(self.mapping.get(start..start + 4)?.try_into().ok()?) as usize;
+        self.sources.get(source_idx)
+    }
 }
 
 /// Backward-compatible view: legacy rkyv arrays for old datasets, mmap slices
@@ -557,6 +614,10 @@ impl MemdbData {
         PlaceRecord::from_disk_bytes(&self.places_mmap[start..end])
     }
 
+    pub fn v2_source_for_place(&self, place_id: usize) -> Option<ActiveSource> {
+        self.v2_lookup.as_ref()?.source_for_place(place_id).cloned()
+    }
+
     pub fn get_place_source_id(&self, place_id: usize) -> Option<String> {
         let db = self.get_view();
         let start = *db.place_source_id_offsets.get(place_id)? as usize;
@@ -617,6 +678,12 @@ impl Memdb {
             ));
         }
 
+        let v2_lookup_path = out_dir.join(V2_LOOKUP_FILE);
+        let v2_lookup = if v2_lookup_path.exists() {
+            Some(V2Lookup::load(&v2_lookup_path, places_mmap.len() / PLACE_RECORD_DISK_BYTES)?)
+        } else {
+            None
+        };
         let db = unsafe { rkyv::archived_root::<CypressMemDb>(&index_mmap) };
         let dense_path = out_dir.join(DENSE_FILE);
         let dense_mmap = if dense_path.exists() {
@@ -771,6 +838,7 @@ impl Memdb {
             reverse_tree,
             bigram_mmap,
             version,
+            v2_lookup,
         })
     }
 
@@ -893,6 +961,7 @@ mod transit_ranking_tests {
                 bigram_mmap: None,
                 reverse_tree: rstar::RTree::new(),
                 version: "transit-fixture".into(),
+                v2_lookup: None,
             }),
             out_dir: PathBuf::new(),
         };
@@ -916,5 +985,40 @@ mod transit_ranking_tests {
         let mode_order: Vec<_> = preferred.iter().filter(|x| x.0 < 4).map(|x| x.0).collect();
         assert_eq!(mode_order, [0, 1, 2, 3]);
         assert_eq!(search(false, 1)[0].0, 4); // warmed query cache has no option leakage
+    }
+}
+
+#[cfg(test)]
+mod v2_lookup_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn provenance_resolves_source_and_rejects_bad_index() -> Result<()> {
+        let path = tempfile::NamedTempFile::new()?;
+        let sources = serde_json::json!([
+            {"source_file": "france.osm.pbf", "generation": uuid::Uuid::nil()},
+            {"source_file": "italy.osm.pbf", "generation": uuid::Uuid::nil()}
+        ]).to_string();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(V2_LOOKUP_MAGIC);
+        bytes.extend_from_slice(&(sources.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&2u64.to_le_bytes());
+        bytes.extend_from_slice(sources.as_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        std::fs::write(path.path(), &bytes)?;
+        let lookup = V2Lookup::load(path.path(), 2)?;
+        assert_eq!(lookup.source_for_place(0).unwrap().source_file, "italy.osm.pbf");
+        assert_eq!(lookup.source_for_place(1).unwrap().source_file, "france.osm.pbf");
+        assert!(lookup.source_for_place(2).is_none());
+        assert!(V2Lookup::load(path.path(), 3).is_err());
+        let offset = bytes.len() - 4;
+        bytes[offset..].copy_from_slice(&2u32.to_le_bytes());
+        let mut file = std::fs::File::create(path.path())?;
+        file.write_all(&bytes)?;
+        file.flush()?;
+        assert!(V2Lookup::load(path.path(), 2).is_err());
+        Ok(())
     }
 }

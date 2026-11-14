@@ -44,6 +44,7 @@ mod token_retrieval;
 mod transit;
 use cpu::{SearchCpu, SearchCpuError};
 use memdb::Memdb;
+use cypress::scylla::PlaceLookupTable;
 use search::{SearchParams, SearchResult, SearchResultV2};
 
 #[derive(Parser, Debug)]
@@ -57,6 +58,10 @@ struct Args {
     /// ScyllaDB URL
     #[arg(long, default_value = "127.0.0.1")]
     scylla_url: String,
+
+    /// Table used to hydrate place documents: places (rollback) or places_v2.
+    #[arg(long, default_value = "places_v2", value_parser = ["places", "places_v2"])]
+    place_lookup_table: String,
 
     /// Directory containing rkyv memory-mapped files compiled by 'compiler'
     #[arg(long, default_value = "./data/compiled")]
@@ -121,10 +126,22 @@ async fn main() -> Result<()> {
     info!("Cypress Query Server");
 
     info!("Connecting to ScyllaDB at {}", args.scylla_url);
-    let scylla_client = ScyllaClient::new(&args.scylla_url).await?;
+    let lookup_table = match args.place_lookup_table.as_str() {
+        "places" => PlaceLookupTable::Places,
+        "places_v2" => PlaceLookupTable::PlacesV2,
+        _ => unreachable!("clap validates lookup table"),
+    };
+    let scylla_client = ScyllaClient::new(&args.scylla_url)
+        .await?
+        .with_place_lookup_table(lookup_table);
+    info!(?lookup_table, "Configured place lookup table");
 
     info!("Initializing MemDB from {}", args.memdb_dir);
     let memdb = Memdb::new(&args.memdb_dir)?;
+    if lookup_table == PlaceLookupTable::PlacesV2 {
+        anyhow::ensure!(memdb.get_data().v2_lookup.is_some(),
+            "places_v2 lookup requires the compiler's cypress_v2_lookup.bin sidecar; recompile before switching");
+    }
 
     // Search contexts cache large arrays per OS thread. Bound their number as
     // well as CPU contention; never execute ranking on a Tokio reactor worker.
