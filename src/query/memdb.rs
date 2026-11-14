@@ -459,7 +459,19 @@ impl V2Lookup {
             source_file: entry.source_file,
             generation: entry.generation,
         }).collect::<Vec<_>>();
-        Ok(Self { mapping, source_offsets_start, sources })
+        let lookup = Self { mapping, source_offsets_start, sources };
+        lookup.validate_indices(place_count)?;
+        Ok(lookup)
+    }
+
+    fn validate_indices(&self, place_count: usize) -> Result<()> {
+        for place_id in 0..place_count {
+            anyhow::ensure!(
+                self.source_for_place(place_id).is_some(),
+                "Invalid V2 source index at place {place_id}"
+            );
+        }
+        Ok(())
     }
 
     pub fn source_for_place(&self, place_id: usize) -> Option<&ActiveSource> {
@@ -951,5 +963,40 @@ mod transit_ranking_tests {
         let mode_order: Vec<_> = preferred.iter().filter(|x| x.0 < 4).map(|x| x.0).collect();
         assert_eq!(mode_order, [0, 1, 2, 3]);
         assert_eq!(search(false, 1)[0].0, 4); // warmed query cache has no option leakage
+    }
+}
+
+#[cfg(test)]
+mod v2_lookup_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn provenance_resolves_source_and_rejects_bad_index() -> Result<()> {
+        let path = tempfile::NamedTempFile::new()?;
+        let sources = serde_json::json!([
+            {"source_file": "france.osm.pbf", "generation": uuid::Uuid::nil()},
+            {"source_file": "italy.osm.pbf", "generation": uuid::Uuid::nil()}
+        ]).to_string();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(V2_LOOKUP_MAGIC);
+        bytes.extend_from_slice(&(sources.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&2u64.to_le_bytes());
+        bytes.extend_from_slice(sources.as_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        std::fs::write(path.path(), &bytes)?;
+        let lookup = V2Lookup::load(path.path(), 2)?;
+        assert_eq!(lookup.source_for_place(0).unwrap().source_file, "italy.osm.pbf");
+        assert_eq!(lookup.source_for_place(1).unwrap().source_file, "france.osm.pbf");
+        assert!(lookup.source_for_place(2).is_none());
+        assert!(V2Lookup::load(path.path(), 3).is_err());
+        let offset = bytes.len() - 4;
+        bytes[offset..].copy_from_slice(&2u32.to_le_bytes());
+        let mut file = std::fs::File::create(path.path())?;
+        file.write_all(&bytes)?;
+        file.flush()?;
+        assert!(V2Lookup::load(path.path(), 2).is_err());
+        Ok(())
     }
 }
