@@ -10,12 +10,30 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::info;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaceLookupTable {
+    Places,
+    PlacesV2,
+}
+
 #[derive(Clone)]
 pub struct ScyllaClient {
     pub session: Arc<Session>,
+    lookup_table: PlaceLookupTable,
 }
 
 impl ScyllaClient {
+    /// Select the table used for online place hydration; imports and compilation
+    /// always operate on places_v2 regardless of this setting.
+    pub fn with_place_lookup_table(mut self, table: PlaceLookupTable) -> Self {
+        self.lookup_table = table;
+        self
+    }
+
+    pub fn place_lookup_table(&self) -> PlaceLookupTable {
+        self.lookup_table
+    }
+
     pub async fn new(uri: &str) -> Result<Self> {
         info!("Connecting to ScyllaDB at {}...", uri);
         let session: Session = SessionBuilder::new()
@@ -26,6 +44,7 @@ impl ScyllaClient {
 
         let client = Self {
             session: Arc::new(session),
+            lookup_table: PlaceLookupTable::Places,
         };
 
         client.init_schema().await?;
@@ -145,19 +164,54 @@ impl ScyllaClient {
         Ok(())
     }
 
+    /// Hydrate a place from the configured table. The source hint is mandatory
+    /// for efficient V2 search results; ID-only details requests use a bounded
+    /// scan of active generations instead of querying V2 with ALLOW FILTERING.
+    pub async fn get_place_for_source(
+        &self,
+        id: &str,
+        source: Option<&places_v2::ActiveSource>,
+    ) -> Result<Option<String>> {
+        match self.lookup_table {
+            PlaceLookupTable::Places => self.get_place_legacy(id).await,
+            PlaceLookupTable::PlacesV2 => match source {
+                Some(source) => self.get_place_v2_from_source(id, source).await,
+                None => self.get_place(id).await,
+            },
+        }
+    }
+
     pub async fn get_place(&self, id: &str) -> Result<Option<String>> {
+        match self.lookup_table {
+            PlaceLookupTable::Places => self.get_place_legacy(id).await,
+            PlaceLookupTable::PlacesV2 => {
+                // Only needed for /place_details?id=... without a source hint.
+                // Prefer the lexically first active source, matching compilation.
+                let sources = self.active_place_sources().await?;
+                // Build futures explicitly to avoid an async closure borrowing
+                // ActiveSource across await (not sufficiently general for Axum).
+                let mut fetch_futures = Vec::with_capacity(sources.len());
+                for source in &sources {
+                    fetch_futures.push(self.get_place_v2_from_source(id, source));
+                }
+                let mut lookups = stream::iter(fetch_futures).buffered(16);
+                while let Some(result) = lookups.next().await {
+                    if let Some(data) = result? {
+                        return Ok(Some(data));
+                    }
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    async fn get_place_legacy(&self, id: &str) -> Result<Option<String>> {
         let result: QueryResult = self
             .session
             .query_unpaged("SELECT data FROM cypress.places WHERE id = ?", (id,))
             .await?;
 
-        if let Ok(rows_result) = result.into_rows_result() {
-            if let Some((data,)) = rows_result.maybe_first_row::<(String,)>()? {
-                return Ok(Some(data));
-            }
-        }
-
-        Ok(None)
+        Ok(result.into_rows_result()?.maybe_first_row::<(String,)>()?.map(|row| row.0))
     }
 
     pub async fn get_admin_areas(&self, ids: &[String]) -> Result<HashMap<String, String>> {

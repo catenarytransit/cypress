@@ -429,9 +429,9 @@ async fn fetch_range_to_spill(
     // Each source generation has bounded buckets. Collect one bucket at a time
     // and resolve duplicate OSM IDs in deterministic source order. This avoids
     // global per-ID LWTs and limits memory to one bucket's candidate documents.
-    let mut records: std::collections::BTreeMap<String, (String, Option<i32>)> =
+    let mut records: std::collections::BTreeMap<String, (String, Option<i32>, u32)> =
         std::collections::BTreeMap::new();
-    for source in sources {
+    for (source_idx, source) in sources.iter().enumerate() {
         let mut results = client.session.query_iter(
             "SELECT id, data, population FROM cypress.places_v2
              WHERE source_file = ? AND generation = ? AND bucket = ?",
@@ -441,7 +441,7 @@ async fn fetch_range_to_spill(
             let (id, data, population) = row?;
             // Prefer the lexically earliest source for overlapping Geofabrik
             // extracts; this is stable regardless of request completion order.
-            records.entry(id).or_insert((data, population));
+            records.entry(id).or_insert((data, population, source_idx as u32));
         }
     }
 
@@ -471,8 +471,9 @@ async fn fetch_range_to_spill(
     })?);
 
     let mut local_place_id = 0u32;
+    let mut v2_source_writer = BufWriter::new(File::create(place_file.with_extension("v2sources"))?);
 
-    for (_, (data, compressed_population)) in records {
+    for (_, (data, compressed_population, source_idx)) in records {
         let Ok(place) = serde_json::from_str::<NormalizedPlace>(&data) else {
             continue;
         };
@@ -512,6 +513,7 @@ async fn fetch_range_to_spill(
         record.name_len = name_len as u8;
 
         write_place_record(&mut place_writer, &record)?;
+        v2_source_writer.write_all(&source_idx.to_le_bytes())?;
         transit_writer.write_all(&[cypress::models::transit::TransitKind::from_categories(
             &place.categories,
         ) as u8])?;
@@ -573,6 +575,7 @@ async fn fetch_range_to_spill(
     }
 
     place_writer.flush()?;
+    v2_source_writer.flush()?;
     transit_writer.flush()?;
     term_writer.flush()?;
     parent_writer.flush()?;
@@ -755,6 +758,32 @@ async fn main() -> Result<()> {
         }
 
         mmap.flush().context("Failed to flush merged place mmap")?;
+    }
+
+    // A compact, position-aligned provenance sidecar lets the query server
+    // resolve a place ID to its exact V2 partition without scanning sources.
+    let staged_v2_lookup_path = run_tmp_dir.join("staged_v2_lookup.bin");
+    {
+        let mut writer = BufWriter::new(File::create(&staged_v2_lookup_path)?);
+        writer.write_all(cypress::scylla::places_v2::V2_LOOKUP_MAGIC)?;
+        let source_json = serde_json::to_vec(&sources.iter().map(|source| {
+            serde_json::json!({
+                "source_file": source.source_file,
+                "generation": source.generation
+            })
+        }).collect::<Vec<_>>())?;
+        writer.write_all(&u32::try_from(source_json.len())?.to_le_bytes())?;
+        writer.write_all(&u64::from(total_places).to_le_bytes())?;
+        writer.write_all(&source_json)?;
+        for (spill, _) in &worker_offsets {
+            let mut reader = BufReader::new(File::open(spill.place_file.with_extension("v2sources"))?);
+            let written = std::io::copy(&mut reader, &mut writer)?;
+            anyhow::ensure!(
+                written == u64::from(spill.place_count) * 4,
+                "V2 provenance count differs from place count"
+            );
+        }
+        writer.flush()?;
     }
 
     let places_mmap = unsafe {
@@ -1781,6 +1810,7 @@ async fn main() -> Result<()> {
 
     let final_places_path = out_dir.join("cypress_places.bin");
     publish::publish_file(&merged_places_path, &final_places_path)?;
+    publish::publish_file(&staged_v2_lookup_path, &out_dir.join(cypress::scylla::places_v2::V2_LOOKUP_FILE))?;
 
     // A new generation without --token-index must not leave an obsolete
     // sidecar from a previous compiled dictionary beside the new MemDB.

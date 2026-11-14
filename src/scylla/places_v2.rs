@@ -11,6 +11,9 @@ use uuid::Uuid;
 use xxhash_rust::xxh64::xxh64;
 
 pub const V2_BUCKETS: i16 = 256;
+/// Compiled place ID -> source generation lookup, aligned with cypress_places.bin.
+pub const V2_LOOKUP_FILE: &str = "cypress_v2_lookup.bin";
+pub const V2_LOOKUP_MAGIC: &[u8; 8] = b"CYV2LOOK";
 const GC_CONCURRENCY: usize = 8;
 const ABANDONED_AFTER_HOURS: i64 = 2;
 const GC_GRACE_HOURS: i64 = 48;
@@ -41,6 +44,20 @@ fn was_applied(result: QueryResult) -> Result<bool> {
 }
 
 impl ScyllaClient {
+    /// Direct, partition-key-complete read against a published generation.
+    pub async fn get_place_v2_from_source(
+        &self,
+        id: &str,
+        source: &ActiveSource,
+    ) -> Result<Option<String>> {
+        let result = self.session.query_unpaged(
+            "SELECT data FROM cypress.places_v2
+             WHERE source_file = ? AND generation = ? AND bucket = ? AND id = ?",
+            (&source.source_file, source.generation, bucket_for_id(id), id),
+        ).await?;
+        Ok(result.into_rows_result()?.maybe_first_row::<(String,)>()?.map(|row| row.0))
+    }
+
     pub(crate) async fn init_places_v2_schema(&self) -> Result<()> {
         for ddl in [
             "CREATE TABLE IF NOT EXISTS cypress.places_v2 (
