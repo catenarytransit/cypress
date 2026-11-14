@@ -38,6 +38,7 @@ mod cpu;
 mod field_aware;
 mod memdb;
 mod roaring_retrieval;
+mod threshold_retrieval;
 mod reverse;
 mod search;
 mod token_retrieval;

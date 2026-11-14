@@ -13,6 +13,13 @@ BASE_TARGET="$DATA/target-main"
 EXPERIMENT_TARGET="$DATA/target-experiment"
 exec > >(tee -a "$RESULTS/run.log") 2>&1
 
+# Archive correctness-checked kernel timings separately from HTTP results.
+# Run serially before the database/build workloads contend for CPU or memory.
+rustc --edition=2021 -O --test scripts/bench-roaring-kernels.rs -o "$DATA/retrieval-kernels"
+"$DATA/retrieval-kernels" --test-threads=1
+"$DATA/retrieval-kernels" --ignored --nocapture --test-threads=1 2>&1 \
+  | tee "$RESULTS/retrieval-kernels.txt"
+
 echo "Baseline: cypress/main at workflow start"
 echo "Experiment: $(git rev-parse HEAD)"
 BASE_SHA="$(git ls-remote https://github.com/catenarytransit/cypress.git refs/heads/main | cut -f1)"

@@ -3,3 +3,6 @@
 // /tmp/roaring-kernels --ignored --nocapture
 #[path = "../src/models/roaring_simd.rs"]
 mod roaring_simd;
+
+#[path = "../src/query/threshold_retrieval.rs"]
+mod threshold_retrieval;

@@ -350,8 +350,10 @@ fn cold_posting_cost(offsets: &[u32], grams: &[u16]) -> ColdPostingCost {
 }
 
 fn log_phase_timing(op: &str, phase: &str, phase_started: Instant) {
-    let elapsed_ms = phase_started.elapsed().as_millis();
-    debug!(target: "cypress::query::timing", op, phase, elapsed_ms, "phase complete");
+    let elapsed = phase_started.elapsed();
+    let elapsed_ms = elapsed.as_millis();
+    let elapsed_us = elapsed.as_micros();
+    debug!(target: "cypress::query::timing", op, phase, elapsed_ms, elapsed_us, "phase complete");
     if elapsed_ms >= SLOW_PHASE_WARN_MS {
         warn!(target: "cypress::query::timing", op, phase, elapsed_ms, "slow phase");
     }
@@ -1342,6 +1344,7 @@ pub fn search_place_ids(
     let mut token_candidate_ids = None::<Vec<u32>>;
     let mut token_candidate_stats = None::<token_retrieval::RetrievalStats>;
     if token_mode != TokenRetrievalMode::Legacy {
+        let token_started = Instant::now();
         let retrieval = if token_mode == TokenRetrievalMode::Roaring {
             memdb_data.roaring_token_mmap.as_ref().map(|sidecar| {
                 cypress::models::roaring_token::RoaringTokenIndexView::view_validated(sidecar)
@@ -1494,6 +1497,7 @@ pub fn search_place_ids(
                 .map_or(0, |x| x.anchor_df),
             "token retrieval plan"
         );
+        log_phase_timing("search_place_ids", "token_retrieval", token_started);
     }
     let use_token_fast_path =
         matches!(token_mode, TokenRetrievalMode::Token | TokenRetrievalMode::Roaring)
@@ -1505,7 +1509,9 @@ pub fn search_place_ids(
         let phase_started = Instant::now();
         let mut ctx_guard = cell.borrow_mut();
         let ctx = &mut *ctx_guard;
-        ctx.clear(string_count, place_count, &memdb_data.version);
+        // Blocked fuzzy counting does not use corpus-sized count/epoch arrays.
+        let count_slots = if token_mode == TokenRetrievalMode::Roaring { 0 } else { string_count };
+        ctx.clear(count_slots, place_count, &memdb_data.version);
 
         let needed_area_sets = db.area_set_offsets.len();
         if ctx.area_match_cache.len() < needed_area_sets {
@@ -1595,96 +1601,143 @@ pub fn search_place_ids(
             } else {
                 ColdPostingCost::default()
             };
-            let mut missing_bigrams = Vec::new();
-
-            let phase_started = Instant::now();
-            let cached_counts = ctx
-                .query_cache
-                .get_closest_ref(&query_bigrams, &mut missing_bigrams);
-            let cache_base_reused = cached_counts.is_some();
-            if let Some(cached) = cached_counts {
-                ctx.restore_sparse_counts(&cached);
-            }
-            let missing_bigram_count = missing_bigrams.len();
-            let cache_restored_string_ids = if detailed_metrics {
-                ctx.touched_string_indices.len()
-            } else {
-                0
-            };
-            let cache_exact_hit = cache_base_reused && missing_bigram_count == 0;
-            let cache_subset_hit = cache_base_reused && !cache_exact_hit;
-            NGRAM_QUERIES.fetch_add(1, Ordering::Relaxed);
-            if cache_exact_hit {
-                NGRAM_EXACT_HITS.fetch_add(1, Ordering::Relaxed);
-            } else if cache_subset_hit {
-                NGRAM_SUBSET_HITS.fetch_add(1, Ordering::Relaxed);
-            }
-            log_phase_timing("search_place_ids", "cache_lookup_restore", phase_started);
-            debug!(
-                target: "cypress::query::timing",
-                op = "search_place_ids",
-                cache_hit = cache_exact_hit,
-                cache_subset_hit,
-                missing_bigram_count,
-                "cache lookup summary"
-            );
-
-            let phase_started = Instant::now();
-            let mut posting_lists_read = 0usize;
-            let mut posting_entries_visited = 0usize;
-            let sidecar = memdb_data.bigram_mmap.as_ref().map(|mmap| {
-                cypress::models::bigram_index::BigramIndexView::parse(mmap)
-                    .expect("bigram index validated on generation load")
-            });
-            for missing_idx in missing_bigrams.into_iter() {
-                let start = db.bigram_offsets[missing_idx as usize] as usize;
-                let end = db.bigram_offsets[(missing_idx + 1) as usize] as usize;
-
-                let bigrams = match sidecar.as_ref() {
-                    Some(sidecar) => sidecar.postings(start, end),
-                    None => db.bigram_data.get(start..end),
+            // The experiment also accelerates fuzzy T-overlap. Token AND
+            // cannot cover typos/unknown tokens, which dominate tail latency.
+            let mut threshold_counts = None;
+            let (posting_lists_read, posting_entries_visited, cache_exact_hit,
+                 cache_subset_hit, cache_restored_string_ids,
+                 cache_snapshot_entries, cache_snapshot_bytes) =
+            if token_mode == TokenRetrievalMode::Roaring {
+                let phase_started = Instant::now();
+                let sidecar = memdb_data.bigram_mmap.as_ref().map(|mmap| {
+                    cypress::models::bigram_index::BigramIndexView::parse(mmap)
+                        .expect("bigram index validated on generation load")
+                });
+                let postings: Vec<&[u32]> = query_bigrams.iter().map(|&gram| {
+                    let start = db.bigram_offsets[gram as usize] as usize;
+                    let end = db.bigram_offsets[gram as usize + 1] as usize;
+                    match sidecar.as_ref() {
+                        Some(index) => index.postings(start, end),
+                        None => db.bigram_data.get(start..end),
+                    }.unwrap_or(&[])
+                }).collect();
+                let threshold = match cosine_mode {
+                    CosineMode::Adr => adr_min_match_count,
+                    CosineMode::Cypress => cypress_min_match_count,
                 };
-                if let Some(bigrams) = bigrams {
-                    if detailed_metrics {
-                        posting_lists_read += 1;
-                        posting_entries_visited += bigrams.len();
-                    }
-                    for &string_idx in bigrams {
-                        let string_idx = string_idx as usize;
-                        ctx.increment_string_match(string_idx);
+                let counts = super::threshold_retrieval::count_threshold(&postings, threshold);
+                let visited = postings.iter().map(|p| p.len()).sum::<usize>();
+                debug!(target: "cypress::query::timing", threshold,
+                    posting_lists_read = postings.len(), posting_entries_visited = visited,
+                    threshold_survivors = counts.len(), counter_bytes = 8192,
+                    "blocked fuzzy threshold plan");
+                let read = postings.len();
+                threshold_counts = Some(counts);
+                log_phase_timing("search_place_ids", "blocked_threshold_counts", phase_started);
+                (read, visited, false, false, 0, 0, 0)
+            } else {
+                let mut missing_bigrams = Vec::new();
+
+                let phase_started = Instant::now();
+                let cached_counts = ctx
+                    .query_cache
+                    .get_closest_ref(&query_bigrams, &mut missing_bigrams);
+                let cache_base_reused = cached_counts.is_some();
+                if let Some(cached) = cached_counts {
+                    ctx.restore_sparse_counts(&cached);
+                }
+                let missing_bigram_count = missing_bigrams.len();
+                let cache_restored_string_ids = if detailed_metrics {
+                    ctx.touched_string_indices.len()
+                } else {
+                    0
+                };
+                let cache_exact_hit = cache_base_reused && missing_bigram_count == 0;
+                let cache_subset_hit = cache_base_reused && !cache_exact_hit;
+                NGRAM_QUERIES.fetch_add(1, Ordering::Relaxed);
+                if cache_exact_hit {
+                    NGRAM_EXACT_HITS.fetch_add(1, Ordering::Relaxed);
+                } else if cache_subset_hit {
+                    NGRAM_SUBSET_HITS.fetch_add(1, Ordering::Relaxed);
+                }
+                log_phase_timing("search_place_ids", "cache_lookup_restore", phase_started);
+                debug!(
+                    target: "cypress::query::timing",
+                    op = "search_place_ids",
+                    cache_hit = cache_exact_hit,
+                    cache_subset_hit,
+                    missing_bigram_count,
+                    "cache lookup summary"
+                );
+
+                let phase_started = Instant::now();
+                let mut posting_lists_read = 0usize;
+                let mut posting_entries_visited = 0usize;
+                let sidecar = memdb_data.bigram_mmap.as_ref().map(|mmap| {
+                    cypress::models::bigram_index::BigramIndexView::parse(mmap)
+                        .expect("bigram index validated on generation load")
+                });
+                for missing_idx in missing_bigrams.into_iter() {
+                    let start = db.bigram_offsets[missing_idx as usize] as usize;
+                    let end = db.bigram_offsets[(missing_idx + 1) as usize] as usize;
+
+                    let bigrams = match sidecar.as_ref() {
+                        Some(sidecar) => sidecar.postings(start, end),
+                        None => db.bigram_data.get(start..end),
+                    };
+                    if let Some(bigrams) = bigrams {
+                        if detailed_metrics {
+                            posting_lists_read += 1;
+                            posting_entries_visited += bigrams.len();
+                        }
+                        for &string_idx in bigrams {
+                            let string_idx = string_idx as usize;
+                            ctx.increment_string_match(string_idx);
+                        }
                     }
                 }
-            }
-            log_phase_timing("search_place_ids", "expand_missing_bigrams", phase_started);
+                log_phase_timing("search_place_ids", "expand_missing_bigrams", phase_started);
 
-            let phase_started = Instant::now();
-            let mut cache_snapshot_entries = 0usize;
-            let mut cache_snapshot_bytes = 0usize;
-            let cache_snapshot_needed = !ctx.query_cache.has_exact(&query_bigrams);
-            if cache_snapshot_needed {
-                let snapshot = ctx.snapshot_sparse_counts();
-                cache_snapshot_entries = snapshot.string_ids.len();
-                cache_snapshot_bytes = snapshot.string_ids.len() * std::mem::size_of::<u32>()
-                    + snapshot.counts.len() * std::mem::size_of::<u8>();
-                ctx.query_cache.put(&query_bigrams, Arc::new(snapshot));
-            }
-            log_phase_timing("search_place_ids", "cache_store_counts", phase_started);
-            debug!(
-                target: "cypress::query::timing",
-                op = "search_place_ids",
-                cache_snapshot_needed,
-                cache_snapshot_entries,
-                cache_snapshot_bytes,
-                "bigram snapshot admission summary"
-            );
+                let phase_started = Instant::now();
+                let mut cache_snapshot_entries = 0usize;
+                let mut cache_snapshot_bytes = 0usize;
+                let cache_snapshot_needed = !ctx.query_cache.has_exact(&query_bigrams);
+                if cache_snapshot_needed {
+                    let snapshot = ctx.snapshot_sparse_counts();
+                    cache_snapshot_entries = snapshot.string_ids.len();
+                    cache_snapshot_bytes = snapshot.string_ids.len() * std::mem::size_of::<u32>()
+                        + snapshot.counts.len() * std::mem::size_of::<u8>();
+                    ctx.query_cache.put(&query_bigrams, Arc::new(snapshot));
+                }
+                log_phase_timing("search_place_ids", "cache_store_counts", phase_started);
+                debug!(
+                    target: "cypress::query::timing",
+                    op = "search_place_ids",
+                    cache_snapshot_needed,
+                    cache_snapshot_entries,
+                    cache_snapshot_bytes,
+                    "bigram snapshot admission summary"
+                );
+
+                (posting_lists_read, posting_entries_visited, cache_exact_hit,
+                 cache_subset_hit, cache_restored_string_ids,
+                 cache_snapshot_entries, cache_snapshot_bytes)
+            };
 
             // Evaluate only the production cosine formula. Prefix FST candidates
             // are added separately below and do not depend on this cutoff.
             let phase_started = Instant::now();
             let mut string_matches = Vec::<CosSimMatch>::new();
-            for touched_idx in 0..ctx.touched_string_indices.len() {
-                let i = ctx.touched_string_indices[touched_idx] as usize;
-                let match_count = ctx.string_match_count(i);
+            let count_len = threshold_counts.as_ref().map_or(
+                ctx.touched_string_indices.len(), Vec::len);
+            for touched_idx in 0..count_len {
+                let (i, match_count) = if let Some(counts) = &threshold_counts {
+                    let (id, count) = counts[touched_idx];
+                    (id as usize, count)
+                } else {
+                    let i = ctx.touched_string_indices[touched_idx] as usize;
+                    (i, ctx.string_match_count(i))
+                };
                 let shared = match_count as u16;
                 let score = match cosine_mode {
                     CosineMode::Adr if shared >= adr_min_match_count => {

@@ -12,18 +12,26 @@ PHASE = re.compile(r'op="([^"]+)" phase="([^"]+)" elapsed_ms=(\d+)')
 
 def analyze(path):
     phases = defaultdict(list)
-    plans = fast = 0
+    plans = fast = threshold_plans = 0
+    survivors = []
     snapshots = []
     for raw in path.read_text().splitlines():
         line = ANSI.sub('', raw)
         if 'phase complete' in line:
             match = PHASE.search(line)
             if match:
-                phases[f'{match[1]}.{match[2]}'].append(int(match[3]))
+                micros = re.search(r'elapsed_us=(\d+)', line)
+                elapsed_ms = int(micros[1]) / 1000 if micros else int(match[3])
+                phases[f'{match[1]}.{match[2]}'].append(elapsed_ms)
         if ': token retrieval plan ' in line:
             plans += 1
             match = re.search(r'token_candidates=(\d+)', line)
             fast += bool(match and int(match[1]))
+        if 'blocked fuzzy threshold plan' in line:
+            threshold_plans += 1
+            match = re.search(r'threshold_survivors=(\d+)', line)
+            if match:
+                survivors.append(int(match[1]))
         if 'bigram snapshot admission summary' in line:
             match = re.search(r'cache_snapshot_bytes=(\d+)', line)
             if match:
@@ -33,6 +41,8 @@ def analyze(path):
         'token_plans': plans, 'nonempty_token_plans': fast,
         'fallback_plans': plans - fast,
         'max_snapshot_bytes': max(snapshots, default=0),
+        'blocked_threshold_plans': threshold_plans,
+        'max_threshold_survivors': max(survivors, default=0),
         'phases': dict(sorted({key: {'calls': len(values), 'total_ms': sum(values),
                                     'max_ms': max(values)}
                                for key, values in phases.items()}.items(),

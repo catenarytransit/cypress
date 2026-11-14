@@ -192,3 +192,94 @@ array-probe timings, not end-to-end or cold-cache results; the flat-list baselin
 previously used a linear cursor, so these figures do not quantify that path's gain.
 The existing five-country ABBA workflow remains necessary to assess latency, memory,
 result parity, and fallback rate before merging.
+
+## 2026-11-14: fix the fuzzy fallback bottleneck
+
+### Evidence from run 43599744653
+
+The linked run built `a05bd181a87ce93b389509e1a1490037fa6b4d41`.
+It predates the AVX2 commit `c74945e`, so it cannot measure that commit.
+The warm median changed from 5.336 to 5.287 ms; p95 changed from 100.471 to
+101.761 ms. All 234 ordered result-ID lists matched. This single ABBA run
+establishes no meaningful overall win; the small tail difference does not by
+itself establish a particular kernel regression.
+
+Both variants logged 6,552 token plans: 5,264 nonempty and 1,288 fallbacks.
+For the experiment, sibling fallback phases consumed 43,393 ms expanding
+bigrams, 22,222 ms making sparse cache snapshots, and 19,395 ms filtering/scoring
+cosine candidates. Search itself logged 99,659 ms; hydration logged 3,317 ms.
+These totals include warmup/first-pass requests and overlapping parent timers;
+only the three sibling phases may be added. The largest snapshot was 21,578,140
+payload bytes. Baseline had 1,286 cache misses and only two exact hits, so the
+large snapshots were nearly always recreated rather than reused.
+
+The central design error was accelerating exact-token AND while leaving fuzzy
+T-overlap accumulation unchanged. The expensive path still scattered writes
+across corpus-sized count/epoch arrays, materialized every touched ID, and copied
+those mostly rejected IDs into cache snapshots. Improving a sparse membership
+microbenchmark cannot remove those costs.
+
+### Algorithm
+
+`CYPRESS_TOKEN_RETRIEVAL_MODE=roaring` now uses blocked ScanCount for fuzzy
+fallbacks. Existing token container intersections remain the selective path.
+The sorted, unique bigram postings produced by the compiler are read directly:
+
+1. Select the smallest next ID block across the query's posting cursors. Skip
+   entirely empty blocks. Slice each posting at the block boundary.
+2. Accumulate exact saturating counts in an **8 KiB counter array**, covering
+   8,192 consecutive canonical StringIds. No per-ID hash lookup or epoch stamp.
+3. Replay those local slices in query-bigram order. Emit strings whose final
+   count reaches the existing ADR/Cypress minimum, and zero emitted counters
+   to prevent duplicates. Retain full counts for the existing cosine formula.
+4. Append survivors to buckets by their first posting. Flatten those buckets to
+   preserve uncached legacy discovery order, including score ties at the cap.
+   This needs neither a corpus-sized origin table nor a global survivor sort.
+
+Only survivors reach the existing cosine scoring and candidate cap. The experiment
+allocates no corpus-sized count/epoch arrays and creates no all-touched snapshots;
+its counters are query-local. Existing scoring formulas, prefix union, languages,
+StringIds, token index encoding, and source lookup remain in use. Main/token mode
+retains its original cache and accumulation path as the A/B control. The new path
+recomputes counts rather than reusing cached subsets; preserving uncached discovery
+order does not promise parity with historical cache-dependent tie ordering. The
+five-country result-ID comparison is therefore still required.
+
+### Research basis
+
+- [Chambi et al., Better bitmap performance with Roaring bitmaps, §4](https://arxiv.org/pdf/1402.6407): the representation and operation must fit the local density and operand cardinalities. Sparse-array intersections and bitmap AND accelerate conjunctions; a fuzzy threshold query needs different aggregation.
+- [Lemire, Boytsov, Kurz, SIMD Compression and the Intersection of Sorted Integers](https://arxiv.org/pdf/1401.6399): evaluate the whole retrieval pipeline and match intersection strategy to list skew, rather than inferring full-query gains from one probe kernel.
+- [Lemire et al., Roaring Bitmaps: Implementation of an Optimized Software Library, §4.2](https://arxiv.org/pdf/1709.07821): block-based array intersections differ from checking each candidate with binary search. The existing array-probe microbenchmark remains a limited kernel comparison.
+- [Kaser and Lemire, Compressed bitmap indexes: beyond unions and intersections, §5.1](https://arxiv.org/pdf/1402.4466): ScanCount computes exact T-overlap; the paper also discusses alternatives such as MGOPT, DSK and bit-sliced aggregation. No single strategy wins on all distributions.
+- [Lemire, How fast can scancount be?](https://lemire.me/blog/2019/08/30/how-fast-can-scancount-be/): partition the ID universe so counters fit in CPU cache, and use small counters. The local-slice replay and first-posting output buckets here preserve Cypress's ordering semantics.
+
+This is cache-local threshold aggregation over the existing sorted bigram lists,
+not a claim that token Roaring AND implements fuzzy matching, or that this is
+CRoaring's bit-sliced threshold algorithm. Building another full bigram sidecar
+would add storage without first proving a retrieval benefit.
+
+### Validation
+
+The standalone harness compares full `(StringId, count)` output **and order** with
+an independent count-map oracle, including randomized lists, empty/missing blocks,
+unsigned maximum IDs, thresholds above list count and 255-count saturation.
+Its timing baseline mirrors the actual reusable epoch/count arrays, touched IDs,
+snapshot copy and threshold filtering, rather than repeated binary searches.
+Eight measured iterations alternate old/new order after correctness checks.
+
+One local serial optimized run measured:
+
+| Synthetic case | Posting entries | Survivors | Epoch + snapshot ms | Blocked ms | Speedup |
+|---|---:|---:|---:|---:|---:|
+| Broad fuzzy | 8,000,920 | 121,060 | 92.212 | 44.982 | 2.05x |
+| Dense short | 2,999,322 | 339,162 | 23.618 | 14.577 | 1.62x |
+| Sparse | 375,798 | 112 | 11.546 | 3.335 | 3.46x |
+
+These synthetic timings exclude HTTP, cosine scoring and database hydration; they
+are not a five-country latency claim. Run serially with
+`/tmp/roaring-kernels --ignored threshold --nocapture --test-threads=1`.
+The ABBA script now archives kernel timings as `retrieval-kernels.txt` before
+building/importing. Logs add token retrieval timing, microsecond phase precision,
+blocked-threshold work and survivor counts, so the next full run can test the
+hypothesis directly. Merge still requires end-to-end latency, result parity and
+resident-memory validation.
