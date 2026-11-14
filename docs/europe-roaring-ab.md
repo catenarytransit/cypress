@@ -136,6 +136,59 @@ At startup, after first pass, and after warm measurement, archive `/proc/PID/sta
 
 The compiler chooses the smaller of flat posting and container encoding. For individual 16-bit shards, run encoding is used only when smaller than either the sparse array or dense bitmap. This reduces file size for highly fragmented rare tokens and compresses spatially ordered or consecutive IDs. The representation is generation-bound and deep-validated before publication.
 
-**Upstream SIMD audit:** [roaring-rs](https://github.com/RoaringBitmap/roaring-rs) version 0.12 uses `fearless_simd` for SIMD-enabled operations and dispatches at runtime on x86/x86-64 with `std`. Cypress's experimental `RoaringPosting` currently uses *scalar* membership/probing; there was no SIMD code to correct. This experiment does not claim SIMD acceleration or full roaring-rs behavior, and should not claim such speedups before implementing a separately verified SIMD intersection path. Native bit tests and scalar run search are exact; container decode and membership tests remain required. The upstream crate is not added as a Cargo dependency here, because an unvalidated `Cargo.lock` update would break `--locked` CI.
+## 2026-11-14: container intersection and runtime AVX2
 
-**Next major experiment:** direct Roaring set intersections for token groups, and a bitmap-based fuzzy candidate accumulator to replace repeated broad bigram-count scans and expensive sparse-count snapshots, with a strict scalar oracle and exact result-ID parity. This is not yet implemented in this revision. The full ABBA benchmark still needs to run.
+The query now intersects the two rarest postings before materializing the candidate
+list. It merges high-16 keys without reading skipped container payloads. Dense pairs
+use 256-bit AND and skip zero vectors before decoding surviving bits; sparse pairs
+consume packed u16 values directly. Only run/bitmap mixed cases need a reusable
+scratch buffer. Further terms filter the sorted candidates in place, loading each
+container header once per candidate group.
+
+Array probes use V1-style broadcast equality (16 u16 or 8 u32 lanes), advancing
+through block maxima with exponential search plus binary refinement for large gaps.
+The cursor never returns to an earlier block. All SIMD loads are unaligned and bounded
+by a complete 32-byte block; tails use scalar reads. x86-64 AVX2 is detected at runtime,
+and other CPUs retain a portable scalar path. No global `target-cpu=native` requirement,
+new dependency, or on-disk format change is introduced.
+
+### Literature and scope
+
+- [Chambi et al., Better bitmap performance with Roaring bitmaps, v4, §4](https://arxiv.org/pdf/1402.6407v4): match high keys first; bitmap/bitmap word AND; array/bitmap bit tests; merge or galloping for arrays. The paper's 4096-element threshold is a space crossover, not a recommendation to scatter IDs uniformly.
+- [Lemire, Boytsov, Kurz, SIMD Compression and the Intersection of Sorted Integers](https://arxiv.org/abs/1401.6399): vector broadcast probes and galloping motivate the array kernel. This is a bounded-block adaptation, not an implementation of every algorithm in that paper.
+- [Lemire et al., Roaring Bitmaps: Implementation of an Optimized Software Library](https://arxiv.org/abs/1709.07821): container-specific SIMD kernels. This implementation does not claim CRoaring's complete kernel matrix or performance.
+
+Canonical StringIds and v2 encoding remain unchanged. Padding every small array to
+32 bytes would increase sparse-token storage; loadu avoids requiring that padding.
+Compiler logs now expose flat lists, run containers, and population buckets
+`[1..16, 17..256, 257..4096, 4097..65536]`, alongside array/bitmap counts. These count
+only containers actually serialized, after the flat-list size comparison.
+
+Use these distributions to decide whether a separate ID permutation is worthwhile.
+A token-cooccurrence ordering could cluster common terms into fewer containers, but
+requires a reverse map and changes candidate locality in the name/postings tables.
+Uniform redistribution would generally destroy useful runs and reduce local density.
+Neither permutation nor fuzzy bigram accumulation is changed here.
+
+### Validation and measurement
+
+Tests compare dispatched and forced scalar array probes with a sorted-set oracle,
+covering every short tail length, randomized monotone queries, unaligned storage,
+large gaps, and unsigned boundaries. Compiler tests cover all flat/array/bitmap/run
+pairings, missing shards, multiple shards, and high IDs. CI includes the SIMD tests.
+
+Run:
+
+```sh
+cargo test --locked --lib --bin compiler --bin query
+rustc --edition=2021 -O --test scripts/bench-roaring-kernels.rs -o /tmp/roaring-kernels
+/tmp/roaring-kernels --ignored --nocapture
+```
+
+One local AVX2 kernel run (200 repetitions, 3856 sparse values) measured repeated
+binary probes versus the dispatched block kernel: 79.0 vs 25.8 ms for step-3
+candidates, and 2.46 vs 0.76 ms for step-127 candidates. These are synthetic warm
+array-probe timings, not end-to-end or cold-cache results; the flat-list baseline
+previously used a linear cursor, so these figures do not quantify that path's gain.
+The existing five-country ABBA workflow remains necessary to assess latency, memory,
+result parity, and fallback rate before merging.

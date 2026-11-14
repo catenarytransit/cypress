@@ -1,9 +1,8 @@
 //! Adaptive posting intersection for the mmap Roaring-style index.
 //!
-//! Sort by document frequency, enumerate only the rarest term, and test
-//! ascending-frequency probe terms. Sparse containers binary-search u16 lows;
-//! dense ones answer using a single bit test. No query-time skip allocations,
-//! no prefix expansion and no arbitrary truncation of broad candidate sets.
+//! Sort by document frequency and intersect the first pair by container kind.
+//! Remaining terms filter the sorted survivors with forward SIMD array probes
+//! or scalar bitmap/run membership. Broad queries retain the existing fallback.
 use anyhow::Result;
 use cypress::models::roaring_token::{RoaringPosting, RoaringTokenIndexView};
 use cypress::models::token_index::tokenize_name;
@@ -32,9 +31,13 @@ pub fn retrieve(
     let mut stats = RetrievalStats {
         tokens: lists.len(), anchor_df, ..Default::default()
     };
-    let mut matched = lists[0].anchor_ids();
-    stats.posting_entries_examined = matched.len() as u64;
-    for probe in &lists[1..] {
+    let mut matched = if lists.len() > 1 {
+        lists[0].intersection(&lists[1])
+    } else {
+        lists[0].anchor_ids()
+    };
+    stats.posting_entries_examined = anchor_df as u64;
+    for probe in lists.iter().skip(2) {
         stats.block_seeks += probe.retain_sorted(&mut matched);
         if matched.is_empty() { return Ok(None); }
     }

@@ -134,35 +134,103 @@ impl RoaringPosting<'_> {
     /// Reuses the caller's allocation; never decodes the probe list.
     pub fn retain_sorted(&self, ids: &mut Vec<u32>) -> u64 {
         debug_assert!(ids.windows(2).all(|w| w[0] < w[1]));
+        let before = ids.len();
+        let kernel = super::roaring_simd::Kernel::detect();
         if self.container_count() == 0 {
-            let mut cursor = 0usize;
-            let n = self.document_frequency as usize;
-            let before = ids.len();
-            ids.retain(|&id| {
-                while cursor < n {
-                    let at = 4 + cursor * 4;
-                    let value = u32::from_le_bytes(self.bytes[at..at+4].try_into().unwrap());
-                    if value >= id { return value == id }
-                    cursor += 1;
-                }
-                false
-            });
+            let mut cursor = 0;
+            ids.retain(|&id| kernel.contains::<4>(&self.bytes[4..], &mut cursor, id));
             return before as u64;
         }
-        let mut cursor = 0;
-        let mut probes = 0;
-        ids.retain(|&id| {
-            probes += 1;
-            let high = (id >> 16) as u16;
-            while cursor < self.container_count() && self.container(cursor).high < high {
-                cursor += 1;
+        let mut container_cursor = 0;
+        let mut read = 0;
+        let mut write = 0;
+        while read < before {
+            let high = (ids[read] >> 16) as u16;
+            let mut end = read + 1;
+            while end < before && (ids[end] >> 16) as u16 == high { end += 1; }
+            // Read only high keys while skipping: do not touch unrelated bodies.
+            while container_cursor < self.container_count() {
+                let pos = 4 + container_cursor * CONTAINER_BYTES;
+                let key = u16::from_le_bytes(self.bytes[pos..pos + 2].try_into().unwrap());
+                if key >= high { break; }
+                container_cursor += 1;
             }
-            if cursor == self.container_count() { return false; }
-            let c = self.container(cursor);
-            c.high == high && Self::contains_low(c, id as u16)
-        });
-        probes
+            if container_cursor == self.container_count() { break; }
+            let c = self.container(container_cursor);
+            if c.high == high {
+                let mut low_cursor = 0;
+                for i in read..end {
+                    let id = ids[i];
+                    let found = if c.kind == 0 {
+                        kernel.contains::<2>(c.body, &mut low_cursor, id as u16 as u32)
+                    } else {
+                        Self::contains_low(c, id as u16)
+                    };
+                    if found { ids[write] = id; write += 1; }
+                }
+            }
+            read = end;
+        }
+        ids.truncate(write);
+        before as u64
     }
+
+    /// Merge container keys before reading payloads. Dense pairs use word AND;
+    /// other pairs enumerate only the smaller container into a reusable buffer.
+    pub fn intersection(&self, other: &Self) -> Vec<u32> {
+        if self.container_count() == 0 || other.container_count() == 0 {
+            let (small, large) = if self.document_frequency <= other.document_frequency {
+                (self, other)
+            } else { (other, self) };
+            let mut ids = small.anchor_ids();
+            large.retain_sorted(&mut ids);
+            return ids;
+        }
+        let mut out = Vec::new();
+        let mut scratch = Vec::new();
+        let kernel = super::roaring_simd::Kernel::detect();
+        let (mut left, mut right) = (0, 0);
+        while left < self.container_count() && right < other.container_count() {
+            let key = |p: &Self, i| {
+                let pos = 4 + i * CONTAINER_BYTES;
+                u16::from_le_bytes(p.bytes[pos..pos+2].try_into().unwrap())
+            };
+            let a_key = key(self, left);
+            let b_key = key(other, right);
+            if a_key < b_key { left += 1; continue; }
+            if b_key < a_key { right += 1; continue; }
+            let a = self.container(left);
+            let b = other.container(right);
+            let high = (a.high as u32) << 16;
+            if a.kind == 1 && b.kind == 1 {
+                super::roaring_simd::intersect_bitmaps(a.body, b.body, high, &mut out);
+            } else {
+                let (small, probe) = if a.count <= b.count { (a, b) } else { (b, a) };
+                let mut cursor = 0;
+                let mut visit = |id: u32| {
+                    let found = if probe.kind == 0 {
+                        kernel.contains::<2>(probe.body, &mut cursor, id as u16 as u32)
+                    } else { Self::contains_low(probe, id as u16) };
+                    if found { out.push(id); }
+                };
+                if small.kind == 0 {
+                    // Consume packed lows directly, without widening a temporary
+                    // array or materializing IDs for nonmatching containers.
+                    for low in small.body.chunks_exact(2) {
+                        visit(high | u16::from_le_bytes([low[0], low[1]]) as u32);
+                    }
+                } else {
+                    scratch.clear();
+                    Self::decode_container(small, &mut scratch);
+                    for &id in &scratch { visit(id); }
+                }
+            }
+            left += 1;
+            right += 1;
+        }
+        out
+    }
+
     /// Decode only the selected rarest anchor list, never the high-DF probes.
     pub fn anchor_ids(&self) -> Vec<u32> {
         let mut out = Vec::with_capacity(self.document_frequency as usize);
@@ -174,33 +242,36 @@ impl RoaringPosting<'_> {
         }
         for n in 0..self.container_count() {
             let c = self.container(n);
-            let high = (c.high as u32) << 16;
-            if c.kind == 2 {
-                let runs = u16::from_le_bytes(c.body[0..2].try_into().unwrap()) as usize;
-                for i in 0..runs {
-                    let pos = 2 + i * 4;
-                    let start = u16::from_le_bytes(c.body[pos..pos+2].try_into().unwrap()) as u32;
-                    let extra = u16::from_le_bytes(c.body[pos+2..pos+4].try_into().unwrap()) as u32;
-                    for low in start..=start + extra {
-                        out.push(high | low);
-                    }
-                }
-            } else if c.kind == 1 {
-                for (i, byte) in c.body.iter().copied().enumerate() {
-                    let mut bits = byte;
-                    while bits != 0 {
-                        let bit = bits.trailing_zeros();
-                        out.push(high | (i as u32 * 8 + bit));
-                        bits &= bits - 1;
-                    }
-                }
-            } else {
-                for v in c.body.chunks_exact(2) {
-                    out.push(high | u16::from_le_bytes([v[0],v[1]]) as u32);
-                }
-            }
+            Self::decode_container(c, &mut out);
         }
         out
+    }
+    fn decode_container(c: Container<'_>, out: &mut Vec<u32>) {
+        let high = (c.high as u32) << 16;
+        if c.kind == 2 {
+            let runs = u16::from_le_bytes(c.body[0..2].try_into().unwrap()) as usize;
+            for i in 0..runs {
+                let pos = 2 + i * 4;
+                let start = u16::from_le_bytes(c.body[pos..pos+2].try_into().unwrap()) as u32;
+                let extra = u16::from_le_bytes(c.body[pos+2..pos+4].try_into().unwrap()) as u32;
+                for low in start..=start + extra {
+                    out.push(high | low);
+                }
+            }
+        } else if c.kind == 1 {
+            for (i, byte) in c.body.iter().copied().enumerate() {
+                let mut bits = byte;
+                while bits != 0 {
+                    let bit = bits.trailing_zeros();
+                    out.push(high | (i as u32 * 8 + bit));
+                    bits &= bits - 1;
+                }
+            }
+        } else {
+            for v in c.body.chunks_exact(2) {
+                out.push(high | u16::from_le_bytes([v[0],v[1]]) as u32);
+            }
+        }
     }
     fn validate(&self) -> Result<()> {
         let n = self.container_count();

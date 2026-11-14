@@ -17,6 +17,10 @@ pub struct Report {
     pub postings: u64,
     pub arrays: u64,
     pub bitmaps: u64,
+    pub runs: u64,
+    pub flat_lists: u64,
+    /// Container populations: 1..16, 17..256, 257..4096, 4097..65536.
+    pub population_buckets: [u64; 4],
     pub bytes: u64,
 }
 
@@ -127,6 +131,9 @@ pub fn build(source: &Path, destination: &Path, scratch: &Path) -> Result<Report
     let mut posting_count = 0u64;
     let mut arrays = 0;
     let mut bitmaps = 0;
+    let mut runs = 0;
+    let mut flat_lists = 0;
+    let mut population_buckets = [0u64; 4];
     let mut terms = index.fst.stream();
     while let Some((token, ordinal)) = terms.next() {
         ensure!(ordinal == token_count, "token ordinal out of order");
@@ -135,6 +142,15 @@ pub fn build(source: &Path, destination: &Path, scratch: &Path) -> Result<Report
         let df = posting.document_frequency;
         let ids = posting.decode_ids()?;
         let (bytes, a, b) = encode_list(&ids)?;
+        let containers = u32::from_le_bytes(bytes[..4].try_into()?) as usize;
+        if containers == 0 { flat_lists += 1; }
+        for i in 0..containers {
+            let at = 4 + i * CONTAINER_BYTES;
+            runs += u64::from(bytes[at + 2] == 2);
+            let count = u32::from_le_bytes(bytes[at + 4..at + 8].try_into()?);
+            let bucket = match count { 0..=16 => 0, 17..=256 => 1, 257..=4096 => 2, _ => 3 };
+            population_buckets[bucket] += 1;
+        }
         offsets.push((byte_position, u32::try_from(bytes.len())?, df));
         payload.write_all(&bytes)?;
         byte_position = byte_position.checked_add(bytes.len() as u64).ok_or_else(|| anyhow!("payload length overflow"))?;
@@ -180,13 +196,59 @@ pub fn build(source: &Path, destination: &Path, scratch: &Path) -> Result<Report
     fs::remove_file(stage)?;
     let bytes = fs::metadata(destination)?.len();
     ensure!(bytes >= HEADER_BYTES as u64 + token_count * META_BYTES as u64, "invalid serialized index size");
-    Ok(Report { tokens: token_count, postings: posting_count, arrays, bitmaps, bytes })
+    Ok(Report { tokens: token_count, postings: posting_count, arrays, bitmaps, runs, flat_lists, population_buckets, bytes })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::token_index::build_token_index;
+
+    fn test_index(ids: &[u32]) -> Vec<u8> {
+        let (encoded, _, _) = encode_list(ids).unwrap();
+        let mut builder = fst::MapBuilder::memory();
+        builder.insert("test", 0).unwrap();
+        let fst = builder.into_inner().unwrap();
+        let mut bytes = MAGIC.to_vec();
+        bytes.extend_from_slice(&VERSION.to_le_bytes());
+        bytes.extend_from_slice(&TOKEN_ANALYZER_VERSION.to_le_bytes());
+        for n in [u32::MAX as u64 + 1, 0, 1, ids.len() as u64, fst.len() as u64, encoded.len() as u64] {
+            bytes.extend_from_slice(&n.to_le_bytes());
+        }
+        bytes.extend_from_slice(&fst);
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&encoded);
+        bytes
+    }
+
+    #[test]
+    fn intersection_representation_matrix_and_missing_shards() {
+        let sets: Vec<Vec<u32>> = vec![
+            vec![0, 17, 65535, 65537, u32::MAX], // flat
+            (0..65536u32).step_by(17).collect(), // array
+            (0..65536u32).step_by(3).collect(), // bitmap
+            (200..9000).collect(), // run
+            (0..65536u32).step_by(5).map(|i| i | 0xffff0000).collect(),
+            (0..200000u32).step_by(19).collect(), // multiple arrays
+        ];
+        for a in &sets {
+            for b in &sets {
+                let a_bytes = test_index(a);
+                let b_bytes = test_index(b);
+                let a_view = RoaringTokenIndexView::parse(&a_bytes).unwrap();
+                let b_view = RoaringTokenIndexView::parse(&b_bytes).unwrap();
+                let ap = a_view.lookup("test").unwrap().unwrap();
+                let bp = b_view.lookup("test").unwrap().unwrap();
+                let expected: Vec<_> = a.iter().copied().filter(|v| b.binary_search(v).is_ok()).collect();
+                assert_eq!(ap.intersection(&bp), expected);
+                let mut retained = a.clone();
+                bp.retain_sorted(&mut retained);
+                assert_eq!(retained, expected);
+            }
+        }
+    }
 
     #[test]
     fn array_and_bitmap_container_membership() {

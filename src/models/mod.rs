@@ -7,6 +7,7 @@ pub mod memdb;
 pub mod normalized;
 pub mod place;
 pub mod roaring_token;
+mod roaring_simd;
 pub mod population;
 pub mod scoring;
 pub mod sift4;

@@ -39,7 +39,7 @@ jobs:
 
       - name: Test Roaring hybrid mmap index and query
         run: |
-          cargo test --locked --lib roaring_token
+          cargo test --locked --lib roaring
           cargo test --locked --bin compiler roaring_token
           cargo test --locked --bin query
 

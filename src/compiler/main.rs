@@ -1803,6 +1803,9 @@ async fn main() -> Result<()> {
             postings = report.postings,
             array_containers = report.arrays,
             bitmap_containers = report.bitmaps,
+            run_containers = report.runs,
+            flat_lists = report.flat_lists,
+            container_population_buckets = ?report.population_buckets,
             roaring_bytes = report.bytes,
             "Roaring-inspired multilingual token index compiled"
         );
