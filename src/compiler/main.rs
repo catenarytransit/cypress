@@ -594,6 +594,13 @@ fn compress_bigram(b0: u8, b1: u8) -> u16 {
     (b0 as u16) | ((b1 as u16) << 8)
 }
 
+#[cfg(not(target_env = "msvc"))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let subscriber = FmtSubscriber::builder()
