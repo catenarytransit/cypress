@@ -1,4 +1,4 @@
-name: European Cypress hybrid Roaring A/B (CH DE FR)
+name: European Cypress hybrid Roaring A/B (CH DE FR GB IT)
 
 on:
   workflow_dispatch:
@@ -72,19 +72,19 @@ jobs:
             exit 1
           fi
           bash -n benchmarks/switzerland_ab/run.sh
-          python3 -m py_compile benchmarks/switzerland_ab/compare.py
+          python3 -m py_compile benchmarks/switzerland_ab/compare.py benchmarks/switzerland_ab/analyze_logs.py
           python3 - <<'PY'
           from collections import Counter
           import json
           from pathlib import Path
           cases = [json.loads(line) for line in Path('benchmarks/switzerland_ab/workload.jsonl').read_text().splitlines() if line.strip()]
           counts = Counter(case.get('country') for case in cases)
-          assert {'CH', 'DE', 'FR'} <= set(counts), counts
+          assert counts == {'CH': 81, 'DE': 50, 'FR': 53, 'GB': 24, 'IT': 26}, counts
           assert len({case['id'] for case in cases}) == len(cases)
-          print('Three-country benchmark workload:', dict(counts))
+          print('CH/DE/FR query workload on five-country data:', dict(counts))
           PY
 
-      - name: Import CH DE FR then compare token vs hybrid bitmap index
+      - name: Import CH DE FR GB IT then compare token vs hybrid bitmap index
         shell: bash
         run: bash benchmarks/switzerland_ab/run.sh
 
@@ -95,7 +95,7 @@ jobs:
           if test -f benchmark_results/switzerland_ab/summary.md; then
             cat benchmark_results/switzerland_ab/summary.md >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "The three-country A/B runner did not finish. See uploaded logs." >> "$GITHUB_STEP_SUMMARY"
+            echo "The five-country A/B runner did not finish. See uploaded logs." >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Upload metrics, per-query results and logs
